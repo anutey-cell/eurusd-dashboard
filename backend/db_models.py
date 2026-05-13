@@ -122,3 +122,27 @@ class MT5TradeLog(Base):
     rejection_reason = Column(Text,        nullable=True)
     reason           = Column(Text,        nullable=True)     # ICT setup description
     raw_response_json = Column(Text,       nullable=True)     # JSON string of MT5 response
+
+
+# ── telegram_alert_logs ───────────────────────────────────────────────────────
+
+class TelegramAlertLog(Base):
+    """
+    Audit log for every Telegram alert attempt — sent, duplicate_skipped, not_qualified, failed.
+    Fields mirror the spec's telegram_alert_logs schema exactly.
+    """
+    __tablename__ = "telegram_alert_logs"
+
+    id               = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    created_at       = Column(DateTime(timezone=True), default=_now, nullable=False)
+    pair             = Column(String(16),  nullable=False)
+    signal           = Column(String(8),   nullable=False)   # BUY | SELL | WAIT
+    quality_score    = Column(Integer,     nullable=True)
+    entry            = Column(Float,       nullable=True)
+    stop_loss        = Column(Float,       nullable=True)
+    take_profit      = Column(Float,       nullable=True)
+    rr               = Column(Float,       nullable=True)
+    fingerprint      = Column(String(32),  nullable=False, default="", index=True)
+    status           = Column(String(32),  nullable=False)   # sent|duplicate_skipped|not_qualified|failed
+    error_message    = Column(Text,        nullable=True)
+    raw_response_json = Column(Text,       nullable=True)

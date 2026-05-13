@@ -32,10 +32,10 @@ _STATUS_EMOJI  = {"accepted": "✅", "rejected": "❌", "failed": "⚠️"}
 
 
 def _is_enabled() -> bool:
-    """Check master Telegram switch without raising."""
+    """Check master Telegram switch without raising. Accepts both new and legacy env var."""
     try:
-        from config import settings
-        return bool(settings.telegram_enabled and settings.telegram_bot_token and settings.telegram_chat_id)
+        from services.telegram_alert_service import telegram_alerts_enabled
+        return telegram_alerts_enabled()
     except Exception:
         return False
 
@@ -52,9 +52,10 @@ def _send(text: str) -> bool:
         # URL contains token — do NOT log this URL
         url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
         payload = {
-            "chat_id":    settings.telegram_chat_id,
-            "text":       text,
-            "parse_mode": "HTML",
+            "chat_id":                  settings.telegram_chat_id,
+            "text":                     text,
+            "parse_mode":               settings.telegram_parse_mode,
+            "disable_web_page_preview": True,
         }
         resp = httpx.post(url, json=payload, timeout=10.0)
         if resp.is_success:

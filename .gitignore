@@ -11,9 +11,16 @@ backend/*.db
 backend/*.db-shm
 backend/*.db-wal
 
-# ── Environment variables (contains API keys) ─────────────────────────────────
-backend/.env
+# ── Environment variables (contains API keys — NEVER commit) ─────────────────
+# Protects all .env variants; explicitly permits .env.example (safe placeholders only)
 .env
+*.env
+.env.*
+!.env.example
+backend/.env
+backend/*.env
+backend/.env.*
+!backend/.env.example
 
 # ── Node / Frontend ───────────────────────────────────────────────────────────
 node_modules/

@@ -177,14 +177,19 @@ export async function placeMT5DemoOrder(orderData) {
   });
 }
 
-// ─── Telegram API ─────────────────────────────────────────────────────────────
+// ─── Telegram Alert API ───────────────────────────────────────────────────────
 
+/** GET /alerts/telegram/status — returns config state, never returns token */
 export async function getTelegramStatus() {
-  return apiFetch('/telegram/status');
+  return apiFetch('/alerts/telegram/status');
 }
 
+/**
+ * POST /alerts/telegram/test — sends a test message.
+ * Requires TELEGRAM_ALERTS_ENABLED=true on the backend; returns 422 otherwise.
+ */
 export async function sendTelegramTest() {
-  return apiFetch('/telegram/test', { method: 'POST' });
+  return apiFetch('/alerts/telegram/test', { method: 'POST' });
 }
 
 // ─── Adapters: snake_case (backend) → camelCase (frontend) ───────────────────

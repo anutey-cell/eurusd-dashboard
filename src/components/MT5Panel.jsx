@@ -644,12 +644,12 @@ export default function MT5Panel({ selectedPair, currentSignal, tradePlan }) {
         )}
       </div>
 
-      {/* ── 9. Telegram Notifications ─────────────────────────────────────── */}
+      {/* ── 9. Telegram Signal Alerts ─────────────────────────────────────── */}
       <div className="mt-4 bg-[#0d1117] rounded-xl border border-[#263044] p-4">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center justify-between mb-1">
           <div className="flex items-center gap-2">
             <span className="text-sm">📨</span>
-            <span className="text-xs font-semibold text-gray-300">Telegram Notifications</span>
+            <span className="text-xs font-semibold text-gray-300">Telegram Signal Alerts</span>
             {tgStatus?.ready ? (
               <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-green-500/15 text-green-400 border border-green-500/20">ACTIVE</span>
             ) : (
@@ -662,35 +662,48 @@ export default function MT5Panel({ selectedPair, currentSignal, tradePlan }) {
               setTgTestResult(null);
               try {
                 const res = await sendTelegramTest();
-                setTgTestResult({ ok: true, msg: res?.message ?? 'Sent!' });
+                setTgTestResult({ ok: true, msg: res?.message ?? 'Test alert sent!' });
               } catch (err) {
-                setTgTestResult({ ok: false, msg: err?.message ?? 'Failed' });
+                const detail = err?.message ?? 'Failed';
+                setTgTestResult({
+                  ok: false,
+                  msg: detail.includes('TELEGRAM_ALERTS_ENABLED')
+                    ? 'Set TELEGRAM_ALERTS_ENABLED=true in backend/.env first'
+                    : detail,
+                });
               } finally {
                 setTgTesting(false);
               }
             }}
-            disabled={tgTesting}
-            className="px-2.5 py-1 rounded-md text-[10px] font-medium bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 border border-blue-500/20 disabled:opacity-40 transition-colors"
+            disabled={tgTesting || !tgStatus?.enabled}
+            title={!tgStatus?.enabled ? 'Set TELEGRAM_ALERTS_ENABLED=true in backend/.env to enable' : 'Send test alert to your Telegram chat'}
+            className="px-2.5 py-1 rounded-md text-[10px] font-medium bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 border border-blue-500/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
-            {tgTesting ? 'Sending…' : 'Send Test'}
+            {tgTesting ? 'Sending…' : 'Send Test Alert'}
           </button>
         </div>
 
-        {/* Status grid */}
+        {/* Notification-only reminder — always visible */}
+        <p className="text-[9px] text-amber-500/70 mb-3 flex items-center gap-1">
+          <span>⚠️</span>
+          Telegram alerts are notification-only. They do not place trades.
+        </p>
+
+        {/* Status grid — 6 cells */}
         <div className="grid grid-cols-3 gap-2 mb-3">
           {[
-            { label: 'Enabled',          val: tgStatus?.enabled },
-            { label: 'Signal Alerts',    val: tgStatus?.signal_alerts },
-            { label: 'Confirm Alerts',   val: tgStatus?.confirm_alerts },
-            { label: 'Trade Alerts',     val: tgStatus?.trade_alerts },
-            { label: 'Token Set',        val: tgStatus?.token_configured },
-            { label: 'Chat ID',          val: tgStatus?.chat_id_masked || (tgStatus?.token_configured ? '—' : 'not set') },
+            { label: 'Alerts Enabled',  val: tgStatus?.enabled },
+            { label: 'Bot Token',       val: tgStatus?.botTokenConfigured },
+            { label: 'Chat ID',         val: tgStatus?.chatIdConfigured ? (tgStatus?.chatIdMasked || 'set') : false },
+            { label: 'Signal Alerts',   val: tgStatus?.signalAlerts },
+            { label: 'Parse Mode',      val: tgStatus?.parseMode ?? '—' },
+            { label: 'Cooldown',        val: tgStatus?.cooldownMinutes != null ? `${tgStatus.cooldownMinutes} min` : '—' },
           ].map(({ label, val }) => (
             <div key={label} className="bg-[#131c27] rounded-lg p-2 border border-[#263044]">
               <div className="text-[9px] text-gray-600 uppercase tracking-wider mb-0.5">{label}</div>
               <div className={`text-[10px] font-semibold ${
-                val === true ? 'text-green-400' :
-                val === false ? 'text-gray-600' :
+                val === true  ? 'text-green-400' :
+                val === false ? 'text-gray-600'  :
                 'text-gray-400'
               }`}>
                 {val === true ? 'Yes' : val === false ? 'No' : (val ?? '—')}
@@ -701,12 +714,21 @@ export default function MT5Panel({ selectedPair, currentSignal, tradePlan }) {
 
         {/* Setup instructions when not configured */}
         {!tgStatus?.ready && (
-          <div className="text-[10px] text-gray-600 space-y-0.5 border-t border-[#263044] pt-2">
-            <p>To activate: set <code className="text-gray-400">TELEGRAM_ENABLED=true</code>, <code className="text-gray-400">TELEGRAM_BOT_TOKEN</code>, and <code className="text-gray-400">TELEGRAM_CHAT_ID</code> in <code className="text-gray-400">backend/.env</code>, then restart.</p>
+          <div className="text-[10px] text-gray-600 space-y-1 border-t border-[#263044] pt-2">
+            <p className="font-semibold text-gray-500">Setup:</p>
+            <p>1. Create bot via <code className="text-gray-400">@BotFather</code> → copy token</p>
+            <p>2. Visit <code className="text-gray-400">/getUpdates</code> to get your chat ID</p>
+            <p>3. Add to <code className="text-gray-400">backend/.env</code>:</p>
+            <pre className="bg-[#0a0f1a] rounded p-1.5 text-[9px] text-gray-400 mt-1 whitespace-pre-wrap">
+{`TELEGRAM_ALERTS_ENABLED=true
+TELEGRAM_BOT_TOKEN=your_token
+TELEGRAM_CHAT_ID=your_chat_id`}
+            </pre>
+            <p>4. Restart backend → click Send Test Alert</p>
           </div>
         )}
 
-        {/* Test result */}
+        {/* Test result banner */}
         {tgTestResult && (
           <div className={`mt-2 px-3 py-1.5 rounded-lg text-[10px] border ${
             tgTestResult.ok

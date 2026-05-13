@@ -135,3 +135,6 @@ class SignalAnalysisOutput(BaseModel):
     reason:       str
     news_status:  NewsStatus
     model:        SignalModelDetail
+    # Telegram alert delivery status — set by the signal router after analysis.
+    # Values: "sent" | "disabled" | "not_qualified" | "duplicate_skipped" | "failed"
+    alert_status: str | None = None

@@ -98,18 +98,23 @@ def fire_alert(
         )
 
     # ── Telegram channel ──────────────────────────────────────────────────────
-    if settings.telegram_enabled:
-        try:
-            from services.telegram_service import send_signal_alert
-            send_signal_alert(
-                pair=payload["pair"],
-                signal=payload["signal"],
-                score=payload["score"],
-                entry=payload.get("entry"),
-                stop_loss=payload.get("stopLoss"),
-                take_profit=payload.get("takeProfit"),
-                rr=payload.get("rr"),
-                reason=payload.get("reason", ""),
-            )
-        except Exception as _tg_exc:
-            logger.warning("Telegram alert error (non-fatal): %s", _tg_exc)
+    # Note: primary Telegram path is now directly in routers/signal.py via
+    # telegram_alert_service.send_signal_alert(). This fallback fires for
+    # webhook-triggered alerts that bypass the signal route (e.g. cron jobs).
+    try:
+        from services.telegram_alert_service import telegram_alerts_enabled, send_signal_alert as _tg_send
+        if telegram_alerts_enabled():
+            _tg_send({
+                "pair":         payload["pair"],
+                "signal":       payload["signal"],
+                "qualityScore": payload["score"],
+                "entry":        payload.get("entry"),
+                "stopLoss":     payload.get("stopLoss"),
+                "takeProfit":   payload.get("takeProfit"),
+                "rr":           payload.get("rr"),
+                "reason":       payload.get("reason", ""),
+                "newsStatus":   "CLEAR",
+                "model":        {},
+            })
+    except Exception as _tg_exc:
+        logger.warning("Telegram alert error (non-fatal): %s", _tg_exc)

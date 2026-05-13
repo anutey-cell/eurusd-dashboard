@@ -80,6 +80,19 @@ def analyze(
             getattr(result, "quality_score", "?"),
             getattr(result, "session", "?"),
         )
+
+        # ── Telegram alert (fire-and-forget — never breaks signal response) ───
+        alert_status: str = "disabled"
+        try:
+            from services.telegram_alert_service import send_signal_alert as _tg_send
+            # Build camelCase payload matching what the service expects
+            payload_dict = result.model_dump(by_alias=True)
+            alert_status = _tg_send(payload_dict)
+        except Exception as _tg_exc:
+            logger.debug("Telegram alert (non-fatal): %s", _tg_exc)
+            alert_status = "failed"
+
+        result.alert_status = alert_status
         return APIResponse(data=result)
     except ProviderError as exc:
         logger.warning("Provider error in signal analysis: %s", exc)

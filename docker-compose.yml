@@ -6,6 +6,9 @@
       - "8000:8000"
     volumes:
       - db_data:/app/storage
+    env_file:
+      - path: ./backend/.env    # loads all secrets (TELEGRAM_*, MT5_*, API keys, etc.)
+        required: false         # OK if .env not yet created — copy .env.example to start
     environment:
       - DATA_MODE=demo
       - DATABASE_URL=sqlite:////app/storage/eurusd_signals.db
