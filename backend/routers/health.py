@@ -46,3 +46,12 @@ def health_check() -> HealthDetail:
         broker_execution_enabled=settings.broker_execution_enabled,
         timestamp=datetime.now(timezone.utc),
     )
+
+
+@router.get("/pairs", summary="List supported trading pairs")
+def supported_pairs() -> dict:
+    from pair_config import get_supported_pairs
+    return {
+        "ok": True,
+        "data": get_supported_pairs(),
+    }

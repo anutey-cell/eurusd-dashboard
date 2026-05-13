@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    app_name: str    = "EUR/USD Signal API"
+    app_name: str    = "FX Signal Pro"
     version: str     = "1.0.0"
     api_prefix: str  = "/api/v1"
 
@@ -55,6 +55,25 @@ class Settings(BaseSettings):
         "http://localhost:3000",
         "http://127.0.0.1:5173",
     ]
+
+    # ── Candle caching ────────────────────────────────────────────────────────
+    candle_cache_enabled:    bool = True
+    candle_cache_ttl_seconds: int = 60
+
+    # ── Alert system ─────────────────────────────────────────────────────────
+    alerts_enabled:       bool = False
+    alert_webhook_url:    str  = ""
+    alert_email_to:       str  = ""
+
+    # ── Auth (optional API key protection) ───────────────────────────────────
+    auth_enabled: bool = False
+    api_key:      str  = "change_me"
+
+    # ── Rate limit backend ────────────────────────────────────────────────────
+    # "memory" = in-process (default, single node)
+    # "redis"  = Redis backend (multi-node VPS)
+    rate_limit_backend: str = "memory"
+    redis_url:          str = "redis://localhost:6379"
 
     # ── Derived helpers (not settable) ────────────────────────────────────────
     @property

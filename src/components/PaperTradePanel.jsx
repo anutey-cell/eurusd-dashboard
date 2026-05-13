@@ -22,8 +22,8 @@ import { confirmSignal } from '../services/api';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
-async function runAnalysis(macroEvents = []) {
-  const res = await fetch(`${API_BASE}/api/v1/signal/analyze`, {
+async function runAnalysis(macroEvents = [], pairCode = 'eurusd') {
+  const res = await fetch(`${API_BASE}/api/v1/signal/analyze?pair=${pairCode}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(macroEvents),
@@ -40,7 +40,7 @@ async function saveSignal(signal) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      pair:             'EUR/USD',
+      pair:             pairLabel,
       timeframe:        'H4',
       signal:           signal.signal,
       quality_score:    signal.qualityScore,
@@ -110,12 +110,12 @@ function ComponentRow({ label, text, positive }) {
   );
 }
 
-function PriceBox({ label, value, cls = 'text-white' }) {
+function PriceBox({ label, value, cls = 'text-white', decimals = 5 }) {
   return (
     <div className="bg-[#1e2535] rounded-lg p-3 text-center">
       <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">{label}</div>
       <div className={`font-mono text-sm font-bold ${cls}`}>
-        {value != null ? value.toFixed(5) : '—'}
+        {value != null ? value.toFixed(decimals) : '—'}
       </div>
     </div>
   );
@@ -123,7 +123,11 @@ function PriceBox({ label, value, cls = 'text-white' }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function PaperTradePanel({ onConfirmed }) {
+export default function PaperTradePanel({ onConfirmed, selectedPair }) {
+  const pairCode     = selectedPair?.code     ?? 'eurusd';
+  const pairLabel    = selectedPair?.label    ?? 'EUR/USD';
+  const pairDecimals = selectedPair?.decimals ?? 5;
+
   const [running,   setRunning]   = useState(false);
   const [result,    setResult]    = useState(null);
   const [error,     setError]     = useState(null);
@@ -137,7 +141,7 @@ export default function PaperTradePanel({ onConfirmed }) {
     setResult(null);
     setSaved(null);
     try {
-      const data = await runAnalysis([]);
+      const data = await runAnalysis([], pairCode);
       setResult(data);
     } catch (e) {
       setError(e.message);
@@ -172,7 +176,7 @@ export default function PaperTradePanel({ onConfirmed }) {
         <div className="flex items-center gap-2.5">
           <BookOpen size={15} className="text-blue-400" />
           <h2 className="text-sm font-semibold text-slate-200 tracking-wide">
-            Paper Trading Workflow
+            Paper Trading — {pairLabel}
           </h2>
         </div>
         <span className="text-[10px] text-slate-500 bg-slate-800 px-2 py-0.5 rounded-full border border-slate-700">
@@ -234,9 +238,9 @@ export default function PaperTradePanel({ onConfirmed }) {
           {/* Trade geometry — only shown when tradeable */}
           {isTradeable && (
             <div className="grid grid-cols-3 gap-2">
-              <PriceBox label="Entry"      value={result.entry}      cls="text-blue-400" />
-              <PriceBox label="Stop Loss"  value={result.stopLoss}   cls="text-red-400" />
-              <PriceBox label="Take Profit" value={result.takeProfit} cls="text-emerald-400" />
+              <PriceBox label="Entry"      value={result.entry}      cls="text-blue-400"    decimals={pairDecimals} />
+              <PriceBox label="Stop Loss"  value={result.stopLoss}   cls="text-red-400"     decimals={pairDecimals} />
+              <PriceBox label="Take Profit" value={result.takeProfit} cls="text-emerald-400" decimals={pairDecimals} />
             </div>
           )}
 
@@ -320,10 +324,10 @@ export default function PaperTradePanel({ onConfirmed }) {
               </div>
               <ul className="text-xs text-blue-200/80 space-y-1 list-disc list-inside">
                 <li>Direction: <strong>{result.signal}</strong></li>
-                <li>Entry near: <strong className="font-mono">{result.entry?.toFixed(5)}</strong></li>
-                <li>Stop Loss: <strong className="font-mono">{result.stopLoss?.toFixed(5)}</strong></li>
-                <li>Take Profit: <strong className="font-mono">{result.takeProfit?.toFixed(5)}</strong></li>
-                <li>Invalidation: <strong className="font-mono">{result.invalidation?.toFixed(5)}</strong></li>
+                <li>Entry near: <strong className="font-mono">{result.entry?.toFixed(pairDecimals)}</strong></li>
+                <li>Stop Loss: <strong className="font-mono">{result.stopLoss?.toFixed(pairDecimals)}</strong></li>
+                <li>Take Profit: <strong className="font-mono">{result.takeProfit?.toFixed(pairDecimals)}</strong></li>
+                <li>Invalidation: <strong className="font-mono">{result.invalidation?.toFixed(pairDecimals)}</strong></li>
               </ul>
               <p className="text-[11px] text-blue-300/60 mt-2">
                 When the trade closes — come back to Signal History below and click <strong>Log Result</strong> on this row.

@@ -304,16 +304,26 @@ def _to_float(s: str | None, default: float) -> float:
 
 # ── Public router ─────────────────────────────────────────────────────────────
 
-def get_macro_calendar(date: str | None = None) -> list[dict]:
+def get_macro_calendar(date: str | None = None, pair: str = "eurusd") -> list[dict]:
     """
     Single entry point for all callers.
+    pair  — pair code, used to filter relevant currencies
 
     Demo mode  → static mock events, no network.
     Live mode  → routes to CALENDAR_PROVIDER; requires CALENDAR_API_KEY
                  (or TE_CLIENT + TE_SECRET for trading_economics).
     """
+    from pair_config import get_pair_config
+    try:
+        pair_cfg = get_pair_config(pair)
+        relevant_currencies = set(pair_cfg["news_currencies"])
+    except ValueError:
+        relevant_currencies = {"EUR", "USD"}
+
     if settings.data_mode == "demo":
-        return _get_demo_calendar(date)
+        events = _get_demo_calendar(date)
+        # Filter to pair-relevant currencies
+        return [e for e in events if e.get("currency", "").upper() in relevant_currencies]
 
     provider = settings.calendar_provider.lower()
 
@@ -325,13 +335,17 @@ def get_macro_calendar(date: str | None = None) -> list[dict]:
         )
 
     if provider == "fmp":
-        return get_fmp_calendar(date)
+        events = get_fmp_calendar(date)
+        return [e for e in events if e.get("currency", "").upper() in relevant_currencies]
     if provider == "trading_economics":
-        return get_trading_economics_calendar(date)
+        events = get_trading_economics_calendar(date)
+        return [e for e in events if e.get("currency", "").upper() in relevant_currencies]
     if provider == "eodhd":
-        return get_eodhd_calendar(date)
+        events = get_eodhd_calendar(date)
+        return [e for e in events if e.get("currency", "").upper() in relevant_currencies]
     if provider == "broker":
-        return get_broker_calendar(date)
+        events = get_broker_calendar(date)
+        return [e for e in events if e.get("currency", "").upper() in relevant_currencies]
 
     raise ValueError(
         f"Unsupported CALENDAR_PROVIDER='{settings.calendar_provider}'. "

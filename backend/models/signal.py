@@ -121,6 +121,8 @@ class SignalAnalysisOutput(BaseModel):
     """Flat signal output matching the expected frontend format."""
     model_config = _camel_cfg
 
+    pair:         str = "eurusd"
+    display_pair: str = "EUR/USD"
     signal:       EngineDirection
     quality_score: int        = Field(ge=0, le=100)
     entry:        float | None = None

@@ -47,10 +47,11 @@ function useDataStatus() {
   return { status, error };
 }
 
-export default function Header() {
+export default function Header({ selectedPair }) {
   const [now, setNow] = useState(new Date());
   const { price, tick } = useSimulatedPrice(currentSignal.price);
   const { status, error: statusError } = useDataStatus();
+  const pairLabel = selectedPair?.label ?? 'EUR/USD';
 
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 1000);
@@ -84,7 +85,7 @@ export default function Header() {
 
       {/* Live Price Ticker */}
       <div className="flex items-center gap-2 bg-[#161b27] border border-[#263044] rounded-lg px-4 py-2">
-        <span className="text-xs font-semibold text-gray-400 mr-1">EUR/USD</span>
+        <span className="text-xs font-semibold text-gray-400 mr-1">{pairLabel}</span>
         <span
           className={`font-mono text-xl font-bold transition-colors duration-300 ${
             tick === 'up' ? 'text-emerald-400' : tick === 'down' ? 'text-red-400' : 'text-white'
@@ -130,6 +131,11 @@ export default function Header() {
             <span className="text-amber-400 font-medium">Demo Mode</span>
           </div>
         )}
+
+        {/* Broker Disabled badge */}
+        <div className="flex items-center gap-1.5 bg-slate-800 border border-slate-700 rounded px-2 py-0.5">
+          <span className="text-slate-500 font-medium text-[10px]">Execution DISABLED</span>
+        </div>
 
         {/* Data Provider */}
         {provider && (

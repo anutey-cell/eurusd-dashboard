@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from models.analytics import AnalyticsResponse, FullAnalyticsResponse
@@ -36,12 +36,24 @@ def mock_analytics() -> APIResponse[AnalyticsResponse]:
         "completed trades. Confidence level is indicated in sampleInfo."
     ),
 )
-def full_analytics(db: Session = Depends(get_db)) -> APIResponse[FullAnalyticsResponse]:
+def full_analytics(
+    db: Session = Depends(get_db),
+    pair: str | None = Query(default=None, description="Filter by pair code: eurusd | xauusd"),
+) -> APIResponse[FullAnalyticsResponse]:
     confirmed_records = (
         db.query(SignalRecord)
           .filter(SignalRecord.confirmed == True)
           .all()
     )
+
+    if pair:
+        from pair_config import get_pair_config
+        try:
+            pair_cfg = get_pair_config(pair)
+            pair_display = pair_cfg["display"]
+            confirmed_records = [r for r in confirmed_records if r.pair == pair_display]
+        except ValueError:
+            pass  # invalid pair code — return all
 
     completed_records = [r for r in confirmed_records if r.result in ("WIN", "LOSS", "BREAKEVEN")]
 

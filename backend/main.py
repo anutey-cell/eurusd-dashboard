@@ -16,7 +16,7 @@ from config import settings
 from database import engine
 import db_models  # registers ORM classes with Base.metadata
 from logging_config import setup_logging
-from middleware import RequestLoggingMiddleware
+from middleware import RequestLoggingMiddleware, AuthMiddleware
 from rate_limit import limiter
 from routers import health, candles, calendar, signal, analytics, backtest, execution
 
@@ -53,6 +53,7 @@ app = FastAPI(
 # ── Rate limiter ──────────────────────────────────────────────────────────────
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(AuthMiddleware)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
@@ -126,7 +127,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 # ── Routers ───────────────────────────────────────────────────────────────────
 prefix = settings.api_prefix
 
-app.include_router(health.router,     prefix=prefix)
+app.include_router(health.router,     prefix=prefix)  # includes /health and /pairs
 app.include_router(candles.router,    prefix=prefix)
 app.include_router(calendar.router,   prefix=prefix)
 app.include_router(signal.router,     prefix=prefix)

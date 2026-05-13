@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from data.candles import get_candles, INTERVAL_MINUTES
 from exceptions import ProviderError
-from pair_config import SUPPORTED_PAIRS, DEFAULT_PAIR
+from pair_config import SUPPORTED_PAIRS, DEFAULT_PAIR, DEFAULT_PAIR_CODE, validate_pair
 from rate_limit import limiter
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
@@ -26,10 +26,8 @@ VALID_TIMEFRAMES = list(INTERVAL_MINUTES.keys())
 
 
 def _fetch_candles(pair: str, timeframe: str, lookback: int):
-    if pair == DEFAULT_PAIR:
-        return get_candles(interval=timeframe, limit=lookback)
-    from services.candle_provider import get_eurusd_candles
-    return get_eurusd_candles(timeframe=timeframe, lookback=lookback, pair=pair)
+    """Fetch candles for any supported pair (pair is already a normalised code)."""
+    return get_candles(interval=timeframe, limit=lookback, pair=pair)
 
 
 # ── /backtest/run ─────────────────────────────────────────────────────────────
@@ -66,10 +64,12 @@ def backtest_run(
             status_code=422,
             detail=f"Unknown timeframe '{timeframe}'. Valid: {VALID_TIMEFRAMES}",
         )
-    if pair not in SUPPORTED_PAIRS:
+    try:
+        pair = validate_pair(pair)   # normalise to code ("eurusd" | "xauusd")
+    except ValueError:
         raise HTTPException(
             status_code=422,
-            detail=f"Unsupported pair '{pair}'. Valid: {SUPPORTED_PAIRS}",
+            detail=f"Unsupported pair '{pair}'. Valid codes: {list(SUPPORTED_PAIRS)}",
         )
 
     logger.info(
@@ -131,10 +131,12 @@ def backtest_optimize(
             status_code=422,
             detail=f"Unknown timeframe '{timeframe}'. Valid: {VALID_TIMEFRAMES}",
         )
-    if pair not in SUPPORTED_PAIRS:
+    try:
+        pair = validate_pair(pair)   # normalise to code
+    except ValueError:
         raise HTTPException(
             status_code=422,
-            detail=f"Unsupported pair '{pair}'. Valid: {SUPPORTED_PAIRS}",
+            detail=f"Unsupported pair '{pair}'. Valid codes: {list(SUPPORTED_PAIRS)}",
         )
 
     logger.info(

@@ -67,10 +67,13 @@ def signal_history(
 def analyze(
     request: Request,
     macro_events: list[dict] = Body(default=[], description="Optional macro calendar events"),
+    pair: str = Query(default="eurusd", description="Trading pair code: eurusd | xauusd"),
 ) -> APIResponse[SignalAnalysisOutput]:
-    logger.info("Signal analysis requested ip=%s", request.client.host if request.client else "unknown")
+    logger.info("Signal analysis requested pair=%s ip=%s", pair, request.client.host if request.client else "unknown")
     try:
-        result = run_signal_analysis(macro_events)
+        from pair_config import validate_pair as _validate_pair
+        pair = _validate_pair(pair)
+        result = run_signal_analysis(macro_events, pair=pair)
         logger.info(
             "Signal analyzed signal=%s quality=%s session=%s",
             getattr(result, "signal", "?"),

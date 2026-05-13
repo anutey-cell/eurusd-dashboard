@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { RefreshCw, Clock } from 'lucide-react';
+import { RefreshCw, Clock, Shield } from 'lucide-react';
 
 import { getSignal, getMacroCalendar, getSignalHistory, getAnalytics } from '../services/api';
 import {
@@ -23,6 +23,33 @@ import BacktestDashboard   from './BacktestDashboard';
 import ExecutionPanel      from './ExecutionPanel';
 import PaperTradePanel     from './PaperTradePanel';
 import PaperTradeJournal   from './PaperTradeJournal';
+
+// ─── Pair options ────────────────────────────────────────────────────────────
+
+const PAIR_OPTIONS = [
+  { code: 'eurusd', label: 'EUR/USD', symbol: 'FX:EURUSD',      decimals: 5 },
+  { code: 'xauusd', label: 'XAU/USD', symbol: 'OANDA:XAU_USD',  decimals: 2 },
+];
+
+function PairSelector({ selected, onChange }) {
+  return (
+    <div className="flex items-center gap-1 bg-[#131c27] border border-[#263044] rounded-lg p-0.5">
+      {PAIR_OPTIONS.map(p => (
+        <button
+          key={p.code}
+          onClick={() => onChange(p)}
+          className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
+            selected === p.code
+              ? 'bg-blue-600 text-white'
+              : 'text-gray-500 hover:text-gray-300'
+          }`}
+        >
+          {p.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -108,7 +135,7 @@ function useRefreshCountdown(ms) {
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
-export default function Dashboard() {
+export default function Dashboard({ selectedPair, onPairChange }) {
   // Four API calls — signal + calendar auto-refresh every 60 s
   const signal    = useDataSource(getSignal,        FALLBACKS.signal,    REFRESH_MS);
   const calendar  = useDataSource(getMacroCalendar, FALLBACKS.calendar,  REFRESH_MS);
@@ -117,6 +144,9 @@ export default function Dashboard() {
 
   // journalKey bumps each time a trade is confirmed → triggers PaperTradeJournal reload
   const [journalKey, setJournalKey] = useState(0);
+
+  // selectedPair / onPairChange lifted to App.jsx so Header can also read it
+  const setSelectedPair = onPairChange ?? (() => {});
 
   const countdown    = useRefreshCountdown(REFRESH_MS);
   const refreshing   = signal.loading || calendar.loading;
@@ -151,11 +181,23 @@ export default function Dashboard() {
             </div>
           )}
         </div>
-        {anyFallback && (
-          <span className="text-[10px] text-amber-400/60 italic">
-            One or more panels using mock fallback
-          </span>
-        )}
+        <div className="flex items-center gap-3">
+          <PairSelector selected={selectedPair.code} onChange={setSelectedPair} />
+          {anyFallback && (
+            <span className="text-[10px] text-amber-400/60 italic">
+              One or more panels using mock fallback
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* ── Safety Banner ──────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-3 px-4 py-1.5 bg-amber-500/5 border-b border-amber-500/10 text-[10px] text-amber-400/70">
+        <Shield size={10} className="flex-shrink-0" />
+        <span>
+          Manual confirmation mode — this system does not execute trades.
+          {selectedPair.code === 'xauusd' && ' XAU/USD uses 1.0 point = 1 USD move.'}
+        </span>
       </div>
 
       {/* ── Main layout ────────────────────────────────────────────────────── */}
@@ -183,7 +225,7 @@ export default function Dashboard() {
           {/* Center — chart stays frontend-only */}
           <div className="flex-1 min-w-0 flex flex-col gap-4">
             <div style={{ height: 540 }}>
-              <TradingViewWidget />
+              <TradingViewWidget symbol={selectedPair.symbol} />
             </div>
             <AnalyticsDashboard
               loading={analytics.loading}
@@ -214,10 +256,11 @@ export default function Dashboard() {
         {/* Row 3: paper trading — run analysis + confirm */}
         <PaperTradePanel
           onConfirmed={() => setJournalKey(k => k + 1)}
+          selectedPair={selectedPair}
         />
 
         {/* Row 4: paper trading journal — DB-backed history with Log Result */}
-        <PaperTradeJournal refreshKey={journalKey} />
+        <PaperTradeJournal refreshKey={journalKey} selectedPair={selectedPair} />
 
         {/* Row 5: mock signal history */}
         <SignalHistory

@@ -8,7 +8,7 @@ const TIMEFRAMES = [
   { label: 'D1',  value: 'D'   },
 ];
 
-export default function TradingViewWidget() {
+export default function TradingViewWidget({ symbol = 'FX:EURUSD' }) {
   const containerRef = useRef(null);
   const [interval, setInterval_] = useState('240');
   const [loaded, setLoaded] = useState(false);
@@ -27,7 +27,7 @@ export default function TradingViewWidget() {
       if (!containerRef.current) return;
       widgetRef.current = new window.TradingView.widget({
         autosize: true,
-        symbol: 'FX:EURUSD',
+        symbol: symbol,
         interval,
         timezone: 'Etc/UTC',
         theme: 'dark',
@@ -67,14 +67,14 @@ export default function TradingViewWidget() {
     return () => {
       if (containerRef.current) containerRef.current.innerHTML = '';
     };
-  }, [interval]);
+  }, [interval, symbol]);
 
   return (
     <div className="card flex flex-col h-full min-h-[480px]">
       <div className="card-header">
         <div className="flex items-center gap-2">
           <BarChart2 size={13} className="text-blue-400" />
-          <span className="card-title">Chart — EUR/USD</span>
+          <span className="card-title">Chart — {symbol}</span>
         </div>
         <div className="flex items-center gap-2">
           {/* Timeframe buttons */}

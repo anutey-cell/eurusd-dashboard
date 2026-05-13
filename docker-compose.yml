@@ -5,10 +5,10 @@
     ports:
       - "8000:8000"
     volumes:
-      - db_data:/app/data
+      - db_data:/app/storage
     environment:
       - DATA_MODE=demo
-      - DATABASE_URL=sqlite:////app/data/eurusd_signals.db
+      - DATABASE_URL=sqlite:////app/storage/eurusd_signals.db
       # CORS default already includes localhost:5173 — override only needed for VPS
       # CORS_ORIGINS=["http://yourdomain.com"]
     restart: unless-stopped

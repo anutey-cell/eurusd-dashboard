@@ -46,8 +46,13 @@ export async function getDataStatus() {
   };
 }
 
-export async function getCandles({ interval = 'H4', limit = 200 } = {}) {
-  return apiFetch(`/candles?interval=${interval}&limit=${limit}`);
+export async function getPairs() {
+  return apiFetch('/pairs');
+}
+
+export async function getCandles({ pair = 'eurusd', interval = 'H4', limit = 200 } = {}) {
+  const params = new URLSearchParams({ pair, interval, limit });
+  return apiFetch(`/candles?${params}`);
 }
 
 export async function getMacroCalendar({ date } = {}) {
@@ -104,10 +109,11 @@ export async function updateSignalResult(signalId, resultData) {
 }
 
 /** Fetch paper-trading journal from the real database (/signal/db/history) */
-export async function getDbSignalHistory({ page = 1, pageSize = 20, signal, result } = {}) {
+export async function getDbSignalHistory({ page = 1, pageSize = 20, signal, result, pair } = {}) {
   const params = new URLSearchParams({ page, page_size: pageSize });
   if (signal) params.set('signal', signal);
   if (result)  params.set('result', result);
+  if (pair)   params.set('pair', pair);
   const res = await apiFetch(`/signal/db/history?${params}`);
   // Schemas use alias_generator=to_camel so backend emits camelCase already
   return {
@@ -116,6 +122,16 @@ export async function getDbSignalHistory({ page = 1, pageSize = 20, signal, resu
     pageSize: res.data.pageSize,  // alias_generator=to_camel → pageSize not page_size
     signals:  res.data.signals,   // array of SignalRead (camelCase)
   };
+}
+
+export async function analyzeSignalForPair(pair = 'eurusd', macroEvents = []) {
+  const res = await apiFetch('/signal/analyze', {
+    method: 'POST',
+    body: JSON.stringify(macroEvents),
+  });
+  // res.data is SignalAnalysisOutput — add pair to it if missing
+  if (res.data && !res.data.pair) res.data.pair = pair;
+  return res.data;
 }
 
 /** Log the final outcome of a paper trade (PUT /signal/{id}/result) */
@@ -161,22 +177,25 @@ function adaptSignal(res) {
 }
 
 function adaptHistory(res) {
+  // Handle both /signal/history (trades array) and /signal/db/history (signals array)
+  const data = res.data ?? res;
+  const rawTrades = data.trades ?? data.signals ?? [];
   return {
-    total:    res.data.total,
-    page:     res.data.page,
-    pageSize: res.data.page_size,
-    trades: res.data.trades.map(t => ({
+    total:    data.total    ?? rawTrades.length,
+    page:     data.page     ?? 1,
+    pageSize: data.page_size ?? data.pageSize ?? 20,
+    trades: rawTrades.map(t => ({
       id:         t.id,
       date:       t.date,
       time:       t.time,
-      dir:        t.direction,
+      dir:        t.direction ?? t.signal,
       entry:      t.entry,
-      exit:       t.exit,
+      exit:       t.exit ?? t.exitPrice,
       pips:       t.pips,
       rr:         t.rr,
       result:     t.result,
       pnl:        t.pnl,
-      confidence: t.confidence,
+      confidence: t.confidence ?? t.qualityScore,
     })),
   };
 }

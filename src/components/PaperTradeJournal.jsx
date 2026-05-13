@@ -197,7 +197,7 @@ function LogResultForm({ record, onSaved, onCancel }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function PaperTradeJournal({ refreshKey = 0 }) {
+export default function PaperTradeJournal({ refreshKey = 0, selectedPair }) {
   const [records,    setRecords]    = useState([]);
   const [total,      setTotal]      = useState(0);
   const [loading,    setLoading]    = useState(true);
@@ -210,16 +210,22 @@ export default function PaperTradeJournal({ refreshKey = 0 }) {
     setLoading(true);
     setError(null);
     try {
-      const sig    = filterSig !== 'ALL' ? filterSig : undefined;
-      const data   = await getDbSignalHistory({ page: 1, pageSize: 50, signal: sig });
-      setRecords(data.signals ?? []);
-      setTotal(data.total ?? 0);
+      const sig        = filterSig !== 'ALL' ? filterSig : undefined;
+      const pairFilter = selectedPair?.label;  // e.g. "EUR/USD"
+      const data       = await getDbSignalHistory({ page: 1, pageSize: 50, signal: sig });
+      // Filter client-side by pair if a specific pair is selected
+      const allSigs  = data.signals ?? [];
+      const filtered = pairFilter
+        ? allSigs.filter(r => !r.pair || r.pair === pairFilter)
+        : allSigs;
+      setRecords(filtered);
+      setTotal(pairFilter ? filtered.length : (data.total ?? 0));
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
     }
-  }, [filterSig]);
+  }, [filterSig, selectedPair]);
 
   // reload when parent calls onConfirmed (refreshKey bumped) or filter changes
   useEffect(() => { load(); }, [load, refreshKey]);
@@ -238,7 +244,9 @@ export default function PaperTradeJournal({ refreshKey = 0 }) {
           <h2 className="text-sm font-semibold text-slate-200 tracking-wide">
             Paper Trading Journal
           </h2>
-          <span className="text-[10px] text-gray-600">({total} saved)</span>
+          <span className="text-[10px] text-gray-600">
+            {selectedPair ? selectedPair.label : 'All Pairs'} · ({total} saved)
+          </span>
           {pending.length > 0 && (
             <span className="text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/30 px-1.5 py-0.5 rounded">
               {pending.length} pending

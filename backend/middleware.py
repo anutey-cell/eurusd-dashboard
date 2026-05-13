@@ -43,3 +43,52 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
         response.headers["X-Request-ID"] = request_id
         return response
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """
+    Optional API-key middleware.
+    Only active when AUTH_ENABLED=true in .env.
+    Protected paths: /signal/confirm, /signal/*/result, /execution/*, /backtest/*
+    Skips /health, /pairs, /signal/analyze, /signal/current, /signal/history,
+          /signal/db/history, /candles, /calendar, /analytics, /cot
+    """
+    _PROTECTED_PREFIXES = (
+        "/api/v1/signal/confirm",
+        "/api/v1/signal/db/history",  # write endpoints only
+        "/api/v1/execution",
+    )
+    _OPEN_PREFIXES = (
+        "/api/v1/health",
+        "/api/v1/pairs",
+        "/api/v1/signal/analyze",
+        "/api/v1/signal/current",
+        "/api/v1/signal/history",
+        "/api/v1/candles",
+        "/api/v1/calendar",
+        "/api/v1/analytics",
+        "/api/v1/cot",
+        "/api/v1/backtest",
+    )
+
+    async def dispatch(self, request: Request, call_next):
+        from config import settings
+        if not settings.auth_enabled:
+            return await call_next(request)
+
+        path = request.url.path
+        # Allow open paths
+        if any(path.startswith(p) for p in self._OPEN_PREFIXES):
+            return await call_next(request)
+
+        # Check protected paths
+        if any(path.startswith(p) for p in self._PROTECTED_PREFIXES):
+            api_key = request.headers.get("X-API-Key", "")
+            if not api_key or api_key != settings.api_key:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": True, "message": "Missing or invalid API key"},
+                )
+
+        return await call_next(request)

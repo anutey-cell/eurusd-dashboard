@@ -21,6 +21,29 @@ export const currentSignal = {
   ],
 };
 
+// ─── XAU/USD Mock Signal ──────────────────────────────────────────────────────
+export const xauusdSignal = {
+  direction:  'WAIT',
+  strength:   62,
+  confidence: 55,
+  timestamp:  '2026-05-13T09:30:00Z',
+  session:    'London',
+  timeframe:  'H4',
+  price:      2358.40,
+  change:     -3.20,
+  changePct:  -0.14,
+  factors: [
+    { name: 'DXY Trend',        value: 'USD strengthening', score: 45, positive: false },
+    { name: 'Real Yields',      value: 'Rising (bearish Au)', score: 40, positive: false },
+    { name: 'Market Structure', value: 'Waiting for CHoCH',  score: 50, positive: false },
+    { name: 'Liquidity',        value: 'Buy-side not swept', score: 30, positive: false },
+    { name: 'FVG',              value: 'No valid FVG yet',   score: 35, positive: false },
+    { name: 'Session',          value: 'London kill zone',   score: 70, positive: true  },
+    { name: 'News Risk',        value: 'NFP Friday — CAUTION', score: 0, positive: false },
+    { name: 'Spread',           value: '0.3 pts (normal)',   score: 85, positive: true  },
+  ],
+};
+
 // ─── Trade Plan ───────────────────────────────────────────────────────────────
 export const tradePlan = {
   entry: 1.08450,
@@ -316,6 +339,26 @@ const _buildMockEquityCurve = () => {
   const pips = [39,25,-23,52,0,35,-22,62,34,27,-25,55,35,-20,35,53,25,-24,34,53];
   let cum = 0;
   return pips.map((p, i) => ({ trade: i + 1, pips: p, cumulativePips: (cum += p) }));
+};
+
+// ─── Pair Configurations ──────────────────────────────────────────────────────
+export const PAIR_CONFIGS = {
+  eurusd: {
+    code: 'eurusd',
+    label: 'EUR/USD',
+    symbol: 'FX:EURUSD',
+    decimals: 5,
+    pipUnit: 'pips',
+    targetLabel: '40 pips',
+  },
+  xauusd: {
+    code: 'xauusd',
+    label: 'XAU/USD',
+    symbol: 'OANDA:XAU_USD',
+    decimals: 2,
+    pipUnit: 'pts',
+    targetLabel: '50 pts',
+  },
 };
 
 export const mockFullAnalytics = {

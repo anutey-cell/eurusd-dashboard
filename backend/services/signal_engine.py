@@ -154,6 +154,8 @@ class SignalResult:
     fvg: FVGResult
     news: NewsResult
     sess: SessionResult
+    pair: str = "eurusd"
+    display_pair: str = "EUR/USD"
 
 
 # ── EMA helper ────────────────────────────────────────────────────────────────
@@ -480,7 +482,8 @@ def _build_reason(
 # ── 9. Master analysis  ───────────────────────────────────────────────────────
 
 def analyze_signal(
-    candles: list[Any],
+    pair: str = "eurusd",
+    candles: list[Any] = None,
     macro_events: list[dict] | None = None,
     at: datetime | None = None,
     pip_size: float = PIP,
@@ -492,15 +495,39 @@ def analyze_signal(
     """
     Run the full ICT/SMC pipeline.
 
+    pair          – pair code ("eurusd" | "xauusd"); drives per-pair config defaults
     at            – historical timestamp for backtesting (uses now() if None)
-    pip_size      – pair-specific pip (0.0001 EUR/USD, 0.01 JPY, 0.1 XAU)
+    pip_size      – pair-specific pip (0.0001 EUR/USD, 0.01 JPY, 1.0 XAU)
     target_pips   – fixed profit-target in pips for this pair
     sl_buffer_pips – structural SL buffer added beyond the swept level
     min_rr        – minimum risk-reward ratio required to fire BUY/SELL
     fvg_min_pips  – minimum FVG size in pips to be considered valid
     """
+    if candles is None:
+        candles = []
+
     if macro_events is None:
         macro_events = []
+
+    # Load pair-specific settings (explicit params take precedence)
+    from pair_config import get_pair_config
+    try:
+        _pcfg = get_pair_config(pair)
+        # Only use pair config defaults if caller didn't override them
+        if pip_size == PIP:
+            pip_size = _pcfg["pip_size"]
+        if target_pips == TARGET_PIPS:
+            target_pips = _pcfg["target_pips"]
+        if sl_buffer_pips == SL_BUFFER_PIPS:
+            sl_buffer_pips = _pcfg["sl_buffer_pips"]
+        if min_rr == MIN_RR:
+            min_rr = _pcfg["min_rr"]
+        if fvg_min_pips == 3:
+            fvg_min_pips = _pcfg["fvg_min_pips"]
+        _price_decimals = _pcfg["price_decimals"]
+    except ValueError:
+        _pcfg = None
+        _price_decimals = 5
 
     # Normalise input: accept dicts, Pydantic-like objects, or internal Candle
     def _to_candle(raw: Any) -> Candle:
@@ -532,7 +559,7 @@ def analyze_signal(
     sess = detect_session(at=at)
 
     score      = calculate_quality_score(htf, liq, ms, fvg, news, sess)
-    price      = round(bars[-1].close, 5) if bars else 1.08432
+    price      = round(bars[-1].close, _price_decimals) if bars else 1.08432
     bull_votes = sum([htf.bullish, liq.bullish, ms.bullish, fvg.bullish])
     bear_votes = 4 - bull_votes
 
@@ -603,6 +630,23 @@ def analyze_signal(
         "session":             sess.session_text,
     }
 
+    # Fire alert if BUY or SELL
+    if signal in ("BUY", "SELL"):
+        try:
+            from services.alert_service import fire_alert
+            fire_alert(
+                pair=_pcfg["display"] if _pcfg else pair,
+                signal=signal,
+                score=score,
+                entry=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                rr=rr,
+                reason=reason or "All gates passed",
+            )
+        except Exception:
+            pass  # alerts never block signal delivery
+
     return SignalResult(
         signal=signal,
         quality_score=score,
@@ -617,4 +661,6 @@ def analyze_signal(
         news_status=news.status,
         model=model_dict,
         htf=htf, liq=liq, ms=ms, fvg=fvg, news=news, sess=sess,
+        pair=pair,
+        display_pair=_pcfg["display"] if _pcfg else "EUR/USD",
     )

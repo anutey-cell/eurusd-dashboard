@@ -66,12 +66,20 @@ def get_current_signal() -> SignalOutput:
     return SignalOutput(signal=_CURRENT_SIGNAL, trade_plan=_TRADE_PLAN)
 
 
-def run_signal_analysis(macro_events: list[dict] | None = None) -> SignalAnalysisOutput:
+def run_signal_analysis(macro_events: list[dict] | None = None, pair: str = "eurusd") -> SignalAnalysisOutput:
     """Run the ICT engine on H4 candles and return the flat signal output."""
-    candle_resp = get_candles(interval="H4", limit=200)
-    r = analyze_signal(candle_resp.candles, macro_events or [])
+    from pair_config import get_pair_config
+    pair_cfg = get_pair_config(pair)
+    candle_resp = get_candles(interval="H4", limit=300, pair=pair)
+    r = analyze_signal(
+        pair=pair,
+        candles=candle_resp.candles,
+        macro_events=macro_events or [],
+    )
 
     return SignalAnalysisOutput(
+        pair=pair,
+        display_pair=pair_cfg.get("display", "EUR/USD"),
         signal=r.signal,                # type: ignore[arg-type]
         quality_score=r.quality_score,
         entry=r.entry,

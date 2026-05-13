@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from config import settings
-from pair_config import PAIRS, DEFAULT_PAIR, get_pair
+from pair_config import DEFAULT_PAIR_CODE, DEFAULT_PAIR, get_pair_config, get_pair
 from services.signal_engine import analyze_signal, PIP, TARGET_PIPS
 
 logger = logging.getLogger(__name__)
@@ -114,7 +114,7 @@ def _to_engine_candle(raw: Any):
 def run_backtest(
     candles_raw: list[Any],
     macro_events: list[dict] | None = None,
-    pair: str = DEFAULT_PAIR,
+    pair: str = DEFAULT_PAIR_CODE,
     signal_window: int = SIGNAL_WINDOW,
     min_rr_override: float | None = None,
 ) -> dict:
@@ -128,12 +128,13 @@ def run_backtest(
     min_rr_override - override the pair's default min RR (used by optimizer)
     """
     macro_events = macro_events or []
-    cfg = get_pair(pair)
-    pip_size       = cfg["pip"]
-    target_pips    = cfg["target_pips"]
-    sl_buffer_pips = cfg["sl_buffer_pips"]
-    fvg_min_pips   = cfg["fvg_min_pips"]
-    pair_min_rr    = min_rr_override if min_rr_override is not None else cfg["min_rr"]
+    cfg = get_pair_config(pair)
+    pip_size        = cfg["pip_size"]
+    target_pips     = cfg["target_pips"]
+    sl_buffer_pips  = cfg["sl_buffer_pips"]
+    fvg_min_pips    = cfg["fvg_min_pips"]
+    price_decimals  = cfg.get("price_decimals", 5)
+    pair_min_rr     = min_rr_override if min_rr_override is not None else cfg["min_rr"]
 
     cost = (SPREAD_PIPS + SLIPPAGE_PIPS) * pip_size
 
@@ -151,9 +152,14 @@ def run_backtest(
         candle_ts = bars[i].time
 
         result = analyze_signal(
-            window, macro_events, at=candle_ts,
-            pip_size=pip_size, target_pips=target_pips,
-            sl_buffer_pips=sl_buffer_pips, min_rr=pair_min_rr,
+            pair=pair,
+            candles=window,
+            macro_events=macro_events,
+            at=candle_ts,
+            pip_size=pip_size,
+            target_pips=target_pips,
+            sl_buffer_pips=sl_buffer_pips,
+            min_rr=pair_min_rr,
             fvg_min_pips=fvg_min_pips,
         )
 
@@ -166,13 +172,13 @@ def run_backtest(
 
         # Apply spread + slippage at entry
         if direction == "BUY":
-            entry       = round(bars[i].close + cost, 5)
+            entry       = round(bars[i].close + cost, price_decimals)
             stop_loss   = result.stop_loss
-            take_profit = round(entry + target_pips * pip_size, 5)
+            take_profit = round(entry + target_pips * pip_size, price_decimals)
         else:
-            entry       = round(bars[i].close - cost, 5)
+            entry       = round(bars[i].close - cost, price_decimals)
             stop_loss   = result.stop_loss
-            take_profit = round(entry - target_pips * pip_size, 5)
+            take_profit = round(entry - target_pips * pip_size, price_decimals)
 
         risk_pips = abs(entry - stop_loss) / pip_size
         if risk_pips <= 0:
@@ -219,8 +225,8 @@ def run_backtest(
             time=candle_ts.isoformat(),
             signal=direction,
             entry=entry,
-            stop_loss=round(stop_loss, 5),
-            take_profit=round(take_profit, 5),
+            stop_loss=round(stop_loss, price_decimals),
+            take_profit=round(take_profit, price_decimals),
             result=trade_result,
             pips=pips_result,
             rr=rr,
