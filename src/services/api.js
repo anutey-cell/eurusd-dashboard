@@ -177,6 +177,16 @@ export async function placeMT5DemoOrder(orderData) {
   });
 }
 
+// ─── Telegram API ─────────────────────────────────────────────────────────────
+
+export async function getTelegramStatus() {
+  return apiFetch('/telegram/status');
+}
+
+export async function sendTelegramTest() {
+  return apiFetch('/telegram/test', { method: 'POST' });
+}
+
 // ─── Adapters: snake_case (backend) → camelCase (frontend) ───────────────────
 
 function adaptSignal(res) {

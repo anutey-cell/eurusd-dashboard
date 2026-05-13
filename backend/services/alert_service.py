@@ -96,3 +96,20 @@ def fire_alert(
             "Email alert placeholder: would send to %s pair=%s signal=%s",
             settings.alert_email_to, pair, signal,
         )
+
+    # ── Telegram channel ──────────────────────────────────────────────────────
+    if settings.telegram_enabled:
+        try:
+            from services.telegram_service import send_signal_alert
+            send_signal_alert(
+                pair=payload["pair"],
+                signal=payload["signal"],
+                score=payload["score"],
+                entry=payload.get("entry"),
+                stop_loss=payload.get("stopLoss"),
+                take_profit=payload.get("takeProfit"),
+                rr=payload.get("rr"),
+                reason=payload.get("reason", ""),
+            )
+        except Exception as _tg_exc:
+            logger.warning("Telegram alert error (non-fatal): %s", _tg_exc)

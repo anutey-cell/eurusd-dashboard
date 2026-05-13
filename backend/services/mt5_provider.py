@@ -609,6 +609,12 @@ def place_demo_market_order(signal: dict) -> dict:
             spread=spread, ticket=None, status="rejected",
             rejection_reason=rejection_reason, reason=reason_txt, raw_response=None,
         )
+        # Fire Telegram rejection alert — fire-and-forget
+        try:
+            from services.telegram_service import send_demo_trade_rejected
+            send_demo_trade_rejected(pair=pair, signal=sig_dir, reasons=reasons)
+        except Exception as _tg_exc:
+            logger.debug("Telegram rejection alert (non-fatal): %s", _tg_exc)
         raise MT5SafetyError(rejection_reason)
 
     # Calculate position size (backend only — never trust frontend lot)
@@ -683,6 +689,18 @@ def place_demo_market_order(signal: dict) -> dict:
             "Demo order placed pair=%s signal=%s ticket=%s lot=%.2f entry=%.5f",
             pair, sig_dir, ticket, lot_size, actual_entry,
         )
+        # Fire Telegram alert — fire-and-forget, never raises
+        try:
+            from services.telegram_service import send_demo_trade_placed
+            send_demo_trade_placed(
+                pair=pair, signal=sig_dir, ticket=ticket,
+                broker_symbol=broker_symbol or pair,
+                lot_size=lot_size, entry=actual_entry,
+                stop_loss=stop_loss, take_profit=take_profit,
+                risk_percent=risk_pct, risk_amount=risk_amount, spread=spread,
+            )
+        except Exception as _tg_exc:
+            logger.debug("Telegram trade alert (non-fatal): %s", _tg_exc)
     else:
         status           = "failed"
         rejection_reason = f"MT5 error {result.retcode}: {result.comment}"

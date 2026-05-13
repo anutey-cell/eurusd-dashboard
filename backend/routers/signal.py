@@ -128,6 +128,25 @@ def confirm_and_save(
         "Signal confirmed id=%s pair=%s signal=%s quality=%s",
         record.id, body.pair, body.signal, body.quality_score,
     )
+
+    # Fire Telegram confirmation alert (fire-and-forget)
+    try:
+        from services.telegram_service import send_signal_confirmed
+        send_signal_confirmed(
+            pair=body.pair,
+            signal=body.signal,
+            signal_id=record.id,
+            score=body.quality_score,
+            entry=body.entry,
+            stop_loss=body.stop_loss,
+            take_profit=body.take_profit,
+            rr=body.rr,
+            session=body.session,
+            timeframe=body.timeframe,
+        )
+    except Exception as _tg_exc:
+        logger.debug("Telegram confirm alert (non-fatal): %s", _tg_exc)
+
     return APIResponse(data=SignalRead.model_validate(record))
 
 
@@ -191,6 +210,21 @@ def record_result(
         "Signal result recorded id=%s result=%s pips=%s",
         signal_id, body.result, body.pips,
     )
+
+    # Fire Telegram result alert (fire-and-forget)
+    try:
+        from services.telegram_service import send_result_logged
+        send_result_logged(
+            pair=record.pair,
+            signal=record.signal,
+            signal_id=signal_id,
+            result=body.result,
+            pips=body.pips,
+            pnl=body.pnl,
+        )
+    except Exception as _tg_exc:
+        logger.debug("Telegram result alert (non-fatal): %s", _tg_exc)
+
     return APIResponse(data=SignalRead.model_validate(record))
 
 

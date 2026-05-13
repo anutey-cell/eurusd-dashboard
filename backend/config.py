@@ -77,6 +77,16 @@ class Settings(BaseSettings):
     alert_webhook_url:    str  = ""
     alert_email_to:       str  = ""
 
+    # ── Telegram bot notifications ────────────────────────────────────────────
+    # Get token from @BotFather. Chat ID = your personal chat or channel.
+    # SECURITY: NEVER commit token to git — keep in .env only.
+    telegram_enabled:        bool = False
+    telegram_bot_token:      str  = ""   # NEVER logged or returned in API responses
+    telegram_chat_id:        str  = ""
+    telegram_signal_alerts:  bool = True   # alert when BUY/SELL signal fires
+    telegram_confirm_alerts: bool = True   # alert when signal confirmed to DB
+    telegram_trade_alerts:   bool = True   # alert when demo trade placed / rejected
+
     # ── Auth (optional API key protection) ───────────────────────────────────
     auth_enabled: bool = False
     api_key:      str  = "change_me"

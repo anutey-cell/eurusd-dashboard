@@ -26,6 +26,8 @@ import {
   getMT5Positions,
   getMT5Logs,
   placeMT5DemoOrder,
+  getTelegramStatus,
+  sendTelegramTest,
 } from '../services/api';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -127,6 +129,9 @@ export default function MT5Panel({ selectedPair, currentSignal, tradePlan }) {
   const [fetchError,   setFetchError]   = useState(null);
   const [orderLoading, setOrderLoading] = useState(false);
   const [orderResult,  setOrderResult]  = useState(null); // { success, message, ticket }
+  const [tgStatus,     setTgStatus]     = useState(null);
+  const [tgTesting,    setTgTesting]    = useState(false);
+  const [tgTestResult, setTgTestResult] = useState(null);
 
   const tickIntervalRef = useRef(null);
 
@@ -145,11 +150,16 @@ export default function MT5Panel({ selectedPair, currentSignal, tradePlan }) {
     setLoading(true);
     setFetchError(null);
     try {
-      const [statusRes, positionsRes, logsRes] = await Promise.allSettled([
+      const [statusRes, positionsRes, logsRes, tgRes] = await Promise.allSettled([
         getMT5Status(),
         getMT5Positions(),
         getMT5Logs({ page: 1, pageSize: 10 }),
+        getTelegramStatus(),
       ]);
+
+      if (tgRes.status === 'fulfilled') {
+        setTgStatus(tgRes.value?.data ?? tgRes.value);
+      }
 
       if (statusRes.status === 'fulfilled') {
         setStatus(statusRes.value?.data ?? statusRes.value);
@@ -630,6 +640,80 @@ export default function MT5Panel({ selectedPair, currentSignal, tradePlan }) {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+      </div>
+
+      {/* ── 9. Telegram Notifications ─────────────────────────────────────── */}
+      <div className="mt-4 bg-[#0d1117] rounded-xl border border-[#263044] p-4">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <span className="text-sm">📨</span>
+            <span className="text-xs font-semibold text-gray-300">Telegram Notifications</span>
+            {tgStatus?.ready ? (
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-green-500/15 text-green-400 border border-green-500/20">ACTIVE</span>
+            ) : (
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-gray-700/50 text-gray-500 border border-gray-700">INACTIVE</span>
+            )}
+          </div>
+          <button
+            onClick={async () => {
+              setTgTesting(true);
+              setTgTestResult(null);
+              try {
+                const res = await sendTelegramTest();
+                setTgTestResult({ ok: true, msg: res?.message ?? 'Sent!' });
+              } catch (err) {
+                setTgTestResult({ ok: false, msg: err?.message ?? 'Failed' });
+              } finally {
+                setTgTesting(false);
+              }
+            }}
+            disabled={tgTesting}
+            className="px-2.5 py-1 rounded-md text-[10px] font-medium bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 border border-blue-500/20 disabled:opacity-40 transition-colors"
+          >
+            {tgTesting ? 'Sending…' : 'Send Test'}
+          </button>
+        </div>
+
+        {/* Status grid */}
+        <div className="grid grid-cols-3 gap-2 mb-3">
+          {[
+            { label: 'Enabled',          val: tgStatus?.enabled },
+            { label: 'Signal Alerts',    val: tgStatus?.signal_alerts },
+            { label: 'Confirm Alerts',   val: tgStatus?.confirm_alerts },
+            { label: 'Trade Alerts',     val: tgStatus?.trade_alerts },
+            { label: 'Token Set',        val: tgStatus?.token_configured },
+            { label: 'Chat ID',          val: tgStatus?.chat_id_masked || (tgStatus?.token_configured ? '—' : 'not set') },
+          ].map(({ label, val }) => (
+            <div key={label} className="bg-[#131c27] rounded-lg p-2 border border-[#263044]">
+              <div className="text-[9px] text-gray-600 uppercase tracking-wider mb-0.5">{label}</div>
+              <div className={`text-[10px] font-semibold ${
+                val === true ? 'text-green-400' :
+                val === false ? 'text-gray-600' :
+                'text-gray-400'
+              }`}>
+                {val === true ? 'Yes' : val === false ? 'No' : (val ?? '—')}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Setup instructions when not configured */}
+        {!tgStatus?.ready && (
+          <div className="text-[10px] text-gray-600 space-y-0.5 border-t border-[#263044] pt-2">
+            <p>To activate: set <code className="text-gray-400">TELEGRAM_ENABLED=true</code>, <code className="text-gray-400">TELEGRAM_BOT_TOKEN</code>, and <code className="text-gray-400">TELEGRAM_CHAT_ID</code> in <code className="text-gray-400">backend/.env</code>, then restart.</p>
+          </div>
+        )}
+
+        {/* Test result */}
+        {tgTestResult && (
+          <div className={`mt-2 px-3 py-1.5 rounded-lg text-[10px] border ${
+            tgTestResult.ok
+              ? 'bg-green-500/10 border-green-500/20 text-green-400'
+              : 'bg-red-500/10 border-red-500/20 text-red-400'
+          }`}>
+            {tgTestResult.ok ? '✅ ' : '❌ '}{tgTestResult.msg}
           </div>
         )}
       </div>
