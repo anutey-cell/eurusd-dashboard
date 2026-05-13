@@ -1,0 +1,29 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/**/*.pyo
+backend/.pytest_cache/
+
+# ── Database (local only — never commit real signal data) ─────────────────────
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+
+# ── Environment variables (contains API keys) ─────────────────────────────────
+backend/.env
+.env
+
+# ── Node / Frontend ───────────────────────────────────────────────────────────
+node_modules/
+dist/
+.vite/
+
+# ── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,76 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+  body {
+    @apply bg-[#0d1117] text-gray-100;
+    min-height: 100vh;
+  }
+  * {
+    @apply border-[#263044];
+  }
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-[#0d1117];
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-[#263044] rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-[#3b4d66];
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-[#161b27] border border-[#263044] rounded-xl;
+  }
+  .card-header {
+    @apply flex items-center justify-between px-4 py-3 border-b border-[#263044];
+  }
+  .card-title {
+    @apply text-xs font-semibold uppercase tracking-widest text-gray-400;
+  }
+  .badge-buy {
+    @apply bg-emerald-500/20 text-emerald-400 border border-emerald-500/30;
+  }
+  .badge-sell {
+    @apply bg-red-500/20 text-red-400 border border-red-500/30;
+  }
+  .badge-neutral {
+    @apply bg-amber-500/20 text-amber-400 border border-amber-500/30;
+  }
+  .stat-value {
+    @apply font-mono text-lg font-semibold text-white;
+  }
+  .stat-label {
+    @apply text-xs text-gray-500 uppercase tracking-wider;
+  }
+  .impact-high {
+    @apply bg-red-500 text-red-500;
+  }
+  .impact-medium {
+    @apply bg-amber-500 text-amber-500;
+  }
+  .impact-low {
+    @apply bg-blue-500 text-blue-500;
+  }
+}
+
+.recharts-tooltip-wrapper .recharts-default-tooltip {
+  background-color: #1e2535 !important;
+  border: 1px solid #263044 !important;
+  border-radius: 8px !important;
+}
+
+.recharts-cartesian-axis-tick-value {
+  fill: #6b7280 !important;
+  font-size: 11px !important;
+}
