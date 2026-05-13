@@ -143,6 +143,40 @@ export async function logSignalResult(signalId, { result, exitPrice, pips, pnl =
   });
 }
 
+// ─── MT5 API ──────────────────────────────────────────────────────────────────
+
+export async function getMT5Status() {
+  return apiFetch('/mt5/status');
+}
+
+export async function getMT5Symbols() {
+  return apiFetch('/mt5/symbols');
+}
+
+export async function getMT5Tick(pair) {
+  return apiFetch(`/mt5/tick/${pair}`);
+}
+
+export async function getMT5Positions() {
+  return apiFetch('/mt5/positions');
+}
+
+export async function getMT5History() {
+  return apiFetch('/mt5/history');
+}
+
+export async function getMT5Logs({ page = 1, pageSize = 20 } = {}) {
+  const params = new URLSearchParams({ page, page_size: pageSize });
+  return apiFetch(`/mt5/logs?${params}`);
+}
+
+export async function placeMT5DemoOrder(orderData) {
+  return apiFetch('/mt5/demo-order', {
+    method: 'POST',
+    body: JSON.stringify(orderData),
+  });
+}
+
 // ─── Adapters: snake_case (backend) → camelCase (frontend) ───────────────────
 
 function adaptSignal(res) {

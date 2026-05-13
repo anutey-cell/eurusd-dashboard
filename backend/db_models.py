@@ -96,3 +96,29 @@ class CandleCacheRecord(Base):
     __table_args__ = (
         UniqueConstraint("pair", "timeframe", "candle_time", name="uq_candle"),
     )
+
+
+# ── mt5_trade_logs ────────────────────────────────────────────────────────────
+
+class MT5TradeLog(Base):
+    __tablename__ = "mt5_trade_logs"
+
+    id               = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    created_at       = Column(DateTime(timezone=True), default=_now, nullable=False)
+    mode             = Column(String(8),   nullable=False, default="demo")   # demo | live
+    pair             = Column(String(16),  nullable=False)
+    broker_symbol    = Column(String(32),  nullable=True)
+    signal           = Column(String(8),   nullable=False)   # BUY | SELL | WAIT
+    order_type       = Column(String(16),  nullable=False, default="MARKET")
+    volume           = Column(Float,       nullable=False, default=0.0)
+    entry            = Column(Float,       nullable=True)
+    stop_loss        = Column(Float,       nullable=True)
+    take_profit      = Column(Float,       nullable=True)
+    risk_percent     = Column(Float,       nullable=True)
+    risk_amount      = Column(Float,       nullable=True)
+    spread           = Column(Float,       nullable=True)
+    ticket           = Column(Integer,     nullable=True)     # MT5 order ticket
+    status           = Column(String(16),  nullable=False)    # accepted | rejected | failed
+    rejection_reason = Column(Text,        nullable=True)
+    reason           = Column(Text,        nullable=True)     # ICT setup description
+    raw_response_json = Column(Text,       nullable=True)     # JSON string of MT5 response

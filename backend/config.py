@@ -48,6 +48,18 @@ class Settings(BaseSettings):
     max_risk_per_trade_percent: float = 0.25
     daily_loss_limit_percent:   float = 1.0
 
+    # ── MT5 demo integration ──────────────────────────────────────────────────
+    mt5_enabled:              bool  = False
+    mt5_mode:                 str   = "demo"      # "demo" | "live" (live blocks execution)
+    mt5_server:               str   = ""
+    mt5_login:                str   = "0"   # stored as str; provider converts to int
+    mt5_password:             str   = ""          # NEVER logged or returned in responses
+    mt5_execution_enabled:    bool  = False       # both this AND allow_demo_trading must be true
+    allow_demo_trading:       bool  = False
+    max_open_trades:          int   = 1
+    max_spread_eurusd_pips:   float = 2.0
+    max_spread_xauusd_points: float = 5.0
+
     # ── CORS ──────────────────────────────────────────────────────────────────
     # Accepts a comma-separated string from .env or a JSON array
     cors_origins: list[str] = [

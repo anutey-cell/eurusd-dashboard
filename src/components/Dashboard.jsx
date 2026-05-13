@@ -23,6 +23,7 @@ import BacktestDashboard   from './BacktestDashboard';
 import ExecutionPanel      from './ExecutionPanel';
 import PaperTradePanel     from './PaperTradePanel';
 import PaperTradeJournal   from './PaperTradeJournal';
+import MT5Panel            from './MT5Panel';
 
 // ─── Pair options ────────────────────────────────────────────────────────────
 
@@ -261,6 +262,13 @@ export default function Dashboard({ selectedPair, onPairChange }) {
 
         {/* Row 4: paper trading journal — DB-backed history with Log Result */}
         <PaperTradeJournal refreshKey={journalKey} selectedPair={selectedPair} />
+
+        {/* Row: MT5 Demo Panel — self-contained, manages its own data fetching */}
+        <MT5Panel
+          selectedPair={selectedPair}
+          currentSignal={signal.data?.currentSignal}
+          tradePlan={signal.data?.tradePlan}
+        />
 
         {/* Row 5: mock signal history */}
         <SignalHistory
