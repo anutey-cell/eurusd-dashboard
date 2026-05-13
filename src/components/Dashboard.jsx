@@ -21,6 +21,8 @@ import SignalHistory       from './SignalHistory';
 import AnalyticsDashboard  from './AnalyticsDashboard';
 import BacktestDashboard   from './BacktestDashboard';
 import ExecutionPanel      from './ExecutionPanel';
+import PaperTradePanel     from './PaperTradePanel';
+import PaperTradeJournal   from './PaperTradeJournal';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -112,6 +114,9 @@ export default function Dashboard() {
   const calendar  = useDataSource(getMacroCalendar, FALLBACKS.calendar,  REFRESH_MS);
   const history   = useDataSource(getSignalHistory, FALLBACKS.history,   null);
   const analytics = useDataSource(getAnalytics,     FALLBACKS.analytics, null);
+
+  // journalKey bumps each time a trade is confirmed → triggers PaperTradeJournal reload
+  const [journalKey, setJournalKey] = useState(0);
 
   const countdown    = useRefreshCountdown(REFRESH_MS);
   const refreshing   = signal.loading || calendar.loading;
@@ -206,7 +211,15 @@ export default function Dashboard() {
         {/* Row 2: checklist (local state only — no API) */}
         <PreTradeChecklist />
 
-        {/* Row 3: signal history */}
+        {/* Row 3: paper trading — run analysis + confirm */}
+        <PaperTradePanel
+          onConfirmed={() => setJournalKey(k => k + 1)}
+        />
+
+        {/* Row 4: paper trading journal — DB-backed history with Log Result */}
+        <PaperTradeJournal refreshKey={journalKey} />
+
+        {/* Row 5: mock signal history */}
         <SignalHistory
           loading={history.loading}
           error={history.error}

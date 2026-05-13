@@ -103,6 +103,30 @@ export async function updateSignalResult(signalId, resultData) {
   });
 }
 
+/** Fetch paper-trading journal from the real database (/signal/db/history) */
+export async function getDbSignalHistory({ page = 1, pageSize = 20, signal, result } = {}) {
+  const params = new URLSearchParams({ page, page_size: pageSize });
+  if (signal) params.set('signal', signal);
+  if (result)  params.set('result', result);
+  const res = await apiFetch(`/signal/db/history?${params}`);
+  // Schemas use alias_generator=to_camel so backend emits camelCase already
+  return {
+    total:    res.data.total,
+    page:     res.data.page,
+    pageSize: res.data.pageSize,  // alias_generator=to_camel → pageSize not page_size
+    signals:  res.data.signals,   // array of SignalRead (camelCase)
+  };
+}
+
+/** Log the final outcome of a paper trade (PUT /signal/{id}/result) */
+export async function logSignalResult(signalId, { result, exitPrice, pips, pnl = null, notes = null }) {
+  return apiFetch(`/signal/${signalId}/result`, {
+    method: 'PUT',
+    // Backend schema accepts both snake_case and camelCase (populate_by_name=True)
+    body: JSON.stringify({ result, exitPrice, pips, pnl, notes }),
+  });
+}
+
 // ─── Adapters: snake_case (backend) → camelCase (frontend) ───────────────────
 
 function adaptSignal(res) {

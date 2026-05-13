@@ -1,18 +1,16 @@
-services:
+﻿services:
 
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: anudhe/eurusd-backend:latest
     ports:
       - "8000:8000"
     volumes:
-      # Persist the SQLite database across container restarts
-      - ./backend/eurusd_signals.db:/app/eurusd_signals.db
-      # Mount .env so you can edit it without rebuilding
-      - ./backend/.env:/app/.env
+      - db_data:/app/data
     environment:
       - DATA_MODE=demo
+      - DATABASE_URL=sqlite:////app/data/eurusd_signals.db
+      # CORS default already includes localhost:5173 — override only needed for VPS
+      # CORS_ORIGINS=["http://yourdomain.com"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
@@ -21,9 +19,7 @@ services:
       retries: 3
 
   frontend:
-    build:
-      context: .
-      dockerfile: frontend.Dockerfile
+    image: anudhe/eurusd-frontend:latest
     ports:
       - "5173:5173"
     environment:
@@ -31,3 +27,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  db_data:

@@ -22,6 +22,7 @@ from slowapi.util import get_remote_address
 
 limiter = Limiter(
     key_func=get_remote_address,
-    default_limits=[],        # no blanket limit — apply per endpoint only
-    headers_enabled=True,     # adds X-RateLimit-* headers to responses
+    default_limits=[],         # no blanket limit — apply per endpoint only
+    headers_enabled=False,     # True requires response: Response in every handler;
+                               # disabled to keep signatures clean for local use
 )
