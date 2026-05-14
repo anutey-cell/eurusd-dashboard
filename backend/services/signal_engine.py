@@ -660,7 +660,7 @@ def analyze_signal(
     if macro_events is None:
         macro_events = []
 
-    # ── Live feed: try MT5 bridge before synthetic data ───────────────────
+    # ── Live feed: try MT5 bridge, then fall back to synthetic ────────────
     if not candles:
         try:
             from services.live_feed import get_live_candles
@@ -670,6 +670,16 @@ def analyze_signal(
                 log.info("[engine] Using live MT5 candles for %s (%d bars)", pair, len(candles))
         except Exception as _lf_exc:
             log.debug("[engine] Live feed unavailable (%s) — synthetic fallback", _lf_exc)
+
+    # Synthetic fallback: generate candles when bridge is offline and none provided
+    if not candles:
+        try:
+            from data.candles import get_candles as _get_synthetic
+            _synth = _get_synthetic(interval="H4", limit=300, pair=pair)
+            candles = _synth.candles
+            log.debug("[engine] Using synthetic candles for %s (%d bars)", pair, len(candles))
+        except Exception as _syn_exc:
+            log.warning("[engine] Synthetic candle fallback failed: %s", _syn_exc)
 
     # ── Adaptive weights: load from DB if session provided ────────────────
     _adaptive_w: dict | None = None
