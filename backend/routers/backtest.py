@@ -35,7 +35,7 @@ from pair_config import SUPPORTED_PAIRS, DEFAULT_PAIR, DEFAULT_PAIR_CODE, valida
 from rate_limit import limiter
 from services.historical_data_provider import (
     historical_data_available, import_csv as import_historical_csv,
-    seed_historical_data,
+    seed_historical_data, fetch_tradingview_history,
 )
 from services.xauusd_backtester import run_xauusd_backtest
 
@@ -383,6 +383,40 @@ def seed_historical(
     except Exception as exc:
         logger.exception("[backtest] Seed failed")
         raise HTTPException(status_code=502, detail=f"Seed error: {exc}") from exc
+
+
+@router.post(
+    "/fetch-tradingview",
+    response_model=APIResponse[dict],
+    summary="Bulk import real XAU/USD historical candles from TradingView",
+    description=(
+        "Uses the existing authenticated tradingview_provider to fetch real "
+        "OANDA:XAUUSD historical bars and store them locally in historical_candles. "
+        "This is a one-time data import — subsequent backtests read from the local DB. "
+        "Pass force=true to refresh existing rows. Rate-limited to 2/minute."
+    ),
+)
+@limiter.limit("2/minute")
+def fetch_tradingview(
+    request: Request,
+    timeframe: str  = Query(default="H4"),
+    n_bars:    int  = Query(default=5000, ge=500, le=20000),
+    force:     bool = Query(default=False),
+    db:        Session = Depends(get_db),
+) -> APIResponse[dict]:
+    try:
+        result = fetch_tradingview_history(
+            db=db, timeframe=timeframe, n_bars=n_bars, force=force,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=502,
+                                 detail=result.get("error", "TradingView fetch failed"))
+        return APIResponse(data=result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[backtest] TradingView import failed")
+        raise HTTPException(status_code=502, detail=f"Import error: {exc}") from exc
 
 
 @router.get(

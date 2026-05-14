@@ -718,6 +718,207 @@ def seed_historical_data(
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Real historical data import via TradingView (one-time bulk fetch)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Uses the existing authenticated tradingview_provider to bulk-fetch real
+# OANDA:XAUUSD candles into the historical_candles table. This is a
+# one-time data-import operation — the resulting candles are then read
+# from the local DB for all backtests (no further TradingView calls).
+
+def fetch_tradingview_history(
+    db:         Session,
+    timeframe:  str  = "H4",
+    n_bars:     int  = 5000,
+    instrument: str  = "XAU/USD",
+    force:      bool = False,
+) -> dict:
+    """
+    Pull real historical XAU/USD candles from TradingView (one-time bulk fetch)
+    and store them in historical_candles. Persistent — backtests read from DB.
+
+    Uses the same authenticated tradingview_provider as the live signal engine
+    but writes the result locally so it's not re-fetched every backtest.
+    """
+    from services.tradingview_provider import _get_client, _interval, _TV_SYMBOLS
+
+    tf = normalise_timeframe(timeframe)
+
+    # Existing rows count
+    existing = db.query(HistoricalCandle).filter(
+        HistoricalCandle.instrument == instrument,
+        HistoricalCandle.timeframe  == tf,
+    ).count()
+
+    if force and existing > 0:
+        deleted = (
+            db.query(HistoricalCandle)
+              .filter(HistoricalCandle.instrument == instrument,
+                      HistoricalCandle.timeframe  == tf)
+              .delete(synchronize_session=False)
+        )
+        db.commit()
+        log.info("[tv_history] force=true — purged %d existing %s %s rows",
+                 deleted, instrument, tf)
+        existing = 0
+
+    if existing > 0 and not force:
+        return {
+            "success":         True,
+            "already_present": True,
+            "candleCount":     existing,
+            "timeframe":       tf,
+            "instrument":      instrument,
+            "candlesInserted": 0,
+            "message":         f"{existing} rows already present — use force=true to refresh",
+        }
+
+    client = _get_client()
+    if client is None:
+        return {
+            "success": False,
+            "error":   "TradingView client unavailable — check TRADINGVIEW_ENABLED + credentials",
+            "candlesInserted": 0,
+        }
+
+    sym_info = _TV_SYMBOLS.get(instrument.lower().replace("/", ""))
+    if not sym_info:
+        return {
+            "success": False,
+            "error":   f"No TradingView symbol mapping for {instrument}",
+            "candlesInserted": 0,
+        }
+    symbol, exchange = sym_info
+
+    n_bars = max(500, min(n_bars, 20000))
+    log.info("[tv_history] Fetching %d %s bars for %s on %s",
+             n_bars, tf, symbol, exchange)
+
+    try:
+        interval = _interval(tf)
+        df = client.get_hist(
+            symbol=symbol,
+            exchange=exchange,
+            interval=interval,
+            n_bars=n_bars + 5,
+        )
+        if df is None or df.empty:
+            return {"success": False, "error": "TradingView returned no data",
+                     "candlesInserted": 0}
+
+        # Drop possibly-incomplete last bar
+        df = df.iloc[:-1]
+        bars = []
+        for ts, row in df.iterrows():
+            if hasattr(ts, "to_pydatetime"):
+                dt = ts.to_pydatetime()
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            bars.append({
+                "time": dt,
+                "open":  float(row["open"]),
+                "high":  float(row["high"]),
+                "low":   float(row["low"]),
+                "close": float(row["close"]),
+                "volume": int(row.get("volume", 0) or 0),
+            })
+    except Exception as exc:
+        log.exception("[tv_history] TradingView fetch failed: %s", exc)
+        return {"success": False, "error": f"TradingView fetch error: {exc}",
+                 "candlesInserted": 0}
+
+    # Validate OHLC sanity before bulk insert
+    valid_bars = []
+    invalid = 0
+    for b in bars:
+        if (b["high"] >= max(b["open"], b["close"], b["low"]) and
+            b["low"]  <= min(b["open"], b["close"], b["high"]) and
+            b["high"] > 0 and b["low"] > 0):
+            valid_bars.append(b)
+        else:
+            invalid += 1
+
+    if not valid_bars:
+        return {"success": False, "error": "All TradingView bars failed OHLC validation",
+                 "candlesInserted": 0, "invalidBars": invalid}
+
+    # Bulk insert
+    records = [
+        HistoricalCandle(
+            instrument=instrument,
+            timeframe=tf,
+            candle_time=b["time"],
+            open=b["open"], high=b["high"], low=b["low"], close=b["close"],
+            volume=b["volume"],
+            source="tradingview",
+        )
+        for b in valid_bars
+    ]
+    inserted = 0
+    try:
+        db.bulk_save_objects(records)
+        db.commit()
+        inserted = len(records)
+    except IntegrityError:
+        db.rollback()
+        for r in records:
+            try:
+                db.add(r); db.commit(); inserted += 1
+            except IntegrityError:
+                db.rollback()
+
+    # Also seed macro events for the candle range (so news filter works)
+    events_inserted = 0
+    if valid_bars:
+        from db_models import MacroEventRecord
+        start_t = valid_bars[0]["time"]
+        end_t   = valid_bars[-1]["time"]
+        events  = generate_historical_macro_events(start=start_t, end=end_t)
+        ev_records = [
+            MacroEventRecord(
+                event_time=e["time"], currency=e["currency"],
+                event_name=e["event_name"], impact=e["impact"],
+                source="tv_history_seed",
+            )
+            for e in events
+        ]
+        try:
+            db.bulk_save_objects(ev_records)
+            db.commit()
+            events_inserted = len(ev_records)
+        except IntegrityError:
+            db.rollback()
+            for r in ev_records:
+                try:
+                    db.add(r); db.commit(); events_inserted += 1
+                except IntegrityError:
+                    db.rollback()
+
+    earliest = valid_bars[0]["time"].isoformat()  if valid_bars else None
+    latest   = valid_bars[-1]["time"].isoformat() if valid_bars else None
+    log.info(
+        "[tv_history] Imported %d real %s bars (TF=%s) + %d events, range %s -> %s",
+        inserted, instrument, tf, events_inserted, earliest, latest,
+    )
+
+    return {
+        "success":         True,
+        "candlesInserted": inserted,
+        "eventsInserted":  events_inserted,
+        "invalidBars":     invalid,
+        "earliest":        earliest,
+        "latest":          latest,
+        "timeframe":       tf,
+        "instrument":      instrument,
+        "source":          "tradingview",
+        "symbol":          symbol,
+        "exchange":        exchange,
+    }
+
+
 def load_historical_macro_events(
     db:    Session,
     start: datetime,
