@@ -21,7 +21,8 @@ import {
   ScanLine, RefreshCw, AlertTriangle, CheckCircle, XCircle,
   Clock, TrendingUp, TrendingDown, Minus, Eye, Zap,
   Shield, Activity, Target, BarChart2, Layers,
-  ChevronDown, ChevronUp, BookOpen,
+  ChevronDown, ChevronUp, BookOpen, Award, Globe,
+  GitBranch, Gauge, Flame,
 } from 'lucide-react';
 import { getScan, forceScan } from '../services/api';
 
@@ -207,6 +208,11 @@ export default function InstitutionalScanPanel({ onScanComplete }) {
   const fvg    = scan?.fvg            ?? {};
   const news   = scan?.news           ?? {};
   const risk   = scan?.risk           ?? {};
+  const macro  = scan?.macro          ?? {};
+  const conflu = scan?.confluence     ?? {};
+  const recAct = scan?.recommendedAction ?? {};
+  const grade  = scan?.grade          ?? '—';
+  const gradeReason = scan?.gradeReason ?? '';
   const blockers    = scan?.blockers     ?? [];
   const blockerCodes = scan?.blockerCodes ?? [];
   const keyDrivers  = scan?.keyDrivers   ?? [];
@@ -265,7 +271,7 @@ export default function InstitutionalScanPanel({ onScanComplete }) {
           </div>
         )}
 
-        {/* ── Market State + Bias + Confidence ──────────────────────────── */}
+        {/* ── Market State + Bias + Confidence + Grade ──────────────────── */}
         <div className="bg-[#131c27] rounded-xl p-4 space-y-3">
           <div className="flex items-center justify-between">
             <div className="space-y-1">
@@ -277,20 +283,49 @@ export default function InstitutionalScanPanel({ onScanComplete }) {
                 <BiasChip bias={bias} />
               </div>
             </div>
-            <div className="text-right">
-              <div className={`text-3xl font-black font-mono ${conf >= 80 ? 'text-emerald-400' : conf >= 60 ? 'text-amber-400' : conf >= 40 ? 'text-blue-400' : 'text-gray-500'}`}>
-                {conf}
+            <div className="flex items-center gap-3">
+              <GradeBadge grade={grade} />
+              <div className="text-right">
+                <div className={`text-3xl font-black font-mono ${conf >= 80 ? 'text-emerald-400' : conf >= 60 ? 'text-amber-400' : conf >= 40 ? 'text-blue-400' : 'text-gray-500'}`}>
+                  {conf}
+                </div>
+                <div className="text-[9px] text-gray-500 uppercase tracking-wider">/100 · conf</div>
               </div>
-              <div className="text-[9px] text-gray-500 uppercase tracking-wider">/100 · confidence</div>
             </div>
           </div>
           <ConfidenceBar value={conf} />
+          {gradeReason && (
+            <p className="text-[10px] text-gray-500 italic">{gradeReason}</p>
+          )}
           {scan?.readiness && (
             <div className="text-[10px] text-gray-500 uppercase tracking-widest">
               Readiness: <span className="text-gray-300 normal-case font-medium">{scan.readiness}</span>
             </div>
           )}
         </div>
+
+        {/* ── Recommended Action Banner (SIGNAL_READY only) ─────────────── */}
+        {recAct.actionable && recAct.tradePlan && (
+          <div className="bg-gradient-to-r from-emerald-900/30 to-emerald-800/10 border border-emerald-700/40 rounded-xl p-4 space-y-2">
+            <div className="flex items-center gap-2 text-emerald-300 text-xs font-bold uppercase tracking-wider">
+              <Flame size={13} /> Recommended Action — {recAct.action.replace(/_/g,' ')}
+            </div>
+            <p className="text-xs text-emerald-100/80 leading-relaxed">{recAct.instruction}</p>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2">
+              <PlanBox label="Direction"  value={recAct.tradePlan.direction} cls={recAct.tradePlan.direction === 'BUY' ? 'text-emerald-400' : 'text-red-400'} />
+              <PlanBox label="Entry"      value={recAct.tradePlan.entry?.toFixed(2)} cls="text-blue-300" />
+              <PlanBox label="Stop Loss"  value={recAct.tradePlan.stopLoss?.toFixed(2)} cls="text-red-300" />
+              <PlanBox label="Take Profit" value={recAct.tradePlan.takeProfit?.toFixed(2)} cls="text-emerald-300" />
+              <PlanBox label="Risk (pts)" value={recAct.tradePlan.riskPoints} cls="text-amber-300" />
+              <PlanBox label="Target (pts)" value={recAct.tradePlan.targetPoints} cls="text-emerald-300" />
+              <PlanBox label="R:R"        value={recAct.tradePlan.rr ? `1:${recAct.tradePlan.rr.toFixed(2)}` : '—'} cls="text-blue-300" />
+              <PlanBox label="Score"      value={recAct.tradePlan.qualityScore != null ? `${recAct.tradePlan.qualityScore}/100` : '—'} cls="text-purple-300" />
+            </div>
+            <p className="text-[9px] text-emerald-300/60 italic mt-1">
+              Confirm manually using the Paper Trading panel below — broker execution remains disabled.
+            </p>
+          </div>
+        )}
 
         {/* ── Market Narrative ──────────────────────────────────────────── */}
         {summ && (
@@ -328,6 +363,52 @@ export default function InstitutionalScanPanel({ onScanComplete }) {
             <InfoRow label="M5 Execution"  value={model.m5Execution}  valueClass={isReady ? 'text-emerald-400' : 'text-amber-400'} />
           </div>
         </CollapsibleSection>
+
+        {/* ── Confluence Map ────────────────────────────────────────────── */}
+        {conflu.factors && (
+          <CollapsibleSection title={`Confluence Map (${conflu.alignedCount}/${conflu.totalFactors})`} Icon={GitBranch} defaultOpen={false}>
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+              {Object.entries(conflu.factors).map(([key, val]) => (
+                <div key={key} className="flex items-center gap-1.5 text-[10px]">
+                  {val
+                    ? <CheckCircle size={10} className="text-emerald-400 flex-shrink-0" />
+                    : <XCircle    size={10} className="text-gray-700 flex-shrink-0" />
+                  }
+                  <span className={val ? 'text-gray-300' : 'text-gray-600'}>
+                    {key.replace(/([A-Z])/g, ' $1').replace(/^./, c => c.toUpperCase())}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-3 pt-2 border-t border-[#1e2535]">
+              <div className="flex justify-between text-[10px] text-gray-500 mb-1">
+                <span>Alignment</span>
+                <span className="font-mono text-gray-300">{conflu.alignmentPct}%</span>
+              </div>
+              <div className="h-1 bg-[#263044] rounded-full overflow-hidden">
+                <div
+                  className={`h-full ${conflu.alignmentPct >= 80 ? 'bg-emerald-500' : conflu.alignmentPct >= 60 ? 'bg-amber-500' : 'bg-blue-500'}`}
+                  style={{ width: `${conflu.alignmentPct}%` }}
+                />
+              </div>
+            </div>
+          </CollapsibleSection>
+        )}
+
+        {/* ── Macro Context (DXY/yields/risk-tone) ──────────────────────── */}
+        {(macro.dxyTrend || macro.yieldsTrend) && (
+          <CollapsibleSection title="Macro Context" Icon={Globe} defaultOpen={false}>
+            <div className="space-y-1">
+              <InfoRow label="DXY trend"     value={macro.dxyTrend}
+                valueClass={macro.dxyTrend?.includes('Weakening') ? 'text-emerald-400' : macro.dxyTrend?.includes('Strengthening') ? 'text-red-400' : 'text-gray-400'} />
+              <InfoRow label="Yields trend"  value={macro.yieldsTrend} />
+              <InfoRow label="Risk tone"     value={macro.riskTone}
+                valueClass={macro.riskTone?.includes('Risk-on') ? 'text-emerald-400' : macro.riskTone?.includes('Risk-off') ? 'text-red-400' : 'text-gray-400'} />
+              <InfoRow label="Gold inverse"  value={macro.goldInverse}
+                valueClass={macro.goldInverse?.includes('Bullish') ? 'text-emerald-400' : macro.goldInverse?.includes('Bearish') ? 'text-red-400' : 'text-gray-400'} />
+            </div>
+          </CollapsibleSection>
+        )}
 
         {/* ── Key Drivers + Blockers ────────────────────────────────────── */}
         {(keyDrivers.length > 0 || blockers.length > 0) && (
@@ -393,10 +474,12 @@ export default function InstitutionalScanPanel({ onScanComplete }) {
               </>
             )}
             <div className="border-t border-[#263044] mt-1.5 pt-1.5 space-y-1">
-              <InfoRow label="Spread"     value={risk.spreadStatus}
-                valueClass={risk.spreadStatus === 'OK' ? 'text-emerald-400' : 'text-red-400'} />
+              <InfoRow label="Spread"     value={risk.spreadPoints != null ? `${risk.spreadPoints} pts (${risk.spreadStatus})` : risk.spreadStatus}
+                valueClass={risk.spreadStatus === 'OK' ? 'text-emerald-400' : risk.spreadStatus === 'ELEVATED' ? 'text-amber-400' : 'text-red-400'} />
               <InfoRow label="Volatility" value={risk.volatilityStatus}
                 valueClass={risk.volatilityStatus === 'OK' ? 'text-emerald-400' : risk.volatilityStatus === 'LOW' ? 'text-amber-400' : 'text-red-400'} />
+              <InfoRow label="Vol regime" value={risk.volatilityRegime}
+                valueClass={risk.volatilityRegime === 'EXPANSION' || risk.volatilityRegime === 'BREAKOUT' ? 'text-purple-400' : risk.volatilityRegime === 'COMPRESSION' ? 'text-amber-400' : 'text-gray-400'} />
               <InfoRow label="ATR (H4)"   value={risk.atr != null ? `${risk.atr} pts` : '—'} />
               <InfoRow label="Target realism" value={risk.targetRealism}
                 valueClass={risk.targetRealism === 'REALISTIC' ? 'text-emerald-400' : risk.targetRealism === 'MARGINAL' ? 'text-amber-400' : 'text-red-400'} />
@@ -426,4 +509,31 @@ function _biasClass(text = '') {
   if (t.includes('bearish')) return 'text-red-400';
   if (t.includes('neutral') || t.includes('mixed')) return 'text-gray-400';
   return 'text-gray-300';
+}
+
+function GradeBadge({ grade }) {
+  const cfg = {
+    'A+': { cls: 'bg-emerald-500/30 text-emerald-300 border-emerald-500/50 shadow-lg shadow-emerald-900/30', tip: 'Institutional-grade' },
+    'A':  { cls: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40', tip: 'Premium' },
+    'B':  { cls: 'bg-blue-500/20    text-blue-400    border-blue-500/40',    tip: 'Valid' },
+    'C':  { cls: 'bg-amber-500/20   text-amber-400   border-amber-500/40',   tip: 'Caution' },
+    'D':  { cls: 'bg-gray-500/20    text-gray-400    border-gray-500/40',    tip: 'Weak' },
+    'F':  { cls: 'bg-red-500/20     text-red-400     border-red-500/40',     tip: 'Fail' },
+  }[grade] ?? { cls: 'bg-gray-700/30 text-gray-500 border-gray-700/30', tip: 'No grade' };
+
+  return (
+    <div className={`flex flex-col items-center justify-center w-12 h-12 rounded-xl border-2 ${cfg.cls}`} title={cfg.tip}>
+      <Award size={11} className="opacity-50" />
+      <span className="font-black text-base leading-none mt-0.5">{grade}</span>
+    </div>
+  );
+}
+
+function PlanBox({ label, value, cls = 'text-white' }) {
+  return (
+    <div className="bg-[#0d1117]/60 rounded-lg p-2 text-center border border-emerald-700/20">
+      <div className="text-[9px] text-emerald-300/50 uppercase tracking-wider mb-0.5">{label}</div>
+      <div className={`font-mono text-xs font-bold ${cls}`}>{value ?? '—'}</div>
+    </div>
+  );
 }

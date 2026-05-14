@@ -28,10 +28,21 @@ async def lifespan(app: FastAPI):
     setup_logging(level="INFO")
     db_models.Base.metadata.create_all(bind=engine)
     import logging
-    logging.getLogger(__name__).info(
+    log = logging.getLogger(__name__)
+    log.info(
         "Server started data_mode=%s fx_provider=%s",
         settings.data_mode, settings.active_fx_provider,
     )
+    # Archive scans older than 30 days (best-effort, never blocks startup)
+    try:
+        from database import SessionLocal
+        from services.institutional_scanner import archive_old_scans
+        with SessionLocal() as _db:
+            deleted = archive_old_scans(_db, keep_days=30)
+            if deleted:
+                log.info("Startup archival: removed %d old scan records", deleted)
+    except Exception as _arc_exc:
+        log.debug("Startup archival skipped (non-fatal): %s", _arc_exc)
     yield
 
 

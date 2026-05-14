@@ -23,7 +23,9 @@ from database import get_db
 from db_models import InstitutionalScan
 from models.common import APIResponse
 from rate_limit import limiter
-from services.institutional_scanner import scan_xauusd_market, get_scan_status
+from services.institutional_scanner import (
+    scan_xauusd_market, get_scan_status, backtest_scanner, archive_old_scans,
+)
 
 router = APIRouter(tags=["scanner"])
 log = logging.getLogger(__name__)
@@ -185,6 +187,52 @@ def market_view_xauusd(
             "action":            record.action,
         }
     return APIResponse(data=payload)
+
+
+# ── GET /scan/backtest ────────────────────────────────────────────────────────
+
+@router.get(
+    "/scan/backtest",
+    response_model=APIResponse[dict],
+    summary="Historical replay of the institutional scanner",
+    description=(
+        "Walks the scanner across N historical H4 bars and shows how the "
+        "market state would have classified each bar. Read-only — does not "
+        "alter the live cache or DB."
+    ),
+)
+@limiter.limit("5/minute")
+def scan_backtest(
+    request: Request,
+    lookback: int = 100,
+) -> APIResponse[dict]:
+    lookback = max(20, min(lookback, 500))
+    log.info("[scan] Backtest requested lookback=%d", lookback)
+    try:
+        result = backtest_scanner(lookback_bars=lookback)
+        return APIResponse(data=result)
+    except Exception as exc:
+        log.exception("[scan] Backtest failed")
+        raise HTTPException(status_code=502, detail=f"Backtest error: {exc}") from exc
+
+
+# ── POST /scan/archive ────────────────────────────────────────────────────────
+
+@router.post(
+    "/scan/archive",
+    response_model=APIResponse[dict],
+    summary="Archive scan records older than N days",
+    description="Deletes institutional_scans rows older than the given retention window. Default 30 days.",
+)
+@limiter.limit("2/minute")
+def scan_archive(
+    request: Request,
+    keep_days: int = 30,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    keep_days = max(1, min(keep_days, 365))
+    deleted = archive_old_scans(db, keep_days=keep_days)
+    return APIResponse(data={"deleted": deleted, "keptDays": keep_days})
 
 
 # ── GET /scan/status ──────────────────────────────────────────────────────────

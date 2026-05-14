@@ -291,15 +291,26 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
         "m5Execution":  _m5_execution(m5c, signal, market_state),
     }
 
-    # ── 19. Risk view ─────────────────────────────────────────────────────────
+    # ── 19. Risk view (live spread + volatility regime) ──────────────────────
+    spread_pts, spread_status = _get_current_spread(h4c, pip_size, max_spread)
+    vol_regime = _detect_volatility_regime(h4c, pip_size)
+
     risk = {
-        "spreadStatus":     "OK",    # TODO: live spread from MT5 tick when bridge online
+        "spreadStatus":     spread_status,
+        "spreadPoints":     spread_pts,
         "volatilityStatus": vol_status,
+        "volatilityRegime": vol_regime,
         "targetRealism":    _target_realism(atr, cfg),
         "dataStatus":       "FRESH",
         "atr":              round(atr, 2),
         "session":          session.session_text,
     }
+
+    # Update market state if spread is too wide
+    if spread_status == "TOO_WIDE" and market_state == "SIGNAL_READY":
+        market_state = "SPREAD_TOO_WIDE"
+        blocker_codes.append("SPREAD_TOO_WIDE")
+        blockers.append(f"Spread {spread_pts:.1f} pts exceeds max {max_spread} pts")
 
     # ── 20. News view ─────────────────────────────────────────────────────────
     next_ev = _next_event(macro_events, now)
@@ -311,6 +322,26 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
         "minutesToEvent": _mins_to(next_ev, now) if next_ev else None,
     }
 
+    # ── 21. Macro context (DXY / yields proxy) ───────────────────────────────
+    macro_ctx = _macro_context(d1_htf, h4_htf, news)
+
+    # ── 22. Setup quality grade (A+/A/B/C/D) ─────────────────────────────────
+    grade, grade_reason = _grade_setup(
+        market_state, quality_score, h4_liq, h4_ms, h4_fvg, news,
+        vol_status, session, inst_bias, confidence
+    )
+
+    # ── 23. Confluence map (which factors are aligned) ───────────────────────
+    confluence = _confluence_map(
+        d1_htf, h4_htf, h1_htf, h4_liq, h4_ms, h4_fvg,
+        news, session, vol_status, spread_status, signal
+    )
+
+    # ── 24. Recommended action with full trade plan (SIGNAL_READY only) ──────
+    recommended = _recommended_action(
+        market_state, signal, engine_result, cfg, h4_liq
+    )
+
     return {
         "instrument":        "XAU/USD",
         "timestamp":         timestamp,
@@ -320,6 +351,8 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
         "institutionalBias": inst_bias,
         "confidence":        confidence,
         "readiness":         readiness,
+        "grade":             grade,
+        "gradeReason":       grade_reason,
         "summary":           summary,
         "keyDrivers":        key_drivers,
         "blockers":          blockers,
@@ -330,6 +363,9 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
         "fvg":               fvg_view,
         "news":              news_view,
         "risk":              risk,
+        "macro":             macro_ctx,
+        "confluence":        confluence,
+        "recommendedAction": recommended,
         "action":            action,
         "qualityScore":      quality_score,
     }
@@ -1050,6 +1086,404 @@ def _maybe_persist(result: dict, db, force: bool = False) -> None:
     })
     log.info("[scanner] Scan persisted to DB market_state=%s signal=%s score=%s",
              ms, sig, conf)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helper: live spread (MT5 first → candle-based estimate)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_current_spread(h4c: list, pip_size: float, max_spread: float) -> tuple[float, str]:
+    """
+    Return (spread_in_points, status). Tries:
+      1. MT5 bridge live tick (if enabled and connected)
+      2. Estimate from recent candle wick patterns (synthetic fallback)
+
+    Status:
+      OK         spread <= 60% of max
+      ELEVATED   spread > 60% but <= 100% of max
+      TOO_WIDE   spread > max_spread
+    """
+    spread_pts = None
+
+    # Try MT5 live spread
+    try:
+        from services.mt5_provider import get_tick
+        tick = get_tick("xauusd")
+        if tick and tick.get("ask") and tick.get("bid"):
+            spread_pts = (tick["ask"] - tick["bid"]) / pip_size
+    except Exception:
+        pass
+
+    # Fall back to candle-based estimate (10% of recent ATR)
+    if spread_pts is None and h4c:
+        recent = h4c[-5:]
+        if recent:
+            avg_range = sum((c.high - c.low) / pip_size for c in recent) / len(recent)
+            spread_pts = max(0.3, avg_range * 0.08)   # gold typical 0.3-1.2 pt spread
+        else:
+            spread_pts = 0.5
+    if spread_pts is None:
+        spread_pts = 0.5
+
+    spread_pts = round(spread_pts, 2)
+
+    if spread_pts > max_spread:
+        status = "TOO_WIDE"
+    elif spread_pts > max_spread * 0.6:
+        status = "ELEVATED"
+    else:
+        status = "OK"
+
+    return spread_pts, status
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helper: volatility regime
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _detect_volatility_regime(h4c: list, pip_size: float) -> str:
+    """
+    Classify the current volatility regime:
+      EXPANSION   ATR rising sharply (last 5 bars > 1.3× previous 10)
+      COMPRESSION ATR falling (last 5 < 0.7× previous 10) -- breakout setup forming
+      STABLE      neither
+      BREAKOUT    last bar range > 1.8× ATR
+    """
+    if len(h4c) < 16:
+        return "STABLE"
+
+    recent_5 = h4c[-5:]
+    prev_10  = h4c[-15:-5]
+
+    atr_recent = sum((c.high - c.low) / pip_size for c in recent_5) / len(recent_5)
+    atr_prev   = sum((c.high - c.low) / pip_size for c in prev_10)  / len(prev_10)
+
+    if atr_prev == 0:
+        return "STABLE"
+
+    ratio = atr_recent / atr_prev
+    last_range = (h4c[-1].high - h4c[-1].low) / pip_size
+
+    if last_range > atr_recent * 1.8:
+        return "BREAKOUT"
+    if ratio > 1.3:
+        return "EXPANSION"
+    if ratio < 0.7:
+        return "COMPRESSION"
+    return "STABLE"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helper: macro context (DXY / yields proxy)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _macro_context(d1_htf, h4_htf, news) -> dict:
+    """
+    Build a macro / risk-on-risk-off context object.
+
+    Tries (in order):
+      1. Live DXY candles from TradingView/MT5 (if available)
+      2. Derives a directional proxy from XAU/USD's own multi-TF bias
+         (gold rises when DXY falls, so XAU bullish bias → DXY bearish proxy)
+    """
+    # Try to fetch live DXY
+    dxy_trend = None
+    yields_trend = None
+    try:
+        from services.tradingview_provider import get_tv_candles
+        dxy_bars = get_tv_candles("dxy", timeframe="H4", limit=50)
+        if dxy_bars and len(dxy_bars) >= 21:
+            closes = [b["close"] for b in dxy_bars]
+            sma21 = sum(closes[-21:]) / 21
+            sma50 = sum(closes[-min(50, len(closes)):]) / min(50, len(closes))
+            dxy_trend = "Strengthening" if sma21 > sma50 else "Weakening"
+    except Exception:
+        pass
+
+    # Derive DXY direction inversely from XAU bias if no live data
+    if dxy_trend is None:
+        if h4_htf and h4_htf.bullish:
+            dxy_trend = "Weakening (proxy)"
+        elif h4_htf and not h4_htf.bullish:
+            dxy_trend = "Strengthening (proxy)"
+        else:
+            dxy_trend = "Neutral"
+
+    # Yields proxy: USD strength = yields up
+    if "Strengthening" in dxy_trend:
+        yields_trend = "Rising (proxy)"
+        risk_tone = "Risk-off (USD/yields bid)"
+    elif "Weakening" in dxy_trend:
+        yields_trend = "Falling (proxy)"
+        risk_tone = "Risk-on (USD/yields offered)"
+    else:
+        yields_trend = "Neutral"
+        risk_tone = "Mixed"
+
+    # News-driven risk tone overrides
+    if news and not news.clear:
+        risk_tone = f"Event risk: {news.blocking_event}"
+
+    return {
+        "dxyTrend":     dxy_trend,
+        "yieldsTrend":  yields_trend,
+        "riskTone":     risk_tone,
+        "goldInverse":  "Bullish for gold" if "Weakening" in dxy_trend else
+                        "Bearish for gold" if "Strengthening" in dxy_trend else
+                        "Neutral for gold",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helper: setup quality grade (A+/A/B/C/D)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _grade_setup(market_state, quality_score, h4_liq, h4_ms, h4_fvg, news,
+                 vol_status, session, inst_bias, confidence) -> tuple[str, str]:
+    """
+    Letter-grade the setup A+ / A / B / C / D / F based on all factors.
+    Returns (grade, one-line reason).
+    """
+    # Hard fails
+    if market_state in ("DATA_STALE", "SPREAD_TOO_WIDE"):
+        return "F", "Data/spread fault -- no setup possible"
+    if news and not news.clear:
+        return "F", f"News blackout active ({news.blocking_event})"
+
+    if market_state == "SIGNAL_READY":
+        # A+ requires: score>=90 + KZ session + all 3 confluence + clear news + stable vol
+        gates = [
+            quality_score >= 90,
+            session and session.in_kill_zone,
+            h4_liq and h4_liq.swept and h4_liq.score >= 15,
+            h4_ms and h4_ms.shifted and h4_ms.pattern == "BOS",
+            h4_fvg and h4_fvg.detected and h4_fvg.in_zone,
+            vol_status == "OK",
+        ]
+        passed = sum(bool(g) for g in gates)
+        if passed >= 5:
+            return "A+", "Institutional-grade setup: all confluence factors aligned"
+        if passed >= 4:
+            return "A", "Premium setup: strong confluence with minor caveat"
+        return "B", "Valid signal but missing one or more premium factors"
+
+    if market_state == "SETUP_FORMING":
+        if confidence >= 65:
+            return "B", "Setup forming with strong bias -- wait for confirmation"
+        return "C", "Setup forming but confluence still developing"
+
+    if market_state == "WATCHLIST":
+        if inst_bias in ("Bullish", "Bearish") and confidence >= 50:
+            return "C", "Directional bias only -- watch for liquidity / structure"
+        return "D", "Weak bias -- low probability environment"
+
+    if market_state == "VOLATILITY_UNSTABLE":
+        return "D", f"Volatility {vol_status.lower()} -- wait for stable conditions"
+
+    return "D", "No actionable conditions present"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helper: confluence map
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _confluence_map(d1_htf, h4_htf, h1_htf, h4_liq, h4_ms, h4_fvg,
+                    news, session, vol_status, spread_status, signal) -> dict:
+    """
+    Boolean map of which factors are aligned + composite count.
+    """
+    factors = {
+        "d1BiasAligned":     bool(d1_htf and d1_htf.bullish == (signal == "BUY") if signal in ("BUY", "SELL") else (d1_htf is not None)),
+        "h4BiasAligned":     bool(h4_htf and h4_htf.bullish == (signal == "BUY") if signal in ("BUY", "SELL") else (h4_htf is not None)),
+        "h1BiasAligned":     bool(h1_htf and h1_htf.bullish == (signal == "BUY") if signal in ("BUY", "SELL") else (h1_htf is not None)),
+        "liquiditySwept":    bool(h4_liq and h4_liq.swept),
+        "structureBreak":    bool(h4_ms and h4_ms.shifted),
+        "fvgPresent":        bool(h4_fvg and h4_fvg.detected),
+        "fvgInZone":         bool(h4_fvg and h4_fvg.detected and h4_fvg.in_zone),
+        "newsClear":         bool(news and news.clear),
+        "killZone":          bool(session and session.in_kill_zone),
+        "volatilityOk":      vol_status == "OK",
+        "spreadOk":          spread_status == "OK",
+    }
+    aligned_count = sum(1 for v in factors.values() if v)
+    return {
+        "factors":      factors,
+        "alignedCount": aligned_count,
+        "totalFactors": len(factors),
+        "alignmentPct": round(aligned_count / len(factors) * 100, 1),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helper: recommended action (full trade plan for SIGNAL_READY)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _recommended_action(market_state, signal, engine_result, cfg, h4_liq) -> dict:
+    """
+    Build a structured trade-plan recommendation. Only populated for SIGNAL_READY.
+    Other states return a watch/wait instruction with no executable values.
+    """
+    if market_state != "SIGNAL_READY" or signal not in ("BUY", "SELL") or not engine_result:
+        return {
+            "action":        "WAIT",
+            "actionable":    False,
+            "instruction":   _instruction_for_state(market_state),
+            "tradePlan":     None,
+        }
+
+    return {
+        "action":      "CONFIRM_TRADE_PLAN",
+        "actionable":  True,
+        "instruction": (
+            f"All institutional gates passed. "
+            f"{signal} setup ready for manual confirmation. "
+            "Manual confirmation required -- no automatic execution."
+        ),
+        "tradePlan": {
+            "direction":    signal,
+            "entry":        engine_result.entry,
+            "stopLoss":     engine_result.stop_loss,
+            "takeProfit":   engine_result.take_profit,
+            "invalidation": engine_result.invalidation,
+            "riskPoints":   engine_result.risk_pips,
+            "targetPoints": engine_result.target_pips,
+            "rr":           engine_result.rr,
+            "qualityScore": engine_result.quality_score,
+            "session":      engine_result.model.get("session", ""),
+            "validityMinutes": 30,
+            "confirmEndpoint":  "POST /api/v1/signal/confirm",
+        },
+    }
+
+
+def _instruction_for_state(state: str) -> str:
+    return {
+        "WATCHLIST":           "Monitor -- directional bias only. Wait for liquidity sweep + structure break.",
+        "SETUP_FORMING":       "Setup forming. Wait for full confluence before considering entry.",
+        "NEWS_BLOCKED":        "Stand aside -- news blackout window active.",
+        "VOLATILITY_UNSTABLE": "Stand aside -- volatility outside acceptable range.",
+        "DATA_STALE":          "Check data feed -- candle data is stale.",
+        "SPREAD_TOO_WIDE":     "Wait for spread to normalise before any action.",
+        "NO_TRADE":            "No actionable conditions. Re-scan later.",
+    }.get(state, "Wait for further confirmation.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public: scan backtest (historical replay)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def backtest_scanner(lookback_bars: int = 100, db=None) -> dict:
+    """
+    Replay the scanner across historical H4 candles to show how the
+    market state would have classified each bar.
+
+    Returns aggregated statistics + per-bar timeline.
+    Read-only -- does not write to DB.
+    """
+    from data.candles import get_candles
+    from services.signal_engine import (
+        detect_higher_timeframe_bias, detect_liquidity_sweep,
+        detect_market_structure, detect_fair_value_gap,
+    )
+    from pair_config import get_pair_config
+
+    cfg = get_pair_config("xauusd")
+    pip_size  = cfg["pip_size"]
+    atr_min   = cfg.get("atr_min", 15)
+    atr_max   = cfg.get("atr_max", 300)
+
+    resp = get_candles(interval="H4", limit=max(lookback_bars + 60, 200), pair="xauusd")
+    all_bars = resp.candles
+
+    if len(all_bars) < 60:
+        return {"error": "insufficient_data", "barsAvailable": len(all_bars)}
+
+    timeline: list[dict] = []
+    state_counts: dict[str, int] = {}
+    signal_counts: dict[str, int] = {"BUY": 0, "SELL": 0, "WAIT": 0}
+
+    # Walk forward -- for each bar, simulate scanner on bars[:i+1]
+    start_idx = len(all_bars) - lookback_bars
+    for i in range(start_idx, len(all_bars)):
+        window = all_bars[:i + 1]
+        if len(window) < 51:
+            continue
+
+        htf  = detect_higher_timeframe_bias(window)
+        liq  = detect_liquidity_sweep(window, pip_size=pip_size,
+                                       strong_wick_pips=cfg.get("strong_wick_pips", 8))
+        ms   = detect_market_structure(window, htf_bullish=htf.bullish)
+        fvg  = detect_fair_value_gap(window, pip_size=pip_size,
+                                      fvg_min_pips=cfg.get("fvg_min_pips", 5))
+
+        atr, vol_status = _calc_atr(window, pip_size, atr_min, atr_max)
+
+        # Mimic the market-state logic (lightweight -- no signal engine, no news here)
+        liq_ok = liq.swept
+        ms_ok  = ms.shifted
+        fvg_ok = fvg.detected
+        conditions = sum([liq_ok, ms_ok, fvg_ok])
+
+        if vol_status != "OK":
+            state = "VOLATILITY_UNSTABLE"
+        elif conditions >= 3 and htf.score >= 8:
+            # all 3 + HTF aligned = synthetic SIGNAL_READY
+            state = "SIGNAL_READY"
+        elif conditions >= 2:
+            state = "SETUP_FORMING"
+        elif conditions >= 1 or htf.bullish is not None:
+            state = "WATCHLIST"
+        else:
+            state = "NO_TRADE"
+
+        # Synthetic signal direction from confluence
+        if state == "SIGNAL_READY":
+            sig = "BUY" if htf.bullish else "SELL"
+        else:
+            sig = "WAIT"
+
+        state_counts[state] = state_counts.get(state, 0) + 1
+        signal_counts[sig] = signal_counts.get(sig, 0) + 1
+
+        timeline.append({
+            "time":         window[-1].time.isoformat() if hasattr(window[-1].time, "isoformat") else str(window[-1].time),
+            "close":        round(window[-1].close, 2),
+            "marketState":  state,
+            "signal":       sig,
+            "atr":          round(atr, 2),
+            "conditions":   conditions,
+            "htfBias":      "Bullish" if htf.bullish else "Bearish",
+        })
+
+    return {
+        "lookbackBars":  len(timeline),
+        "stateDistribution":  state_counts,
+        "signalDistribution": signal_counts,
+        "signalReadyRate": round(state_counts.get("SIGNAL_READY", 0) / max(len(timeline), 1) * 100, 2),
+        "timeline":      timeline,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public: archival
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def archive_old_scans(db, keep_days: int = 30) -> int:
+    """
+    Delete institutional_scans rows older than keep_days.
+    Returns number of rows deleted. Safe to call repeatedly.
+    """
+    from db_models import InstitutionalScan
+    cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+    deleted = (
+        db.query(InstitutionalScan)
+          .filter(InstitutionalScan.created_at < cutoff)
+          .delete(synchronize_session=False)
+    )
+    if deleted:
+        db.commit()
+        log.info("[scanner] Archived %d scans older than %d days", deleted, keep_days)
+    return deleted
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

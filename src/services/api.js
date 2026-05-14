@@ -191,6 +191,12 @@ export async function getMarketView() {
   return res.data ?? res;
 }
 
+/** GET /scan/backtest — historical replay of the scanner. */
+export async function getScanBacktest(lookback = 100) {
+  const res = await apiFetch(`/scan/backtest?lookback=${lookback}`);
+  return res.data ?? res;
+}
+
 // ─── MT5 API ──────────────────────────────────────────────────────────────────
 
 export async function getMT5Status() {
