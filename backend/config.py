@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     version: str            = "1.0.0"
     api_prefix: str         = "/api/v1"
     supported_instrument:   str = "xauusd"   # single-instrument mode
+    xauusd_mode:            str = "MONITOR_ONLY"  # operating mode for XAU/USD
 
     # ── Data mode ─────────────────────────────────────────────────────────────
     # "demo"  → deterministic seeded mock data, no API key required
@@ -131,6 +132,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"  # silently ignore unrecognised env vars
 
 
 settings = Settings()

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
@@ -29,24 +29,24 @@ class CurrentSignal(BaseModel):
 
 
 class TradePlanTarget(BaseModel):
-    label: str
-    price: float
-    rr: str
-    pips: int
+    label:   str
+    price:   float
+    rr:      str
+    pips:    Optional[int] = None
     partial: str
 
 
 class TradePlan(BaseModel):
-    entry: float
-    stop_loss: float
-    stop_loss_pips: int
-    targets: list[TradePlanTarget]
-    risk_percent: float
-    position_size: float
-    account_size: float
-    risk_amount: float
-    validity: datetime
-    notes: str
+    entry:          Optional[float] = None
+    stop_loss:      Optional[float] = None
+    stop_loss_pips: Optional[int]   = None
+    targets:        list[TradePlanTarget] = []
+    risk_percent:   Optional[float] = None
+    position_size:  Optional[float] = None
+    account_size:   Optional[float] = None
+    risk_amount:    Optional[float] = None
+    validity:       Optional[datetime] = None
+    notes:          str = ""
 
 
 class SignalOutput(BaseModel):

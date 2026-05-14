@@ -28,7 +28,7 @@ _FACTORS = [
 ]
 
 _CURRENT_SIGNAL = CurrentSignal(
-    direction="WAIT",
+    direction="NEUTRAL",
     strength=30,
     confidence=30,
     timestamp=datetime(2026, 5, 14, 9, 0, 0, tzinfo=timezone.utc),
