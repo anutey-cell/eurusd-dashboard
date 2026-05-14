@@ -227,6 +227,54 @@ class BacktestRun(Base):
     equity_curve_json     = Column(Text, nullable=True)
 
 
+# ── paper_observations ────────────────────────────────────────────────────────
+
+class PaperObservation(Base):
+    """
+    Auto-logged record of every SIGNAL_READY scanner state.
+    Used for PAPER_OBSERVATION_ONLY workflow — the dashboard logs each
+    qualifying signal without manual confirmation, then resolves the
+    outcome forward against future candles. Acts as the second validation
+    dataset alongside the backtest.
+    """
+    __tablename__ = "paper_observations"
+
+    id              = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    observed_at     = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    instrument      = Column(String(16), nullable=False, default="XAU/USD")
+    timeframe       = Column(String(8),  nullable=False, default="H4")
+
+    # Trade plan at the moment of observation
+    signal          = Column(String(8),  nullable=False)   # BUY | SELL
+    entry           = Column(Float, nullable=False)
+    stop_loss       = Column(Float, nullable=False)
+    take_profit     = Column(Float, nullable=False)
+    risk_points     = Column(Float, nullable=True)
+    target_points   = Column(Float, nullable=True)
+    rr              = Column(Float, nullable=True)
+    score           = Column(Integer, nullable=True)
+    session         = Column(String(32), nullable=True)
+    setup_type      = Column(String(64), nullable=True)
+    market_state    = Column(String(32), nullable=True)
+    confidence      = Column(Integer, nullable=True)
+    grade           = Column(String(4),  nullable=True)
+
+    # Dedupe fingerprint — prevents duplicate logs for the same setup
+    # within a cooldown window. sha256(signal+entry+sl+tp+score)[:16]
+    fingerprint     = Column(String(32), nullable=False, default="", index=True)
+
+    # Forward resolution (filled by tracker.resolve_pending())
+    resolved_at     = Column(DateTime(timezone=True), nullable=True)
+    result          = Column(String(16), nullable=True)    # WIN | LOSS | EXPIRED | PENDING
+    exit_price      = Column(Float, nullable=True)
+    points_captured = Column(Float, nullable=True)
+    r_multiple      = Column(Float, nullable=True)
+    bars_held       = Column(Integer, nullable=True)
+
+    # Engine snapshot for audit/debugging
+    engine_model_json = Column(Text, nullable=True)
+
+
 # ── institutional_scans ───────────────────────────────────────────────────────
 
 class InstitutionalScan(Base):

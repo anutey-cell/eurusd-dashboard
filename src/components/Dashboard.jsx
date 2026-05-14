@@ -28,6 +28,7 @@ import EngineMaturityCard     from './EngineMaturityCard';
 import InstitutionalScanPanel from './InstitutionalScanPanel';
 import ScanHistoryPanel       from './ScanHistoryPanel';
 import XauusdBacktestPanel    from './XauusdBacktestPanel';
+import PaperObservationPanel  from './PaperObservationPanel';
 
 // ─── Instrument ───────────────────────────────────────────────────────────────
 // XAU/USD is the only supported instrument.
@@ -279,6 +280,9 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
           refetch={history.refetch}
           trades={history.data?.trades}
         />
+
+        {/* Row: paper observation tracker (PAPER_OBSERVATION_ONLY workflow) */}
+        <PaperObservationPanel />
 
         {/* Row: strict XAU/USD backtest (primary) */}
         <XauusdBacktestPanel />

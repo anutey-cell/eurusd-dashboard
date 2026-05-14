@@ -259,6 +259,32 @@ export async function deleteBacktestRun(id) {
   return res.data ?? res;
 }
 
+// ─── Paper Observation API ─────────────────────────────────────────────────────
+
+/** GET /observations — list paper observations (auto-logged SIGNAL_READY states) */
+export async function getPaperObservations({ limit = 50, resolved = 'all' } = {}) {
+  const res = await apiFetch(`/observations?limit=${limit}&resolved=${resolved}`);
+  return res.data ?? res;
+}
+
+/** GET /observations/stats — running WR/expectancy + progress to n=30 */
+export async function getPaperObservationStats() {
+  const res = await apiFetch('/observations/stats');
+  return res.data ?? res;
+}
+
+/** POST /observations/resolve — forward-walk pending obs to determine outcomes */
+export async function resolvePaperObservations() {
+  const res = await apiFetch('/observations/resolve', { method: 'POST' });
+  return res.data ?? res;
+}
+
+/** DELETE /observations/:id */
+export async function deletePaperObservation(id) {
+  const res = await apiFetch(`/observations/${id}`, { method: 'DELETE' });
+  return res.data ?? res;
+}
+
 // ─── MT5 API ──────────────────────────────────────────────────────────────────
 
 export async function getMT5Status() {

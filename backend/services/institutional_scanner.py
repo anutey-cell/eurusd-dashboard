@@ -106,6 +106,16 @@ def scan_xauusd_market(force_refresh: bool = False, db=None) -> dict:
         except Exception as _te:
             log.debug("[scanner] Telegram alert (non-fatal): %s", _te)
 
+        # Auto-log to paper observations (PAPER_OBSERVATION_ONLY workflow)
+        if db is not None:
+            try:
+                from services.paper_observation_tracker import log_observation
+                obs_id = log_observation(db, result)
+                if obs_id:
+                    result["paperObservationId"] = obs_id
+            except Exception as _po:
+                log.debug("[scanner] Paper observation log (non-fatal): %s", _po)
+
     return result
 
 
