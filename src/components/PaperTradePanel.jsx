@@ -28,11 +28,14 @@ async function runAnalysis(macroEvents = [], pairCode = 'xauusd') {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(macroEvents),
   });
+  const json = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.message || `HTTP ${res.status}`);
+    // Backend wraps errors in {error, message} or {detail}
+    const msg = json.message || json.detail || `HTTP ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
   }
-  return res.json();
+  // Unwrap the APIResponse envelope: {ok, data} → data
+  return json.data ?? json;
 }
 
 async function saveSignal(signal, pairLabel) {
@@ -44,27 +47,28 @@ async function saveSignal(signal, pairLabel) {
       timeframe:        'H4',
       signal:           signal.signal,
       quality_score:    signal.qualityScore,
-      entry:            signal.entry,
-      stop_loss:        signal.stopLoss,
-      take_profit:      signal.takeProfit,
-      risk_pips:        signal.riskPips,
-      target_pips:      signal.targetPips,
-      rr:               signal.rr,
-      invalidation:     signal.invalidation,
-      liquidity_status: signal.model?.liquidity        ?? '',
-      fvg_status:       signal.model?.fvg              ?? '',
-      structure_status: signal.model?.structure        ?? '',
+      entry:            signal.entry       ?? null,
+      stop_loss:        signal.stopLoss    ?? null,
+      take_profit:      signal.takeProfit  ?? null,
+      risk_pips:        signal.riskPips    ?? null,
+      target_pips:      signal.targetPips  ?? 50,
+      rr:               signal.rr          ?? null,
+      invalidation:     signal.invalidation ?? null,
+      liquidity_status: signal.model?.liquidity           ?? '',
+      fvg_status:       signal.model?.fvg                 ?? '',
+      structure_status: signal.model?.structure           ?? '',
       macro_status:     signal.model?.higherTimeframeBias ?? '',
-      news_status:      signal.newsStatus              ?? 'CLEAR',
-      session:          signal.model?.session          ?? '',
-      reason:           signal.reason                  ?? '',
+      news_status:      signal.newsStatus                 ?? 'CLEAR',
+      session:          signal.model?.session             ?? '',
+      reason:           signal.reason                     ?? '',
     }),
   });
+  const json = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.message || `HTTP ${res.status}`);
+    const msg = json.message || json.detail || `HTTP ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
   }
-  return res.json();
+  return json;
 }
 
 // ── sub-components ────────────────────────────────────────────────────────────

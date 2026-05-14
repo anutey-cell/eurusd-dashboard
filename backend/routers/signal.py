@@ -174,30 +174,26 @@ def confirm_and_save(
     body: SignalCreate,
     db: Session = Depends(get_db),
 ) -> APIResponse[SignalRead]:
-    # Gate: reject confirmation when pair is in MONITOR_ONLY or DISABLED mode
-    from pair_config import get_pair_mode as _get_mode, get_pair_config as _get_cfg
+    # Gate: only block confirmation when explicitly DISABLED.
+    # MONITOR_ONLY and PAPER_OBSERVATION both allow paper journaling —
+    # the difference is DEMO_ELIGIBLE allows demo broker execution.
+    from pair_config import get_pair_mode as _get_mode
     try:
-        _pair_code = body.pair.lower().replace("/", "").replace("_", "").replace(" ", "")
-        # Map display name to code if needed
-        try:
-            _pair_code = _get_cfg(_pair_code)["code"]
-        except Exception:
-            pass
-        _mode = _get_mode(_pair_code)
-        if _mode in ("MONITOR_ONLY", "DISABLED"):
+        _mode = _get_mode()   # no args — XAU/USD is the only instrument
+        if _mode == "DISABLED":
             raise HTTPException(
                 status_code=403,
                 detail={
                     "error": True,
-                    "message": f"{body.pair} is in {_mode} mode — signal confirmation is not allowed.",
+                    "message": "XAU/USD is DISABLED — signal analysis and confirmation are blocked.",
                     "pair_mode": _mode,
-                    "hint": "Update mode via POST /api/v1/readiness/mode to PAPER_OBSERVATION or higher.",
+                    "hint": "Update mode via POST /api/v1/readiness/mode.",
                 },
             )
     except HTTPException:
         raise
     except Exception as _mode_exc:
-        logger.debug("Mode check (non-fatal): %s", _mode_exc)
+        logger.debug("Mode gate check (non-fatal): %s", _mode_exc)
 
     record = SignalRecord(
         pair=body.pair,
