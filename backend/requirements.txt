@@ -9,8 +9,9 @@ pydantic-settings>=2.2.0
 # ── Database ──────────────────────────────────────────────────────────────────
 sqlalchemy>=2.0.0
 
-# ── HTTP client (live data providers) ────────────────────────────────────────
+# ── HTTP clients (live data providers + MT5 bridge) ──────────────────────────
 httpx>=0.27.0
+requests>=2.31.0
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 slowapi>=0.1.9
