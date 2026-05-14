@@ -46,9 +46,11 @@ CACHE_TTL   = 300       # 5 min — TradingView rate-limits frequent requests
 PROBE_TTL   = 600       # re-test connectivity every 10 min
 
 # TradingView exchange + symbol per pair code
+# OANDA verified working for XAUUSD (real price ~4700, confirmed 2026-05-14)
+# TVC was returning empty for XAUUSD — do not use TVC for gold
 _TV_SYMBOLS: dict[str, tuple[str, str]] = {
     "eurusd": ("EURUSD", "FX_IDC"),
-    "xauusd": ("XAUUSD", "TVC"),
+    "xauusd": ("XAUUSD", "OANDA"),
     "gbpusd": ("GBPUSD", "FX_IDC"),
     "usdjpy": ("USDJPY", "FX_IDC"),
 }

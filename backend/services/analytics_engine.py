@@ -94,6 +94,8 @@ def classify_session(session_text: str) -> str:
 # ── Sample confidence ─────────────────────────────────────────────────────────
 
 def _classify_sample(n: int) -> tuple[SampleSize, str]:
+    if n == 0:
+        return "low", "No completed trades yet — log trade outcomes to build real analytics. All metrics are zero until real data exists."
     if n < 20:
         return "low", f"Low confidence — only {n} completed trade{'s' if n != 1 else ''}. Need 20+ for reliable statistics."
     if n < 50:

@@ -57,16 +57,12 @@ def full_analytics(
 
     completed_records = [r for r in confirmed_records if r.result in ("WIN", "LOSS", "BREAKEVEN")]
 
-    # Fall back to mock trade history when DB has insufficient data
-    if len(completed_records) < 5:
-        from data.signals import _HISTORY as mock_history
-        trades_source = mock_history
-        total_signals    = len(mock_history)
-        confirmed_count  = len(mock_history)
-    else:
-        trades_source   = completed_records
-        total_signals   = len(confirmed_records)
-        confirmed_count = len(confirmed_records)
+    # Always use real DB data only — never fall back to mock trade history.
+    # When the DB has fewer than 5 completed trades the sample_info message
+    # explains this clearly so the frontend can show an appropriate notice.
+    trades_source   = completed_records
+    total_signals   = len(confirmed_records)
+    confirmed_count = len(confirmed_records)
 
     result = compute_analytics(
         all_trades=trades_source,

@@ -660,7 +660,7 @@ def analyze_signal(
     if macro_events is None:
         macro_events = []
 
-    # ── Live feed: try MT5 bridge, then fall back to synthetic ────────────
+    # ── Live feed: try MT5 bridge, then TradingView, then synthetic ──────
     if not candles:
         try:
             from services.live_feed import get_live_candles
@@ -680,6 +680,49 @@ def analyze_signal(
             log.debug("[engine] Using synthetic candles for %s (%d bars)", pair, len(candles))
         except Exception as _syn_exc:
             log.warning("[engine] Synthetic candle fallback failed: %s", _syn_exc)
+
+    # ── Stale candle guard ────────────────────────────────────────────────
+    # H4 candles older than 8 hours cannot safely produce BUY/SELL signals.
+    # Force WAIT immediately so stale data can never trigger a trade.
+    if candles:
+        _latest_time_str = candles[-1].get("time", "") if hasattr(candles[-1], "get") else ""
+        if _latest_time_str:
+            try:
+                _latest_ts = datetime.fromisoformat(_latest_time_str.replace("Z", "+00:00"))
+                _age_hours = (datetime.now(timezone.utc) - _latest_ts).total_seconds() / 3600
+                # H4 candle cycle = 4h; allow 4h candle duration + 4h tolerance = 8h max
+                if _age_hours > 8:
+                    log.warning("[engine] STALE CANDLES for %s — latest bar is %.1fh old (max 8h). Forcing WAIT.",
+                                pair, _age_hours)
+                    _stale_reason = f"STALE_CANDLES — data is {_age_hours:.1f}h old (max 8h). Check data feed."
+                    return SignalResult(
+                        signal="WAIT", quality_score=0,
+                        entry=None, stop_loss=None, take_profit=None,
+                        risk_pips=None, target_pips=target_pips, rr=None,
+                        invalidation=None, reason=_stale_reason, news_status="CLEAR",
+                        model={"higherTimeframeBias": "—", "liquidity": "—",
+                               "structure": "—", "fvg": "—", "session": "—"},
+                        htf=HTFResult(bullish=False, score=0, ema21=0.0, ema50=0.0,
+                                      structure="—", bias_text="Stale data"),
+                        liq=LiqResult(swept=False, bullish=False, score=0,
+                                      swept_level=0.0, liq_text="Stale data"),
+                        ms=MSResult(shifted=False, bullish=False, score=0,
+                                    pattern="None", structure_text="Stale data"),
+                        fvg=FVGResult(detected=False, bullish=False, score=0,
+                                      gap_low=0.0, gap_high=0.0, in_zone=False,
+                                      fvg_text="Stale data"),
+                        news=NewsResult(clear=True, score=0, blocking_event="",
+                                        status="CLEAR"),
+                        sess=SessionResult(score=0, session="—", in_kill_zone=False,
+                                           session_text="Stale data"),
+                        pair=pair,
+                        display_pair=pair.upper(),
+                        component_snapshot="{}",
+                        weights_used=None,
+                        data_source="stale",
+                    )
+            except Exception as _ts_exc:
+                log.debug("[engine] Could not parse candle timestamp for staleness check: %s", _ts_exc)
 
     # ── Adaptive weights: load from DB if session provided ────────────────
     _adaptive_w: dict | None = None
