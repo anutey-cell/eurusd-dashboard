@@ -864,9 +864,14 @@ def analyze_signal(
         except Exception:
             pass
 
-    _data_src = "live" if (candles and hasattr(candles[0], "get") and
-                            candles[0].get("source") == "mt5") else (
-                "live" if _adaptive_w is None and candles else "synthetic")
+    # Determine data source from the candles that were actually used
+    _data_src = "synthetic"
+    if candles and hasattr(candles[0], "get"):
+        _src = candles[0].get("source", "")
+        if _src == "mt5":
+            _data_src = "live"
+        elif _src == "tradingview":
+            _data_src = "tradingview"
 
     return SignalResult(
         signal        = signal,

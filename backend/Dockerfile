@@ -8,6 +8,9 @@ ENV PYTHONUTF8=1 \
 
 WORKDIR /app
 
+# git is required to pip-install packages from GitHub (e.g. tvdatafeed)
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

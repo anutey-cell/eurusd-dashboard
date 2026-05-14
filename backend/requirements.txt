@@ -20,8 +20,8 @@ limits>=3.7.0
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dateutil>=2.9.0
 
-# ── TradingView real candle data ─────────────────────────────────────────────
-tvDatafeed>=2.3.0
+# ── TradingView real candle data (GitHub archive — not on PyPI) ─────────────
+https://github.com/rongardF/tvdatafeed/archive/refs/heads/main.zip
 
 # ── MT5 integration (Windows-only — skipped automatically on Linux) ──────────
 MetaTrader5>=5.0.45; sys_platform == "win32"

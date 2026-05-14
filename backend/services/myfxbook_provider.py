@@ -189,6 +189,8 @@ def get_sentiment(pair: str) -> SentimentData | None:
     Return community sentiment for the given pair code (e.g. 'eurusd', 'xauusd').
     Returns None when MyFXBook is disabled or unavailable.
     """
+    global _cache_fetched
+
     if not MYFXBOOK_ENABLED:
         return None
 
@@ -218,7 +220,6 @@ def get_sentiment(pair: str) -> SentimentData | None:
             break
 
     # Populate cache for all pairs returned
-    global _cache_fetched
     _cache_fetched = now
 
     for symbol, sym_data in all_data.items():
