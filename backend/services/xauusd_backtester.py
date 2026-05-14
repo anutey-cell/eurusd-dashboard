@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import logging
 import os
+import random
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -131,6 +133,11 @@ def run_xauusd_backtest(
     allow_overlap:        Optional[bool]  = None,
     auto_seed:            bool            = True,
     enable_premium_gates: bool            = True,
+    walk_forward_segments: int            = 4,
+    monte_carlo_runs:      int            = 500,
+    classify_regimes:      bool           = True,
+    analyze_skipped:       bool           = False,
+    risk_sensitivity:      bool           = True,
 ) -> dict:
     """
     Run the strict XAU/USD backtest.
@@ -380,6 +387,11 @@ def run_xauusd_backtest(
         peak_eq       = max(peak_eq, equity_after)
         drawdown_pct  = round((peak_eq - equity_after) / peak_eq * 100, 2) if peak_eq else 0.0
 
+        # Classify market regime at the trade bar (uses window up to i)
+        regime = _classify_regime(window, pip_size) if classify_regimes else "UNKNOWN"
+        # News-day classification
+        news_class = _classify_news_day(candle_ts, macro_events)
+
         trade = Trade(
             id=len(trades) + 1,
             entry_time=candle_ts.isoformat(),
@@ -403,6 +415,8 @@ def run_xauusd_backtest(
             score=result.quality_score,
             reason=_short_reason(result.model, result.reason),
             bars_held=bars_held,
+            market_state=regime,
+            blockers=[news_class] if news_class != "normal_day" else [],
             costs={"spreadPoints": spread_points, "slippagePoints": slippage_points,
                    "commission": commission_per_trade},
         )
@@ -434,8 +448,31 @@ def run_xauusd_backtest(
     # ── Compute breakdowns ──────────────────────────────────────────────────
     breakdowns = _compute_breakdowns(trades)
 
-    # ── Reliability rating ──────────────────────────────────────────────────
-    rating = _reliability_rating(summary, trades)
+    # ── Phase 2a additions ──────────────────────────────────────────────────
+    walk_forward = _walk_forward_analysis(trades, segments=walk_forward_segments)
+    monte_carlo  = _monte_carlo_simulation(
+        trades, runs=monte_carlo_runs, initial_balance=initial_balance,
+        risk_percent=risk_percent,
+    ) if monte_carlo_runs > 0 else None
+    regime_perf = _regime_breakdown(trades) if classify_regimes else []
+    news_perf   = _news_day_breakdown(trades)
+    setup_perf  = _setup_type_breakdown(trades)
+    risk_sens   = _risk_sensitivity_analysis(
+        trades, initial_balance=initial_balance,
+    ) if risk_sensitivity else []
+    skipped_diag = _skipped_diagnostics(skipped)
+
+    overfitting = _assess_overfitting(
+        summary=summary, walk_forward=walk_forward, breakdowns=breakdowns,
+        regime_perf=regime_perf, monte_carlo=monte_carlo, trades=trades,
+    )
+
+    # ── Quality score (replaces reliability) ────────────────────────────────
+    rating = _compute_quality_score(
+        summary=summary, trades=trades, walk_forward=walk_forward,
+        breakdowns=breakdowns, regime_perf=regime_perf, overfitting=overfitting,
+        data_source=source,
+    )
 
     settings_obj = {
         "instrument":          "XAU/USD",
@@ -466,14 +503,26 @@ def run_xauusd_backtest(
             "start": bars[MIN_WARMUP_BARS - 1].time.isoformat() if bars else None,
             "end":   bars[-1].time.isoformat() if bars else None,
         },
-        "settings":    settings_obj,
-        "summary":     summary,
-        "reliability": rating,
-        "breakdowns":  breakdowns,
-        "equityCurve": equity_curve,
-        "trades":      [_trade_to_dict(t) for t in trades],
-        "skipped":     [_skip_to_dict(s)  for s in skipped],
-        "warnings":    _standard_warnings(source),
+        "settings":     settings_obj,
+        "summary":      summary,
+        "qualityScore": rating,
+        "reliability":  rating,    # alias for backwards compat
+        "recommendation": rating.get("recommendation"),
+        "breakdowns":   breakdowns,
+        # Phase 2a
+        "walkForward":      walk_forward,
+        "monteCarlo":       monte_carlo,
+        "regimePerformance": regime_perf,
+        "newsPerformance":  news_perf,
+        "setupPerformance": setup_perf,
+        "riskSensitivity":  risk_sens,
+        "overfittingRisk":  overfitting,
+        "skippedDiagnostics": skipped_diag,
+        # Existing
+        "equityCurve":  equity_curve,
+        "trades":       [_trade_to_dict(t) for t in trades],
+        "skipped":      [_skip_to_dict(s)  for s in skipped],
+        "warnings":     _standard_warnings(source),
     }
 
 
@@ -775,7 +824,774 @@ def _compute_breakdowns(trades: list[Trade]) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Reliability rating (0-100)
+# Phase 2a — Walk-forward segmentation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _walk_forward_analysis(trades: list[Trade], segments: int = 4) -> dict:
+    """
+    Split trades into N equal-size segments by index. For each segment compute
+    win rate, expectancy R, profit factor, max DD%. Classify consistency.
+    Detects overfitting: if only one segment is profitable, all others weak.
+    """
+    n = len(trades)
+    if n < segments or n < 8:
+        return {
+            "segments":       [],
+            "interpretation": "insufficient_sample",
+            "note": f"Need at least {max(segments, 8)} trades for {segments}-segment walk-forward "
+                    f"(have {n})",
+        }
+
+    size = n // segments
+    rows: list[dict] = []
+    expectancies: list[float] = []
+
+    for i in range(segments):
+        start = i * size
+        end   = (i + 1) * size if i < segments - 1 else n
+        sub   = trades[start:end]
+        if not sub:
+            continue
+
+        wins   = [t for t in sub if t.result == "WIN"]
+        losses = [t for t in sub if t.result == "LOSS"]
+        n_sub  = len(sub)
+        wr     = round(len(wins) / n_sub * 100, 2)
+        exp_R  = round(sum(t.r_multiple for t in sub) / n_sub, 3)
+        exp_pts = round(sum(t.points for t in sub) / n_sub, 3)
+
+        win_pts  = sum(t.points for t in wins)
+        loss_pts = abs(sum(t.points for t in losses))
+        pf = round(win_pts / loss_pts, 3) if loss_pts > 0 else None
+
+        # Max DD within segment (compute from segment-only equity curve)
+        eq = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for t in sub:
+            eq += t.r_multiple
+            peak = max(peak, eq)
+            dd = (peak - eq)
+            max_dd = max(max_dd, dd)
+        max_dd_pct = round(max_dd * 100 / max(peak, 1), 2)  # in R units → display as %
+
+        rows.append({
+            "segment":      i + 1,
+            "period":       f"segment {i + 1}/{segments}",
+            "validTrades":  n_sub,
+            "winRate":      wr,
+            "expectancyR":  exp_R,
+            "expectancyPoints": exp_pts,
+            "profitFactor": pf,
+            "maxDrawdownR": round(max_dd, 2),
+            "startTime":    sub[0].entry_time,
+            "endTime":      sub[-1].entry_time,
+        })
+        expectancies.append(exp_R)
+
+    # Interpretation
+    if not expectancies:
+        interp = "insufficient_sample"
+    else:
+        positive_count = sum(1 for e in expectancies if e > 0)
+        # Trends
+        if positive_count == 0:
+            interp = "consistently_negative"
+        elif positive_count == len(expectancies):
+            interp = "consistent"
+        elif positive_count == 1:
+            interp = "single_segment_profitable_overfitting_risk"
+        elif expectancies[-1] > expectancies[0] and positive_count >= len(expectancies) // 2:
+            interp = "improving"
+        elif expectancies[0] > expectancies[-1] and positive_count >= len(expectancies) // 2:
+            interp = "deteriorating"
+        else:
+            interp = "inconsistent"
+
+    return {
+        "segments":       rows,
+        "interpretation": interp,
+        "segmentCount":   segments,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2a — Monte Carlo simulation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _monte_carlo_simulation(
+    trades:          list[Trade],
+    runs:            int   = 500,
+    initial_balance: float = 10000.0,
+    risk_percent:    float = 0.25,
+) -> dict:
+    """
+    Shuffle trade R-multiples N times. For each shuffle, walk through trades
+    computing the equity curve and record max drawdown + final equity.
+
+    Returns probability bands for drawdown and profitability.
+    """
+    n = len(trades)
+    if n < 5:
+        return {
+            "runs":  0,
+            "note":  f"Need >= 5 trades for Monte Carlo (have {n})",
+            "available": False,
+        }
+
+    r_multiples = [t.r_multiple for t in trades]
+    risk_amount_pct = risk_percent / 100.0
+
+    final_equities: list[float] = []
+    max_drawdowns:  list[float] = []
+    losing_streaks: list[int]   = []
+
+    rng = random.Random(42)   # deterministic seed for reproducibility
+
+    for _ in range(runs):
+        shuffled = list(r_multiples)
+        rng.shuffle(shuffled)
+
+        equity = initial_balance
+        peak   = initial_balance
+        max_dd_pct = 0.0
+        current_streak = 0
+        max_streak = 0
+
+        for r in shuffled:
+            risk_amt = equity * risk_amount_pct
+            equity += risk_amt * r
+            peak = max(peak, equity)
+            if peak > 0:
+                dd_pct = (peak - equity) / peak * 100
+                max_dd_pct = max(max_dd_pct, dd_pct)
+            if r < 0:
+                current_streak += 1
+                max_streak = max(max_streak, current_streak)
+            else:
+                current_streak = 0
+
+        final_equities.append(equity)
+        max_drawdowns.append(max_dd_pct)
+        losing_streaks.append(max_streak)
+
+    final_equities.sort()
+    max_drawdowns.sort()
+    losing_streaks.sort()
+
+    profitable = sum(1 for f in final_equities if f > initial_balance)
+    dd_above_10 = sum(1 for d in max_drawdowns if d > 10)
+    dd_above_20 = sum(1 for d in max_drawdowns if d > 20)
+
+    def _pct(idx: float) -> float:
+        i = int(idx)
+        return max_drawdowns[min(i, len(max_drawdowns) - 1)]
+
+    return {
+        "runs":                              runs,
+        "available":                         True,
+        "tradeSampleSize":                   n,
+        "probabilityProfitable":             round(profitable / runs * 100, 2),
+        "medianFinalBalance":                round(final_equities[runs // 2], 2),
+        "medianMaxDrawdownPercent":          round(max_drawdowns[runs // 2], 2),
+        "p95MaxDrawdownPercent":             round(_pct(runs * 0.95), 2),
+        "worstMaxDrawdownPercent":           round(max_drawdowns[-1], 2),
+        "probabilityDrawdownAbove10Percent": round(dd_above_10 / runs * 100, 2),
+        "probabilityDrawdownAbove20Percent": round(dd_above_20 / runs * 100, 2),
+        "medianLongestLosingStreak":         losing_streaks[runs // 2],
+        "worstLongestLosingStreak":          losing_streaks[-1],
+        "interpretation": _mc_interpretation(
+            profitable / runs * 100,
+            max_drawdowns[runs // 2],
+            dd_above_20 / runs * 100,
+        ),
+    }
+
+
+def _mc_interpretation(prob_profitable: float, median_dd: float, prob_dd20: float) -> str:
+    if prob_profitable >= 70 and median_dd < 10 and prob_dd20 < 5:
+        return "Robust — high probability of profit, drawdown well-contained"
+    if prob_profitable >= 60 and median_dd < 15:
+        return "Acceptable — likely profitable with manageable drawdown"
+    if prob_profitable >= 50:
+        return "Marginal — coin-flip outcome, drawdown risk material"
+    return "Fragile — strategy probably unprofitable under random sequencing"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2a — Market regime classification
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _classify_regime(candles: list, pip_size: float) -> str:
+    """
+    Classify market regime at the trade bar using ATR + range characteristics.
+
+    Regimes:
+      TRENDING        — directional bias + ATR moderate
+      RANGE_BOUND     — price oscillating in tight band
+      COMPRESSION     — ATR shrinking sharply
+      EXPANSION       — ATR rising sharply
+      HIGH_VOLATILITY — ATR > 2x typical
+      LOW_VOLATILITY  — ATR < 0.5x typical
+      REVERSAL        — recent strong move + opposing wick
+      UNKNOWN         — insufficient data
+    """
+    if len(candles) < 25:
+        return "UNKNOWN"
+
+    bars = candles[-25:]
+    ranges = [(c.high - c.low) / pip_size for c in bars]
+    atr_14 = sum(ranges[-14:]) / 14
+    atr_5  = sum(ranges[-5:]) / 5
+    atr_prior = sum(ranges[:-5]) / max(len(ranges) - 5, 1)
+
+    if atr_prior == 0:
+        return "UNKNOWN"
+
+    # Vol regime
+    if atr_14 > 2 * atr_prior:
+        return "HIGH_VOLATILITY"
+    if atr_14 < 0.5 * atr_prior:
+        return "LOW_VOLATILITY"
+
+    # Expansion / compression
+    if atr_prior > 0:
+        ratio = atr_5 / atr_prior
+        if ratio > 1.4:
+            return "EXPANSION"
+        if ratio < 0.6:
+            return "COMPRESSION"
+
+    # Trending vs range
+    highs = [c.high for c in bars]
+    lows  = [c.low  for c in bars]
+    price_range = max(highs) - min(lows)
+    if price_range == 0:
+        return "RANGE_BOUND"
+
+    # If close has moved >= 60% of range from period start → trending
+    travel = abs(bars[-1].close - bars[0].close)
+    if travel >= price_range * 0.55:
+        return "TRENDING"
+
+    # Reversal: large wick on most recent bar opposing direction
+    last = bars[-1]
+    body = abs(last.close - last.open)
+    upper_wick = last.high - max(last.open, last.close)
+    lower_wick = min(last.open, last.close) - last.low
+    if body > 0 and max(upper_wick, lower_wick) > body * 1.5:
+        return "REVERSAL"
+
+    return "RANGE_BOUND"
+
+
+def _regime_breakdown(trades: list[Trade]) -> list[dict]:
+    if not trades:
+        return []
+    regimes: dict[str, list[Trade]] = {}
+    for t in trades:
+        regimes.setdefault(t.market_state or "UNKNOWN", []).append(t)
+
+    rows: list[dict] = []
+    for regime, sub in regimes.items():
+        wins = [t for t in sub if t.result == "WIN"]
+        wr   = round(len(wins) / len(sub) * 100, 2)
+        exp_R = round(sum(t.r_multiple for t in sub) / len(sub), 3)
+        win_pts  = sum(t.points for t in wins)
+        loss_pts = abs(sum(t.points for t in sub if t.result == "LOSS"))
+        pf = round(win_pts / loss_pts, 3) if loss_pts > 0 else None
+        rows.append({
+            "regime":       regime,
+            "trades":       len(sub),
+            "wins":         len(wins),
+            "winRate":      wr,
+            "expectancyR":  exp_R,
+            "averagePoints": round(sum(t.points for t in sub) / len(sub), 2),
+            "profitFactor": pf,
+            "recommendation": (
+                "Trade — strong edge"        if exp_R >= 0.3 and len(sub) >= 10 else
+                "Trade — acceptable edge"    if exp_R >= 0.1 and len(sub) >= 10 else
+                "Watchlist — small sample"   if len(sub) < 10 else
+                "Filter out — negative edge"
+            ),
+        })
+    rows.sort(key=lambda r: -r["expectancyR"])
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2a — News-day classification
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _classify_news_day(at: datetime, macro_events: list[dict]) -> str:
+    """
+    Classify the bar as: normal_day | pre_news | post_news | news_window | high_impact_day.
+    """
+    if not macro_events:
+        return "normal_day"
+
+    if not at.tzinfo:
+        at = at.replace(tzinfo=timezone.utc)
+
+    same_day_events = []
+    for e in macro_events:
+        if str(e.get("impact", "")).lower() != "high":
+            continue
+        try:
+            ev_time = datetime.fromisoformat(str(e.get("time", "")).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        # SQLite may strip tzinfo — coerce both sides to UTC
+        if ev_time.tzinfo is None:
+            ev_time = ev_time.replace(tzinfo=timezone.utc)
+        if ev_time.date() == at.date():
+            same_day_events.append(ev_time)
+
+    if not same_day_events:
+        return "normal_day"
+
+    # Find the closest event
+    nearest = min(same_day_events, key=lambda t: abs((t - at).total_seconds()))
+    diff_min = (nearest - at).total_seconds() / 60
+
+    if -30 <= diff_min <= 60:
+        return "news_window"
+    if 0 < diff_min <= 180:
+        return "pre_news"
+    if -180 <= diff_min < 0:
+        return "post_news"
+    return "high_impact_day"
+
+
+def _news_day_breakdown(trades: list[Trade]) -> list[dict]:
+    if not trades:
+        return []
+    groups: dict[str, list[Trade]] = {}
+    for t in trades:
+        key = t.blockers[0] if t.blockers else "normal_day"
+        groups.setdefault(key, []).append(t)
+    rows = []
+    for label, sub in groups.items():
+        wins = [t for t in sub if t.result == "WIN"]
+        wr = round(len(wins) / len(sub) * 100, 2)
+        exp_R = round(sum(t.r_multiple for t in sub) / len(sub), 3)
+        rows.append({
+            "category":    label,
+            "trades":      len(sub),
+            "winRate":     wr,
+            "expectancyR": exp_R,
+        })
+    rows.sort(key=lambda r: -r["expectancyR"])
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2a — Setup type classification (lightweight)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _setup_type_breakdown(trades: list[Trade]) -> list[dict]:
+    """
+    Classify trades by reason-text keywords. This is heuristic until the signal
+    engine emits a structured setup_type field. Useful as a directional signal
+    of which setups have edge.
+    """
+    if not trades:
+        return []
+    groups: dict[str, list[Trade]] = {}
+    for t in trades:
+        rl = (t.reason or "").lower()
+        if "bos" in rl and "fvg" in rl:
+            label = "BOS continuation + FVG"
+        elif "choch" in rl and ("swept" in rl or "liquidity" in rl) and "fvg" in rl:
+            label = "Liquidity sweep + CHoCH + FVG"
+        elif "choch" in rl:
+            label = "CHoCH reversal"
+        elif "bos" in rl:
+            label = "BOS continuation"
+        elif "swept" in rl or "liquidity" in rl:
+            label = "Liquidity sweep"
+        elif "fvg" in rl:
+            label = "FVG retest"
+        else:
+            label = "Other ICT setup"
+        groups.setdefault(label, []).append(t)
+
+    rows = []
+    for label, sub in groups.items():
+        wins = [t for t in sub if t.result == "WIN"]
+        wr = round(len(wins) / len(sub) * 100, 2)
+        exp_R = round(sum(t.r_multiple for t in sub) / len(sub), 3)
+        avg_held = round(sum(t.bars_held for t in sub) / len(sub), 1)
+        rows.append({
+            "setupType":         label,
+            "trades":            len(sub),
+            "winRate":           wr,
+            "expectancyR":       exp_R,
+            "averageBarsHeld":   avg_held,
+            "failureRate":       round((len(sub) - len(wins)) / len(sub) * 100, 2),
+        })
+    rows.sort(key=lambda r: -r["expectancyR"])
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2a — Risk sensitivity (analytical)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _risk_sensitivity_analysis(
+    trades: list[Trade],
+    initial_balance: float,
+    risk_levels: list[float] = (0.25, 0.5, 1.0),
+) -> list[dict]:
+    """
+    Project final equity + max DD for each risk level by re-walking R-multiples.
+    Analytical — no re-running of the engine.
+    """
+    if not trades:
+        return []
+
+    r_multiples = [t.r_multiple for t in trades]
+    rows: list[dict] = []
+    for risk_pct in risk_levels:
+        equity = initial_balance
+        peak   = initial_balance
+        max_dd_pct = 0.0
+        for r in r_multiples:
+            risk_amt = equity * (risk_pct / 100.0)
+            equity += risk_amt * r
+            peak = max(peak, equity)
+            if peak > 0:
+                max_dd_pct = max(max_dd_pct, (peak - equity) / peak * 100)
+        rows.append({
+            "riskPercent":          risk_pct,
+            "finalBalance":         round(equity, 2),
+            "netReturnPercent":     round((equity - initial_balance) / initial_balance * 100, 2),
+            "maxDrawdownPercent":   round(max_dd_pct, 2),
+            "recommendation": (
+                "Acceptable" if max_dd_pct < 10 else
+                "Caution"    if max_dd_pct < 20 else
+                "Reject — drawdown too large"
+            ),
+        })
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2a — Skipped diagnostics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _skipped_diagnostics(skipped: list[SkippedTrade]) -> dict:
+    if not skipped:
+        return {"totalSkipped": 0, "byReason": []}
+    counter: dict[str, int] = {}
+    for s in skipped:
+        counter[s.reason] = counter.get(s.reason, 0) + 1
+    rows = sorted(
+        [{"reason": k, "count": v, "percent": round(v / len(skipped) * 100, 2)}
+         for k, v in counter.items()],
+        key=lambda r: -r["count"],
+    )
+    return {
+        "totalSkipped": len(skipped),
+        "byReason":     rows,
+        "note": (
+            "Skipped trades are NOT counted in main performance. "
+            "Provided for diagnostic insight only."
+        ),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2a — Overfitting risk assessment
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _assess_overfitting(
+    summary: dict, walk_forward: dict, breakdowns: dict,
+    regime_perf: list[dict], monte_carlo: dict | None, trades: list[Trade],
+) -> dict:
+    """
+    Emit an overfitting risk level (LOW/MEDIUM/HIGH/CRITICAL) with warnings.
+    """
+    warnings: list[str] = []
+    score = 0   # higher = more risk
+
+    # 1. Sample size
+    n = summary.get("validTrades", 0)
+    if n < 30:
+        warnings.append(f"Tiny sample ({n} trades) — statistically unreliable")
+        score += 3
+    elif n < 100:
+        warnings.append(f"Small sample ({n} trades) — limited confidence")
+        score += 1
+
+    # 2. Walk-forward consistency
+    interp = walk_forward.get("interpretation", "")
+    if interp == "single_segment_profitable_overfitting_risk":
+        warnings.append("Only 1 walk-forward segment profitable — likely curve-fit")
+        score += 3
+    elif interp == "consistently_negative":
+        warnings.append("All walk-forward segments are negative")
+        score += 2
+    elif interp == "deteriorating":
+        warnings.append("Walk-forward performance is deteriorating")
+        score += 2
+    elif interp == "inconsistent":
+        warnings.append("Walk-forward performance is inconsistent across segments")
+        score += 1
+
+    # 3. Single-session dominance
+    sess_b = breakdowns.get("session", [])
+    if sess_b:
+        total_pts = sum(s.get("totalPoints", 0) for s in sess_b)
+        if total_pts != 0:
+            for s in sess_b:
+                if s.get("totalPoints", 0) > 0 and abs(s["totalPoints"]) >= abs(total_pts) * 0.8:
+                    warnings.append(
+                        f"Single session '{s['session']}' produces >80% of total profit"
+                    )
+                    score += 2
+                    break
+
+    # 4. Score predictiveness
+    score_b = breakdowns.get("scoreBand", [])
+    if len(score_b) >= 2:
+        # Higher score bands should monotonically increase expectancyR
+        exps = [b["expectancyR"] for b in score_b]
+        if not all(exps[i] <= exps[i + 1] for i in range(len(exps) - 1)):
+            warnings.append("Score bands not monotonic — signal score may not be predictive")
+            score += 1
+
+    # 5. Regime dependence
+    if regime_perf:
+        positives = [r for r in regime_perf if r["expectancyR"] > 0]
+        if len(regime_perf) >= 3 and len(positives) == 1:
+            warnings.append(
+                f"Only regime '{positives[0]['regime']}' is profitable — regime-dependent edge"
+            )
+            score += 1
+
+    # 6. Drawdown excessive
+    if summary.get("maxDrawdownPercent", 0) > 20:
+        warnings.append(f"Max drawdown {summary['maxDrawdownPercent']}% exceeds 20%")
+        score += 2
+
+    # 7. Monte Carlo robustness
+    if monte_carlo and monte_carlo.get("available"):
+        if monte_carlo.get("probabilityProfitable", 100) < 50:
+            warnings.append(
+                f"Monte Carlo: only {monte_carlo['probabilityProfitable']}% of "
+                "random sequences are profitable"
+            )
+            score += 2
+        if monte_carlo.get("probabilityDrawdownAbove20Percent", 0) > 25:
+            warnings.append(
+                f"Monte Carlo: {monte_carlo['probabilityDrawdownAbove20Percent']}% "
+                "of sequences hit >20% drawdown"
+            )
+            score += 1
+
+    # 8. Excessive RR_AFTER_COST_TOO_LOW skips
+    rr_skip_pct = 0.0
+    # (computed downstream from skipped diagnostics — skip for now)
+
+    # Risk level
+    if score >= 7:
+        level = "CRITICAL"
+    elif score >= 4:
+        level = "HIGH"
+    elif score >= 2:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+
+    return {
+        "level":       level,
+        "score":       score,
+        "warnings":    warnings,
+        "interpretation": {
+            "LOW":      "No major red flags detected.",
+            "MEDIUM":   "Some concerns — review warnings before proceeding to paper.",
+            "HIGH":     "Strong signs of overfitting — strategy may not generalise.",
+            "CRITICAL": "Backtest evidence is unreliable — do NOT proceed.",
+        }[level],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2a — Quality score + recommendation engine (replaces reliability)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_quality_score(
+    summary:      dict,
+    trades:       list[Trade],
+    walk_forward: dict,
+    breakdowns:   dict,
+    regime_perf:  list[dict],
+    overfitting:  dict,
+    data_source:  str,
+) -> dict:
+    """
+    Backtest Quality Score (0-100). Replaces older reliability rating.
+
+    Components (max points):
+      Data quality:               15
+      Sample size:                15
+      Expectancy:                 15
+      Profit factor:              15
+      Drawdown control:           15
+      Walk-forward consistency:   10
+      Session robustness:          5
+      Regime robustness:           5
+      Score predictiveness:        5
+
+    Hard caps applied AFTER summing.
+    Adds 5-tier recommendation enum.
+    """
+    n = summary.get("validTrades", 0)
+    expectancy = summary.get("expectancyPoints", 0)
+    eR         = summary.get("expectancyR", 0)
+    pf         = summary.get("profitFactor") or 0
+    max_dd     = summary.get("maxDrawdownPercent", 0)
+
+    score = 0
+
+    # Data quality (15) — penalise synthetic
+    if data_source == "database":
+        score += 15
+    elif data_source == "synthetic":
+        score += 5    # honest about synthetic limitation
+    else:
+        score += 8
+
+    # Sample size (15)
+    if n >= 200:    score += 15
+    elif n >= 100:  score += 12
+    elif n >= 50:   score += 8
+    elif n >= 30:   score += 5
+    elif n >= 10:   score += 2
+
+    # Expectancy R (15)
+    if eR >= 0.5:    score += 15
+    elif eR >= 0.3:  score += 12
+    elif eR >= 0.15: score += 8
+    elif eR >= 0.05: score += 4
+
+    # Profit factor (15)
+    if pf >= 2.0:    score += 15
+    elif pf >= 1.5:  score += 12
+    elif pf >= 1.2:  score += 8
+    elif pf >= 1.0:  score += 4
+
+    # Drawdown (15) — lower is better
+    if max_dd < 5:     score += 15
+    elif max_dd < 10:  score += 12
+    elif max_dd < 15:  score += 8
+    elif max_dd < 25:  score += 4
+
+    # Walk-forward consistency (10)
+    interp = walk_forward.get("interpretation", "")
+    if interp == "consistent":           score += 10
+    elif interp == "improving":          score += 7
+    elif interp == "inconsistent":       score += 4
+    elif interp == "deteriorating":      score += 2
+    # consistently_negative, single_segment, insufficient_sample → 0
+
+    # Session robustness (5) — at least 2 sessions with WR >= 45% and >= 5 trades
+    sess_robust = 0
+    for s in breakdowns.get("session", []):
+        if s.get("winRate", 0) >= 45 and s.get("trades", 0) >= 5:
+            sess_robust += 1
+    if sess_robust >= 3:   score += 5
+    elif sess_robust >= 2: score += 3
+    elif sess_robust >= 1: score += 1
+
+    # Regime robustness (5) — at least 2 profitable regimes
+    pos_regimes = sum(1 for r in regime_perf if r.get("expectancyR", 0) > 0)
+    if pos_regimes >= 3:   score += 5
+    elif pos_regimes >= 2: score += 3
+    elif pos_regimes >= 1: score += 1
+
+    # Score predictiveness (5) — monotonic improvement across bands
+    score_b = breakdowns.get("scoreBand", [])
+    if len(score_b) >= 2:
+        exps = [b["expectancyR"] for b in score_b]
+        monotonic = all(exps[i] <= exps[i + 1] for i in range(len(exps) - 1))
+        if monotonic:    score += 5
+        elif exps[-1] > exps[0]:  score += 2
+
+    # Hard caps
+    of_level = overfitting.get("level", "LOW")
+    if n < 30:                        score = min(score, 50)
+    elif n < 100:                     score = min(score, 75)
+    if expectancy <= 0:               score = min(score, 50)
+    if pf < 1.2:                      score = min(score, 60)
+    if max_dd > 15:                   score = min(score, 65)
+    if of_level == "HIGH":            score = min(score, 70)
+    if of_level == "CRITICAL":        score = min(score, 50)
+
+    # Band classification
+    if score >= 85:    band = "Strong — paper-test eligible"
+    elif score >= 70:  band = "Promising — requires paper observation"
+    elif score >= 50:  band = "Needs more testing"
+    else:              band = "Weak / unreliable"
+
+    # 5-tier recommendation
+    if expectancy <= 0 or pf < 1.1 or max_dd > 25 or n < 30:
+        recommendation = "NOT_READY"
+        verdict = (
+            "Backtest evidence is insufficient. Do not proceed to paper trading. "
+            "Iterate the strategy or gather more historical data."
+        )
+    elif n < 100 or of_level in ("HIGH", "CRITICAL"):
+        recommendation = "COLLECT_MORE_DATA"
+        verdict = (
+            f"Sample size and/or overfitting risk ({of_level}) prevent recommendation. "
+            "Import more historical XAU/USD data and re-run."
+        )
+    elif n < 100 and eR > 0 and pf >= 1.2:
+        recommendation = "PAPER_OBSERVATION_ONLY"
+        verdict = (
+            "Results are promising but sample is below 100 trades. "
+            "Permit paper observation only — no execution decisions yet."
+        )
+    elif n >= 100 and eR > 0 and pf >= 1.2 and max_dd <= 15 and of_level in ("LOW", "MEDIUM"):
+        if n >= 150 and pf >= 1.3 and max_dd <= 10 and of_level == "LOW":
+            recommendation = "READY_FOR_DEMO_TEST_AFTER_REVIEW"
+            verdict = (
+                "Strong evidence across all dimensions. Proceed to structured "
+                "demo testing AFTER manual strategy review. Live trading remains disabled."
+            )
+        else:
+            recommendation = "READY_FOR_STRUCTURED_PAPER_TEST"
+            verdict = (
+                "Backtest passes validation thresholds. Proceed to structured "
+                "paper observation — track 30+ live signals before considering demo."
+            )
+    else:
+        recommendation = "NOT_READY"
+        verdict = "One or more validation thresholds not met. Iterate and re-run."
+
+    return {
+        "score":          score,
+        "band":           band,
+        "verdict":        verdict,
+        "recommendation": recommendation,
+        "overfittingLevel": of_level,
+        "components": {
+            "dataQuality":          15 if data_source == "database" else 5 if data_source == "synthetic" else 8,
+            "sampleSize":           min(15, score),    # informational
+            "expectancyR":          eR,
+            "profitFactor":         pf,
+            "maxDrawdownPercent":   max_dd,
+            "walkForward":          interp,
+            "positiveRegimes":      pos_regimes,
+            "robustSessions":       sess_robust,
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Reliability rating (0-100) — kept as legacy alias
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _reliability_rating(summary: dict, trades: list[Trade]) -> dict:

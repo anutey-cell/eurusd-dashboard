@@ -223,6 +223,10 @@ def xauusd_backtest(
     allow_overlap:       bool = Query(default=False, description="Allow concurrent trades"),
     auto_seed:           bool = Query(default=True, description="Auto-seed 365 days if DB empty"),
     enable_premium_gates: bool = Query(default=True, description="Enforce 5 premium ICT gates (OB+OTE+DXY+DailyOpen+LondonFix)"),
+    walk_forward_segments: int = Query(default=4, ge=2, le=10, description="Phase 2a — walk-forward segments"),
+    monte_carlo_runs:      int = Query(default=500, ge=0, le=5000, description="Phase 2a — Monte Carlo runs (0 = disabled)"),
+    classify_regimes:      bool = Query(default=True, description="Phase 2a — classify each trade's market regime"),
+    risk_sensitivity_flag: bool = Query(default=True, alias="risk_sensitivity", description="Phase 2a — project equity at 0.25/0.5/1.0 risk levels"),
     save:                bool = Query(default=True, description="Save run to backtest_runs table"),
     db: Session = Depends(get_db),
 ) -> APIResponse[dict]:
@@ -267,6 +271,10 @@ def xauusd_backtest(
             allow_overlap=allow_overlap,
             auto_seed=auto_seed,
             enable_premium_gates=enable_premium_gates,
+            walk_forward_segments=walk_forward_segments,
+            monte_carlo_runs=monte_carlo_runs,
+            classify_regimes=classify_regimes,
+            risk_sensitivity=risk_sensitivity_flag,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -436,6 +444,44 @@ def get_run(
         "trades":      _safe_json(row.trades_json,     []),
         "skipped":     _safe_json(row.skipped_json,    []),
     })
+
+
+@router.get(
+    "/compare-runs",
+    response_model=APIResponse[dict],
+    summary="Compare the last N saved backtest runs side-by-side",
+)
+@limiter.limit("10/minute")
+def compare_runs(
+    request: Request,
+    limit: int = Query(default=5, ge=2, le=20),
+    db:    Session = Depends(get_db),
+) -> APIResponse[dict]:
+    rows = (
+        db.query(BacktestRun)
+          .order_by(BacktestRun.created_at.desc())
+          .limit(limit)
+          .all()
+    )
+    if not rows:
+        return APIResponse(data={"runs": [], "comparison": []})
+
+    comparison = []
+    for r in rows:
+        comparison.append({
+            "id":                  r.id,
+            "createdAt":           r.created_at.isoformat() if r.created_at else None,
+            "timeframe":           r.timeframe,
+            "validTrades":         r.valid_trades,
+            "winRate":             r.win_rate,
+            "expectancyR":         r.expectancy_r,
+            "profitFactor":        r.profit_factor,
+            "maxDrawdownPercent":  r.max_drawdown_percent,
+            "netReturnPercent":    r.net_return_percent,
+            "qualityScore":        r.reliability_rating,
+            "band":                r.reliability_band,
+        })
+    return APIResponse(data={"runs": [_run_to_summary(r) for r in rows], "comparison": comparison})
 
 
 @router.delete(

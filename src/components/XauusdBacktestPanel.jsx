@@ -99,7 +99,8 @@ function Stat({ label, value, sub, color = 'text-white', small = false }) {
 
 function ReliabilityCard({ reliability }) {
   if (!reliability) return null;
-  const { score = 0, band = '', violations = [], verdict = '' } = reliability;
+  const { score = 0, band = '', violations = [], verdict = '',
+          recommendation, overfittingLevel } = reliability;
 
   const tier =
     score >= 85 ? { cls: 'from-emerald-700/40 to-emerald-900/20 border-emerald-600/50 text-emerald-300', label: 'STRONG'   } :
@@ -107,12 +108,19 @@ function ReliabilityCard({ reliability }) {
     score >= 50 ? { cls: 'from-amber-700/40   to-amber-900/20   border-amber-600/50   text-amber-300',   label: 'WEAK'      } :
                   { cls: 'from-red-700/40     to-red-900/20     border-red-600/50     text-red-300',     label: 'INSUFFICIENT' };
 
+  const recCls =
+    recommendation === 'READY_FOR_DEMO_TEST_AFTER_REVIEW' ? 'bg-emerald-600 text-white' :
+    recommendation === 'READY_FOR_STRUCTURED_PAPER_TEST'  ? 'bg-blue-600   text-white' :
+    recommendation === 'PAPER_OBSERVATION_ONLY'           ? 'bg-amber-600  text-white' :
+    recommendation === 'COLLECT_MORE_DATA'                ? 'bg-amber-700  text-amber-100' :
+                                                            'bg-red-700    text-white';
+
   return (
     <div className={`bg-gradient-to-r ${tier.cls} border rounded-xl p-4 space-y-2`}>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           <Award size={15} />
-          <span className="text-xs uppercase tracking-widest font-bold">Backtest Reliability</span>
+          <span className="text-xs uppercase tracking-widest font-bold">Backtest Quality Score</span>
         </div>
         <div className="text-right">
           <div className="text-3xl font-black font-mono leading-none">{score}<span className="text-sm opacity-50">/100</span></div>
@@ -121,6 +129,23 @@ function ReliabilityCard({ reliability }) {
       </div>
       <p className="text-[11px] opacity-90 leading-relaxed">{band}</p>
       <p className="text-[11px] opacity-80 italic">{verdict}</p>
+      {recommendation && (
+        <div className="flex items-center gap-2 pt-2 border-t border-current/20">
+          <span className={`text-[10px] font-bold uppercase tracking-wider rounded px-2 py-1 ${recCls}`}>
+            {recommendation.replace(/_/g, ' ')}
+          </span>
+          {overfittingLevel && (
+            <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
+              overfittingLevel === 'LOW'      ? 'bg-emerald-900/40 text-emerald-300' :
+              overfittingLevel === 'MEDIUM'   ? 'bg-amber-900/40   text-amber-300'   :
+              overfittingLevel === 'HIGH'     ? 'bg-red-900/40     text-red-300'     :
+                                                'bg-red-700        text-white'
+            }`}>
+              Overfit risk: {overfittingLevel}
+            </span>
+          )}
+        </div>
+      )}
       {violations.length > 0 && (
         <div className="pt-2 border-t border-current/20">
           <p className="text-[9px] uppercase tracking-wider opacity-70 mb-1">Violations:</p>
@@ -130,6 +155,151 @@ function ReliabilityCard({ reliability }) {
         </div>
       )}
     </div>
+  );
+}
+
+// ── Phase 2a panels ───────────────────────────────────────────────────────────
+
+function WalkForwardPanel({ wf }) {
+  if (!wf || !wf.segments?.length) {
+    return (
+      <div className="bg-[#161b27] border border-[#263044] rounded-lg p-3">
+        <div className="text-xs font-medium text-gray-300 mb-2 flex items-center gap-2">
+          <FlaskConical size={12} className="text-blue-400" /> Walk-Forward Analysis
+        </div>
+        <p className="text-[10px] text-gray-500 italic">{wf?.note ?? 'No data'}</p>
+      </div>
+    );
+  }
+  const interpCls =
+    wf.interpretation === 'consistent'                              ? 'text-emerald-400' :
+    wf.interpretation === 'improving'                               ? 'text-emerald-400' :
+    wf.interpretation === 'inconsistent'                            ? 'text-amber-400'   :
+    wf.interpretation === 'deteriorating'                           ? 'text-red-400'     :
+    wf.interpretation === 'single_segment_profitable_overfitting_risk' ? 'text-red-400'  :
+                                                                       'text-gray-500';
+  return (
+    <div className="bg-[#161b27] border border-[#263044] rounded-lg p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs font-medium text-gray-300 flex items-center gap-2">
+          <FlaskConical size={12} className="text-blue-400" /> Walk-Forward Analysis
+        </div>
+        <span className={`text-[10px] font-mono uppercase tracking-wider ${interpCls}`}>
+          {wf.interpretation?.replace(/_/g, ' ')}
+        </span>
+      </div>
+      <table className="w-full text-[10px]">
+        <thead>
+          <tr className="text-gray-500 uppercase tracking-wider">
+            {['Seg', 'Trades', 'WR', 'Exp R', 'PF', 'DD R'].map(h => (
+              <th key={h} className="text-left py-1 px-1.5 border-b border-[#263044]">{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {wf.segments.map(s => (
+            <tr key={s.segment} className="border-b border-[#1a2035]">
+              <td className="py-1 px-1.5 font-mono text-gray-400">{s.segment}/{wf.segmentCount}</td>
+              <td className="py-1 px-1.5 font-mono">{s.validTrades}</td>
+              <td className="py-1 px-1.5 font-mono">{s.winRate}%</td>
+              <td className={`py-1 px-1.5 font-mono ${s.expectancyR > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                {s.expectancyR > 0 ? '+' : ''}{s.expectancyR?.toFixed(2)}R
+              </td>
+              <td className="py-1 px-1.5 font-mono">{s.profitFactor?.toFixed(2) ?? 'N/A'}</td>
+              <td className="py-1 px-1.5 font-mono text-red-400/70">{s.maxDrawdownR?.toFixed(2)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function MonteCarloPanel({ mc }) {
+  if (!mc || !mc.available) {
+    return (
+      <div className="bg-[#161b27] border border-[#263044] rounded-lg p-3">
+        <div className="text-xs font-medium text-gray-300 mb-2 flex items-center gap-2">
+          <FlaskConical size={12} className="text-purple-400" /> Monte Carlo
+        </div>
+        <p className="text-[10px] text-gray-500 italic">{mc?.note ?? 'Not run'}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="bg-[#161b27] border border-[#263044] rounded-lg p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs font-medium text-gray-300 flex items-center gap-2">
+          <FlaskConical size={12} className="text-purple-400" /> Monte Carlo ({mc.runs} runs)
+        </div>
+        <span className="text-[10px] text-gray-500">on {mc.tradeSampleSize} trades</span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <Stat label="P(profit)"
+              value={`${mc.probabilityProfitable}%`}
+              color={mc.probabilityProfitable >= 70 ? 'text-emerald-400' : mc.probabilityProfitable >= 50 ? 'text-amber-400' : 'text-red-400'}
+              small />
+        <Stat label="Median DD %"
+              value={`${mc.medianMaxDrawdownPercent}%`}
+              color={mc.medianMaxDrawdownPercent < 10 ? 'text-emerald-400' : mc.medianMaxDrawdownPercent < 20 ? 'text-amber-400' : 'text-red-400'}
+              small />
+        <Stat label="P95 DD %"   value={`${mc.p95MaxDrawdownPercent}%`} color="text-amber-400" small />
+        <Stat label="Worst DD %" value={`${mc.worstMaxDrawdownPercent}%`} color="text-red-400" small />
+        <Stat label="P(DD>10%)"  value={`${mc.probabilityDrawdownAbove10Percent}%`} small />
+        <Stat label="P(DD>20%)"  value={`${mc.probabilityDrawdownAbove20Percent}%`}
+              color={mc.probabilityDrawdownAbove20Percent > 25 ? 'text-red-400' : 'text-gray-300'}
+              small />
+        <Stat label="Median LL streak" value={mc.medianLongestLosingStreak} small />
+        <Stat label="Worst LL streak"  value={mc.worstLongestLosingStreak} color="text-red-400/80" small />
+      </div>
+      <p className="text-[10px] text-gray-500 italic mt-2">{mc.interpretation}</p>
+    </div>
+  );
+}
+
+function OverfittingPanel({ of }) {
+  if (!of) return null;
+  const levelCfg = {
+    LOW:      { cls: 'border-emerald-600/40 bg-emerald-900/15 text-emerald-300', label: 'LOW RISK' },
+    MEDIUM:   { cls: 'border-amber-600/40   bg-amber-900/15   text-amber-300',   label: 'MEDIUM RISK' },
+    HIGH:     { cls: 'border-red-600/40     bg-red-900/15     text-red-300',     label: 'HIGH RISK' },
+    CRITICAL: { cls: 'border-red-500        bg-red-900/30     text-red-200',     label: 'CRITICAL RISK' },
+  }[of.level] ?? { cls: 'border-gray-600 bg-gray-900/15 text-gray-400', label: of.level };
+
+  return (
+    <div className={`rounded-lg p-3 border ${levelCfg.cls}`}>
+      <div className="flex items-center gap-2 mb-2">
+        <AlertTriangle size={13} />
+        <span className="text-xs font-bold uppercase tracking-widest">
+          Overfitting Risk — {levelCfg.label}
+        </span>
+      </div>
+      <p className="text-[11px] opacity-90 mb-2">{of.interpretation}</p>
+      {of.warnings?.length > 0 && (
+        <ul className="space-y-1">
+          {of.warnings.map((w, i) => (
+            <li key={i} className="text-[10px] opacity-80 leading-tight">• {w}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function RiskSensitivityPanel({ rs }) {
+  if (!rs || rs.length === 0) return null;
+  return (
+    <BreakdownTable title="Risk Sensitivity (analytical)" rows={rs}
+      cols={[
+        { key: 'riskPercent',          label: 'Risk %',     fmt: r => `${r.riskPercent}%` },
+        { key: 'finalBalance',         label: 'Final $',    fmt: r => `$${r.finalBalance?.toFixed(0)}` },
+        { key: 'netReturnPercent',     label: 'Net %',      fmt: r => `${r.netReturnPercent > 0 ? '+' : ''}${r.netReturnPercent}%`,
+          cls: r => r.netReturnPercent > 0 ? 'text-emerald-400' : 'text-red-400' },
+        { key: 'maxDrawdownPercent',   label: 'Max DD %',   fmt: r => `${r.maxDrawdownPercent}%`,
+          cls: r => r.maxDrawdownPercent < 10 ? 'text-emerald-400' : r.maxDrawdownPercent < 20 ? 'text-amber-400' : 'text-red-400' },
+        { key: 'recommendation',       label: 'Verdict',
+          cls: r => r.recommendation?.includes('Reject') ? 'text-red-400' : r.recommendation?.includes('Caution') ? 'text-amber-400' : 'text-emerald-400' },
+      ]} />
   );
 }
 
@@ -669,7 +839,8 @@ export default function XauusdBacktestPanel() {
         {result && !running && (
           <>
             {/* Warnings + reliability */}
-            <ReliabilityCard reliability={result.reliability} />
+            <ReliabilityCard reliability={result.qualityScore ?? result.reliability} />
+            <OverfittingPanel of={result.overfittingRisk} />
             <WarningsBanner warnings={result.warnings} />
 
             {/* Summary grid */}
@@ -742,6 +913,57 @@ export default function XauusdBacktestPanel() {
                   { key: 'pct',     label: '%', fmt: r => `${r.pct}%` },
                 ]} />
             </div>
+
+            {/* Phase 2a validation panels */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+              <WalkForwardPanel  wf={result.walkForward} />
+              <MonteCarloPanel   mc={result.monteCarlo} />
+            </div>
+
+            <RiskSensitivityPanel rs={result.riskSensitivity} />
+
+            {result.regimePerformance?.length > 0 && (
+              <BreakdownTable title="Market Regime Performance" rows={result.regimePerformance}
+                cols={[
+                  { key: 'regime',         label: 'Regime' },
+                  { key: 'trades',         label: '#' },
+                  { key: 'winRate',        label: 'Win %', fmt: r => `${r.winRate}%`,
+                    cls: r => r.winRate >= 50 ? 'text-emerald-400' : 'text-amber-400' },
+                  { key: 'expectancyR',    label: 'Exp R', fmt: r => `${r.expectancyR > 0 ? '+' : ''}${r.expectancyR}R`,
+                    cls: r => r.expectancyR > 0 ? 'text-emerald-400' : 'text-red-400' },
+                  { key: 'averagePoints',  label: 'Avg P', fmt: r => `${r.averagePoints > 0 ? '+' : ''}${r.averagePoints?.toFixed(1)}` },
+                  { key: 'profitFactor',   label: 'PF',    fmt: r => r.profitFactor?.toFixed(2) ?? 'N/A' },
+                  { key: 'recommendation', label: 'Verdict',
+                    cls: r => r.recommendation?.includes('strong') ? 'text-emerald-400' :
+                              r.recommendation?.includes('acceptable') ? 'text-blue-400' :
+                              r.recommendation?.includes('Watchlist') ? 'text-amber-400' :
+                              'text-red-400' },
+                ]} />
+            )}
+
+            {result.newsPerformance?.length > 1 && (
+              <BreakdownTable title="News-Day Performance" rows={result.newsPerformance}
+                cols={[
+                  { key: 'category',    label: 'Category' },
+                  { key: 'trades',      label: '#' },
+                  { key: 'winRate',     label: 'Win %', fmt: r => `${r.winRate}%` },
+                  { key: 'expectancyR', label: 'Exp R', fmt: r => `${r.expectancyR > 0 ? '+' : ''}${r.expectancyR}R`,
+                    cls: r => r.expectancyR > 0 ? 'text-emerald-400' : 'text-red-400' },
+                ]} />
+            )}
+
+            {result.setupPerformance?.length > 0 && (
+              <BreakdownTable title="Setup Type Performance" rows={result.setupPerformance}
+                cols={[
+                  { key: 'setupType',         label: 'Setup' },
+                  { key: 'trades',            label: '#' },
+                  { key: 'winRate',           label: 'WR %', fmt: r => `${r.winRate}%` },
+                  { key: 'expectancyR',       label: 'Exp R', fmt: r => `${r.expectancyR > 0 ? '+' : ''}${r.expectancyR}R`,
+                    cls: r => r.expectancyR > 0 ? 'text-emerald-400' : 'text-red-400' },
+                  { key: 'averageBarsHeld',   label: 'Bars' },
+                  { key: 'failureRate',       label: 'Fail %', fmt: r => `${r.failureRate}%` },
+                ]} />
+            )}
 
             {/* Trades + skipped */}
             <TradeList trades={result.trades} />
