@@ -18,7 +18,7 @@ Market states
 NO_TRADE            No meaningful setup present
 WATCHLIST           Directional bias without confirmed entry
 SETUP_FORMING       Liquidity/FVG/structure forming but incomplete
-SIGNAL_READY        All gates satisfied — signal engine returned BUY/SELL
+SIGNAL_READY        All gates satisfied -- signal engine returned BUY/SELL
 NEWS_BLOCKED        News risk prevents action
 DATA_STALE          Candle data too old to trust
 SPREAD_TOO_WIDE     Spread exceeds XAU/USD threshold
@@ -225,7 +225,7 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
     # ── 6. ATR / volatility ──────────────────────────────────────────────────
     atr, vol_status = _calc_atr(h4c, pip_size, atr_min, atr_max)
 
-    # ── 7. Run existing signal engine (H4 — remains the BUY/SELL gate) ──────
+    # ── 7. Run existing signal engine (H4 -- remains the BUY/SELL gate) ──────
     engine_result = None
     try:
         engine_result = run_signal_analysis(
@@ -640,7 +640,7 @@ def _opportunity(market_state, signal, quality_score, engine_result, h4_fvg, h4_
                     if h4_liq.bullish
                     else f"Above swept high {lv:.2f}")
     else:
-        inv_text = "No invalidation defined — no signal"
+        inv_text = "No invalidation defined -- no signal"
 
     # Target
     target_pts = cfg.get("target_pips", 50)
@@ -689,11 +689,11 @@ def _liquidity_view(h4c: list, h4_liq) -> dict:
 
     return {
         "status":                status,
-        "buySide":               f"{swing_high:.2f}" if swing_high else "—",
-        "sellSide":              f"{swing_low:.2f}"  if swing_low  else "—",
+        "buySide":               f"{swing_high:.2f}" if swing_high else "--",
+        "sellSide":              f"{swing_low:.2f}"  if swing_low  else "--",
         "swept":                 bool(h4_liq and h4_liq.swept),
-        "sweepSide":             ("sell-side" if (h4_liq and h4_liq.bullish)
-                                  else "buy-side"  if (h4_liq and not h4_liq.bullish)
+        "sweepSide":             ("sell-side" if (h4_liq and h4_liq.swept and h4_liq.bullish)
+                                  else "buy-side"  if (h4_liq and h4_liq.swept and not h4_liq.bullish)
                                   else "none"),
         "nearestLiquidityTarget": next_target,
     }
@@ -718,10 +718,10 @@ def _fvg_view(h4_fvg) -> dict:
         freshness = "Being mitigated"
         mitigated = False
     elif "approaching" in (h4_fvg.fvg_text or ""):
-        freshness = "Fresh — price approaching"
+        freshness = "Fresh -- price approaching"
         mitigated = False
     else:
-        freshness = "Fresh — price not yet at zone"
+        freshness = "Fresh -- price not yet at zone"
         mitigated = False
 
     return {
@@ -742,7 +742,7 @@ def _fvg_view(h4_fvg) -> dict:
 
 def _m5_execution(m5c: list, signal: str, market_state: str) -> str:
     if market_state == "SIGNAL_READY" and signal in ("BUY", "SELL"):
-        return f"{signal} setup confirmed — await M5 entry trigger"
+        return f"{signal} setup confirmed -- await M5 entry trigger"
     if market_state == "SETUP_FORMING":
         return "Monitoring M5 for entry trigger"
     if not m5c:
@@ -841,7 +841,7 @@ def _build_summary(market_state, signal, inst_bias, h4_liq, h4_ms, h4_fvg,
     state_conclusions = {
         "SIGNAL_READY":
             f"Current status: SIGNAL READY. Score {quality_score}/100. "
-            "Manual confirmation required — no automatic execution.",
+            "Manual confirmation required -- no automatic execution.",
         "SETUP_FORMING":
             f"Current status: SETUP FORMING (score {quality_score}/100). "
             "Monitoring for full confluence before confirmation.",
@@ -1067,7 +1067,7 @@ def _stale_result(timestamp: str, scan_mode: str, blocker_msg: str) -> dict:
         "confidence":        0,
         "readiness":         "Data Stale",
         "summary": (
-            f"XAU/USD scanner: data is stale — {blocker_msg}. "
+            f"XAU/USD scanner: data is stale -- {blocker_msg}. "
             "All signals suppressed until fresh candle data is confirmed. "
             "Status: DATA_STALE. Action: CHECK_DATA_FEED."
         ),
