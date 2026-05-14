@@ -364,6 +364,28 @@ export default function InstitutionalScanPanel({ onScanComplete }) {
           </div>
         </CollapsibleSection>
 
+        {/* ── Premium ICT Gates (Order Block, OTE, DXY, Daily Open, London Fix) ── */}
+        <CollapsibleSection title="Premium ICT Gates (Top-Retail Tier)" Icon={Award} defaultOpen={true}>
+          <div className="space-y-1">
+            <InfoRow label="Order Block"   value={scan?.engineModel?.orderBlock ?? 'Live signal only'}
+              valueClass={scan?.engineModel?.orderBlock?.includes('in zone') ? 'text-emerald-400' :
+                          scan?.engineModel?.orderBlock?.includes('No order block') ? 'text-red-400' : 'text-gray-400'} />
+            <InfoRow label="OTE Zone"      value={scan?.engineModel?.oteZone ?? 'Live signal only'}
+              valueClass={scan?.engineModel?.oteZone?.includes('in zone') ? 'text-emerald-400' : 'text-amber-400'} />
+            <InfoRow label="DXY Alignment" value={scan?.engineModel?.dxyAlignment ?? 'Live signal only'}
+              valueClass={scan?.engineModel?.dxyAlignment?.includes('supports') ? 'text-emerald-400' :
+                          scan?.engineModel?.dxyAlignment?.includes('opposes') ? 'text-red-400' : 'text-gray-400'} />
+            <InfoRow label="Daily Open"    value={scan?.engineModel?.dailyOpen ?? 'Live signal only'}
+              valueClass={scan?.engineModel?.dailyOpen?.includes('supports') ? 'text-emerald-400' :
+                          scan?.engineModel?.dailyOpen?.includes('opposes') ? 'text-red-400' : 'text-gray-400'} />
+            <InfoRow label="London Fix"    value={scan?.engineModel?.londonFix ?? 'Live signal only'}
+              valueClass={scan?.engineModel?.londonFix?.includes('window') ? 'text-emerald-400' : 'text-gray-500'} />
+            <InfoRow label="All 5 Gates Passed"
+              value={scan?.engineModel?.premiumGatesPassed === true ? 'YES' : scan?.engineModel?.premiumGatesPassed === false ? 'NO' : '—'}
+              valueClass={scan?.engineModel?.premiumGatesPassed ? 'text-emerald-400 font-bold' : 'text-red-400'} />
+          </div>
+        </CollapsibleSection>
+
         {/* ── Confluence Map ────────────────────────────────────────────── */}
         {conflu.factors && (
           <CollapsibleSection title={`Confluence Map (${conflu.alignedCount}/${conflu.totalFactors})`} Icon={GitBranch} defaultOpen={false}>

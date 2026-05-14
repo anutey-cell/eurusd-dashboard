@@ -222,6 +222,7 @@ def xauusd_backtest(
     max_trades:          int | None = Query(default=None, ge=1, le=10000),
     allow_overlap:       bool = Query(default=False, description="Allow concurrent trades"),
     auto_seed:           bool = Query(default=True, description="Auto-seed 365 days if DB empty"),
+    enable_premium_gates: bool = Query(default=True, description="Enforce 5 premium ICT gates (OB+OTE+DXY+DailyOpen+LondonFix)"),
     save:                bool = Query(default=True, description="Save run to backtest_runs table"),
     db: Session = Depends(get_db),
 ) -> APIResponse[dict]:
@@ -265,6 +266,7 @@ def xauusd_backtest(
             max_trades=max_trades,
             allow_overlap=allow_overlap,
             auto_seed=auto_seed,
+            enable_premium_gates=enable_premium_gates,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

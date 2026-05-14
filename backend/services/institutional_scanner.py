@@ -236,6 +236,8 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
 
     signal        = engine_result.signal        if engine_result else "WAIT"
     quality_score = engine_result.quality_score if engine_result else 0
+    # Engine premium-gate descriptions (None when premium gates not run)
+    engine_model = getattr(engine_result, "model", {}) if engine_result else {}
 
     # ── 8. Institutional bias (multi-TF majority vote) ───────────────────────
     inst_bias, bias_conf = _institutional_bias(d1_htf, h4_htf, h1_htf, h4_liq, h4_ms)
@@ -368,6 +370,15 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
         "recommendedAction": recommended,
         "action":            action,
         "qualityScore":      quality_score,
+        # Engine-level premium gate descriptions (from signal_engine model dict)
+        "engineModel": {
+            "orderBlock":          engine_model.get("orderBlock"),
+            "oteZone":             engine_model.get("oteZone"),
+            "dxyAlignment":        engine_model.get("dxyAlignment"),
+            "dailyOpen":           engine_model.get("dailyOpen"),
+            "londonFix":           engine_model.get("londonFix"),
+            "premiumGatesPassed":  engine_model.get("premiumGatesPassed"),
+        },
     }
 
 

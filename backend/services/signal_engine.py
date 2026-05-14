@@ -154,6 +154,60 @@ class SessionResult:
     session_text: str
 
 
+# ─── Premium ICT gates (top retail tier additions) ────────────────────────────
+
+@dataclass
+class OBResult:
+    """Order Block — last opposing candle before a strong displacement."""
+    detected:    bool
+    bullish:     bool
+    in_zone:     bool
+    mitigated:   bool
+    ob_high:     float
+    ob_low:      float
+    displacement_size: float    # how strong the displacement was (in points)
+    ob_text:     str
+
+
+@dataclass
+class OTEResult:
+    """Optimal Trade Entry — 62-79% retracement of the displacement leg."""
+    in_zone:    bool
+    ote_low:    float           # 79% retracement level
+    ote_high:   float           # 62% retracement level
+    leg_high:   float           # impulse leg high
+    leg_low:    float           # impulse leg low
+    fib_pct:    float           # current price's position in the retracement (0-1)
+    ote_text:   str
+
+
+@dataclass
+class DXYAlignment:
+    """DXY (Dollar Index) trend alignment — gold has -0.8 correlation."""
+    aligned:    bool
+    available:  bool            # False if live DXY couldn't be fetched
+    dxy_trend:  str             # strengthening | weakening | neutral
+    dxy_text:   str
+
+
+@dataclass
+class DailyOpenBias:
+    """Daily open bias — buy above, sell below the 00:00 UTC price."""
+    aligned:    bool
+    daily_open: float
+    current:    float
+    bias:       str             # above | below
+    do_text:    str
+
+
+@dataclass
+class LondonFixStatus:
+    """London Gold Fix windows (10:30 + 15:00 UTC) — produce most intraday range."""
+    active:     bool
+    window:     str             # AM | PM | none
+    label:      str
+
+
 @dataclass
 class SignalResult:
     signal:       str
@@ -179,6 +233,13 @@ class SignalResult:
     component_snapshot: str  = "{}"    # JSON — which ICT gates were active
     weights_used:       dict = None    # adaptive weights applied (None = base weights)
     data_source:        str  = "synthetic"  # "live" | "synthetic"
+    # ─── Premium ICT gate results (None when not evaluated) ──────────────────
+    ob:           Optional["OBResult"]       = None
+    ote:          Optional["OTEResult"]      = None
+    dxy:          Optional["DXYAlignment"]   = None
+    daily_open:   Optional["DailyOpenBias"]  = None
+    london_fix:   Optional["LondonFixStatus"] = None
+    premium_gates_passed: bool = False    # True if all 5 premium gates aligned
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +686,310 @@ def calculate_quality_score(htf, liq, ms, fvg, news, sess,
 
 
 # ---------------------------------------------------------------------------
+# 7b. ORDER BLOCK detection  (premium ICT gate)
+#
+# An order block is the LAST opposing candle before a strong displacement.
+#   Bullish OB: last bearish candle before a strong bullish breakout
+#   Bearish OB: last bullish candle before a strong bearish breakout
+#
+# Used as a directional entry zone — top retail traders REQUIRE
+# entries from within an OB for high-probability setups.
+# ---------------------------------------------------------------------------
+
+def detect_order_block(
+    candles:        list[Candle],
+    pip_size:       float = PIP,
+    displacement_min_atr: float = 1.5,    # body must be >= 1.5x avg body
+) -> OBResult:
+    """
+    Find the most recent valid order block in either direction.
+    Returns OBResult with in_zone=True when current price is inside the OB.
+    """
+    _null = OBResult(
+        detected=False, bullish=False, in_zone=False, mitigated=False,
+        ob_high=0.0, ob_low=0.0, displacement_size=0.0,
+        ob_text="No order block detected",
+    )
+    if len(candles) < 12:
+        return _null
+
+    bars = candles[-30:]
+    bodies = [abs(c.close - c.open) for c in bars]
+    avg_body = sum(bodies) / len(bodies) if bodies else 0.0
+    if avg_body == 0:
+        return _null
+
+    current_price = bars[-1].close
+
+    # Walk back from the most recent bars looking for a strong displacement
+    for i in range(len(bars) - 2, 2, -1):
+        body = bodies[i]
+        if body < avg_body * displacement_min_atr:
+            continue
+
+        bullish_disp = bars[i].close > bars[i].open
+
+        # Find the LAST opposite-coloured candle within 5 bars before the displacement
+        for j in range(i - 1, max(0, i - 6), -1):
+            opp = (bars[j].close < bars[j].open) if bullish_disp else (bars[j].close > bars[j].open)
+            if not opp:
+                continue
+
+            # OB found at bars[j]
+            ob_high = bars[j].high
+            ob_low  = bars[j].low
+
+            # Mitigated if price came back into the OB after the displacement
+            mitigated = False
+            for k in range(i + 1, len(bars)):
+                if bars[k].low <= ob_high and bars[k].high >= ob_low:
+                    mitigated = True
+                    break
+
+            in_zone = ob_low <= current_price <= ob_high
+            disp_size = body / pip_size
+
+            return OBResult(
+                detected=True,
+                bullish=bullish_disp,
+                in_zone=in_zone,
+                mitigated=mitigated,
+                ob_high=round(ob_high, 5),
+                ob_low=round(ob_low, 5),
+                displacement_size=round(disp_size, 1),
+                ob_text=(
+                    f"{'Bullish' if bullish_disp else 'Bearish'} OB "
+                    f"{ob_low:.2f}-{ob_high:.2f} "
+                    f"(disp {disp_size:.0f} pts"
+                    f"{', mitigated' if mitigated else ''}"
+                    f"{', in zone' if in_zone else ''})"
+                ),
+            )
+
+    return _null
+
+
+# ---------------------------------------------------------------------------
+# 7c. OPTIMAL TRADE ENTRY (OTE)  (premium ICT gate)
+#
+# The 62-79% retracement of the most recent impulse leg.
+# Top ICT traders ONLY enter from this zone — it's where institutions
+# accumulate before continuation. Entries outside this zone are rejected.
+# ---------------------------------------------------------------------------
+
+def check_ote_zone(
+    candles:        list[Candle],
+    signal_dir:     str = "BUY",        # "BUY" or "SELL"
+    leg_lookback:   int = 30,
+) -> OTEResult:
+    """
+    For a BUY: looks for a recent up-leg and computes 62%-79% retracement
+    going DOWN from the high. Price must be inside that zone.
+
+    For a SELL: looks for a recent down-leg and computes 62%-79% retracement
+    going UP from the low.
+    """
+    if len(candles) < 10:
+        return OTEResult(in_zone=False, ote_low=0.0, ote_high=0.0,
+                          leg_high=0.0, leg_low=0.0, fib_pct=0.0,
+                          ote_text="Insufficient data")
+
+    bars = candles[-leg_lookback:]
+    highs = [c.high for c in bars]
+    lows  = [c.low  for c in bars]
+
+    high_idx = highs.index(max(highs))
+    low_idx  = lows.index(min(lows))
+
+    leg_high = highs[high_idx]
+    leg_low  = lows[low_idx]
+    leg_size = leg_high - leg_low
+
+    if leg_size <= 0:
+        return OTEResult(in_zone=False, ote_low=0.0, ote_high=0.0,
+                          leg_high=leg_high, leg_low=leg_low, fib_pct=0.0,
+                          ote_text="Zero-range leg")
+
+    current = bars[-1].close
+
+    if signal_dir == "BUY":
+        # Up-leg: low → high. Retracement zone is from high downward.
+        # 62% level = leg_high - 0.62 × range  (upper boundary of OTE)
+        # 79% level = leg_high - 0.79 × range  (lower boundary of OTE)
+        ote_high = leg_high - leg_size * 0.62
+        ote_low  = leg_high - leg_size * 0.79
+        in_zone  = ote_low <= current <= ote_high
+        fib_pct  = (leg_high - current) / leg_size if leg_size else 0.0
+    else:  # SELL
+        # Down-leg: high → low. Retracement zone is from low upward.
+        ote_low  = leg_low + leg_size * 0.62
+        ote_high = leg_low + leg_size * 0.79
+        in_zone  = ote_low <= current <= ote_high
+        fib_pct  = (current - leg_low) / leg_size if leg_size else 0.0
+
+    return OTEResult(
+        in_zone=in_zone,
+        ote_low=round(ote_low, 5),
+        ote_high=round(ote_high, 5),
+        leg_high=round(leg_high, 5),
+        leg_low=round(leg_low, 5),
+        fib_pct=round(fib_pct, 3),
+        ote_text=(
+            f"OTE {ote_low:.2f}-{ote_high:.2f} "
+            f"({'in zone' if in_zone else f'price {fib_pct * 100:.0f}% retraced'})"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7d. DXY ALIGNMENT  (premium ICT gate)
+#
+# Gold has -0.7 to -0.85 correlation with DXY. The top retail gold traders
+# REJECT BUYs when DXY is strengthening and SELLs when DXY is weakening.
+#
+# `at_historical` skips the live DXY fetch (backtest mode) — the gate
+# returns aligned=True with available=False so it doesn't block historical
+# walk-forward.
+# ---------------------------------------------------------------------------
+
+def check_dxy_alignment(
+    signal_dir:      str  = "BUY",
+    at_historical:   bool = False,
+) -> DXYAlignment:
+    """
+    Fetches live DXY trend (H4 EMA-21 vs EMA-50) and checks if it
+    supports a gold BUY or SELL setup.
+    """
+    if at_historical or signal_dir == "WAIT":
+        return DXYAlignment(
+            aligned=True, available=False,
+            dxy_trend="historical_mode",
+            dxy_text="DXY check skipped (historical / WAIT)",
+        )
+
+    try:
+        from services.tradingview_provider import get_tv_candles
+        bars = get_tv_candles("dxy", timeframe="H4", limit=50)
+    except Exception:
+        return DXYAlignment(
+            aligned=True, available=False,
+            dxy_trend="unavailable",
+            dxy_text="DXY data unavailable - check allowed",
+        )
+
+    if not bars or len(bars) < 21:
+        return DXYAlignment(
+            aligned=True, available=False,
+            dxy_trend="insufficient_data",
+            dxy_text="Insufficient DXY data - check allowed",
+        )
+
+    closes = [b["close"] for b in bars]
+    sma21  = sum(closes[-21:]) / 21
+    sma50  = sum(closes[-min(50, len(closes)):]) / min(50, len(closes))
+    dxy_up = sma21 > sma50
+
+    # Gold inverse: BUY needs DXY down; SELL needs DXY up
+    if signal_dir == "BUY":
+        aligned = not dxy_up
+    elif signal_dir == "SELL":
+        aligned = dxy_up
+    else:
+        aligned = True
+
+    trend_label = "strengthening" if dxy_up else "weakening"
+    return DXYAlignment(
+        aligned=aligned,
+        available=True,
+        dxy_trend=trend_label,
+        dxy_text=(
+            f"DXY {trend_label} (SMA21 {sma21:.2f} vs SMA50 {sma50:.2f}) "
+            f"-> {'supports' if aligned else 'opposes'} gold {signal_dir}"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7e. DAILY OPEN BIAS  (premium ICT gate)
+#
+# Used by every top retail XAU/USD trader as a hard bias anchor:
+#   - Above 00:00 UTC daily open  ->  BUY-only day
+#   - Below 00:00 UTC daily open  ->  SELL-only day
+# Eliminates counter-trend entries on what should be a directional day.
+# ---------------------------------------------------------------------------
+
+def check_daily_open_bias(
+    candles:    list[Candle],
+    signal_dir: str = "BUY",
+    at:         datetime | None = None,
+) -> DailyOpenBias:
+    """Anchor the day's bias to the 00:00 UTC open price."""
+    now = at or datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    today_bars = [c for c in candles if (c.time.replace(tzinfo=timezone.utc) if c.time.tzinfo is None else c.time) >= today_start]
+
+    if not today_bars and candles:
+        # Fall back to first candle of session
+        daily_open = candles[0].open
+    elif today_bars:
+        daily_open = today_bars[0].open
+    else:
+        return DailyOpenBias(
+            aligned=True, daily_open=0.0, current=0.0,
+            bias="unknown",
+            do_text="No data for daily open",
+        )
+
+    current = candles[-1].close
+    bias = "above" if current > daily_open else ("below" if current < daily_open else "at")
+
+    if signal_dir == "BUY":
+        aligned = current >= daily_open
+    elif signal_dir == "SELL":
+        aligned = current <= daily_open
+    else:
+        aligned = True
+
+    return DailyOpenBias(
+        aligned=aligned,
+        daily_open=round(daily_open, 5),
+        current=round(current, 5),
+        bias=bias,
+        do_text=(
+            f"Daily open {daily_open:.2f}, price {current:.2f} "
+            f"({bias} open) - {'supports' if aligned else 'opposes'} {signal_dir}"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7f. LONDON GOLD FIX  (premium ICT gate - score booster)
+#
+# 60% of intraday gold range happens around the London Gold Fix:
+#   AM Fix: 10:30 UTC (window 09:30-11:00 UTC)
+#   PM Fix: 15:00 UTC (window 14:00-16:00 UTC)
+# Top traders schedule their entries inside these windows.
+# Active fix adds +5 to the quality score (capped at 100).
+# ---------------------------------------------------------------------------
+
+def check_london_fix(at: datetime | None = None) -> LondonFixStatus:
+    now = at or datetime.now(timezone.utc)
+    h = now.hour + now.minute / 60
+    am_window = 9.5  <= h <= 11.0     # 09:30-11:00 UTC
+    pm_window = 14.0 <= h <= 16.0     # 14:00-16:00 UTC
+
+    if am_window:
+        return LondonFixStatus(active=True, window="AM",
+                                label="AM London Fix window (10:30 UTC)")
+    if pm_window:
+        return LondonFixStatus(active=True, window="PM",
+                                label="PM London Fix window (15:00 UTC)")
+    return LondonFixStatus(active=False, window="none",
+                            label="Outside London Fix windows")
+
+
+# ---------------------------------------------------------------------------
 # 8. Reason builder -- specific, gate-aware messages
 #
 # FIX #10 : Each gate failure now returns a distinct, actionable message
@@ -695,6 +1060,8 @@ def analyze_signal(
     min_rr:         float           = MIN_RR,
     fvg_min_pips:   int             = 3,
     db=None,                        # SQLAlchemy Session — optional, enables adaptive weights
+    enable_premium_gates: bool = True,    # NEW: 5 premium ICT gates (OB, OTE, DXY, DailyOpen, LondonFix)
+    historical_mode:      bool = False,   # NEW: skip live-data gates (DXY) when backtesting
 ) -> SignalResult:
     """
     Run the full ICT/SMC pipeline.
@@ -951,13 +1318,74 @@ def analyze_signal(
                                bull_votes, bear_votes, n_votes, sess=sess,
                                strong_wick_pips=_strong_wick_pips)
 
-    # ── MyFXBook sentiment (non-blocking, supplementary) ──────────────────
-    _sentiment: dict = {}
-    try:
-        from services.myfxbook_provider import get_sentiment_for_signal
-        _sentiment = get_sentiment_for_signal(pair, signal)
-    except Exception:
-        _sentiment = {"available": False, "interpretation": "Sentiment unavailable", "adjusted_score": 0}
+    # ── PREMIUM ICT GATES ─────────────────────────────────────────────────
+    # Run the 5 premium gates only when a primary BUY/SELL would otherwise fire.
+    # If any gate fails, downgrade to WAIT with a specific reason and clear
+    # entry/SL/TP so the trade is rejected cleanly.
+    ob_result      = None
+    ote_result     = None
+    dxy_result     = None
+    do_result      = None
+    fix_result     = None
+    premium_passed = False
+
+    if enable_premium_gates and signal in ("BUY", "SELL"):
+        ob_result  = detect_order_block(bars, pip_size=pip_size)
+        ote_result = check_ote_zone(bars, signal_dir=signal)
+        dxy_result = check_dxy_alignment(signal_dir=signal, at_historical=historical_mode)
+        do_result  = check_daily_open_bias(bars, signal_dir=signal, at=at)
+        fix_result = check_london_fix(at=at)
+
+        # Gate 1: Order Block must be detected AND aligned with signal
+        if not ob_result.detected:
+            signal = "WAIT"
+            entry = stop_loss = take_profit = invalidation = None
+            risk_pips = rr = None
+            reason = "Premium gate: no order block detected for entry zone"
+        elif (signal == "BUY" and not ob_result.bullish) or (signal == "SELL" and ob_result.bullish):
+            signal_kept = signal  # remember for reason
+            signal = "WAIT"
+            entry = stop_loss = take_profit = invalidation = None
+            risk_pips = rr = None
+            reason = f"Premium gate: order block direction conflicts with {signal_kept} setup"
+
+        # Gate 2: OTE zone — entry must be in 62-79% retracement
+        elif not ote_result.in_zone:
+            signal_kept = signal
+            signal = "WAIT"
+            entry = stop_loss = take_profit = invalidation = None
+            risk_pips = rr = None
+            reason = (
+                f"Premium gate: price not in OTE zone "
+                f"(62-79% retracement required, currently at {ote_result.fib_pct * 100:.0f}%)"
+            )
+
+        # Gate 3: DXY alignment — only enforced when DXY data is available
+        elif dxy_result.available and not dxy_result.aligned:
+            signal_kept = signal
+            signal = "WAIT"
+            entry = stop_loss = take_profit = invalidation = None
+            risk_pips = rr = None
+            reason = f"Premium gate: DXY {dxy_result.dxy_trend} opposes {signal_kept} setup"
+
+        # Gate 4: Daily open bias
+        elif not do_result.aligned:
+            signal_kept = signal
+            signal = "WAIT"
+            entry = stop_loss = take_profit = invalidation = None
+            risk_pips = rr = None
+            reason = (
+                f"Premium gate: price is {do_result.bias} daily open "
+                f"({do_result.daily_open:.2f}) - opposes {signal_kept} bias"
+            )
+
+        else:
+            # All four hard gates passed
+            premium_passed = True
+
+            # Gate 5: London Fix bonus (+5 to score, capped at 100)
+            if fix_result.active:
+                score = min(100, score + 5)
 
     model_dict = {
         "higherTimeframeBias": htf.bias_text,
@@ -965,8 +1393,23 @@ def analyze_signal(
         "structure":           ms.structure_text,
         "fvg":                 fvg.fvg_text,
         "session":             sess.session_text,
-        "sentiment":           _sentiment,
+        # Premium gate fields (None when premium gates disabled)
+        "orderBlock":          ob_result.ob_text  if ob_result  else "Not evaluated",
+        "oteZone":             ote_result.ote_text if ote_result else "Not evaluated",
+        "dxyAlignment":        dxy_result.dxy_text if dxy_result else "Not evaluated",
+        "dailyOpen":           do_result.do_text  if do_result  else "Not evaluated",
+        "londonFix":           fix_result.label   if fix_result else "Not evaluated",
+        "premiumGatesPassed":  premium_passed,
     }
+
+    # ── MyFXBook sentiment (non-blocking, supplementary) ──────────────────
+    _sentiment: dict = {}
+    try:
+        from services.myfxbook_provider import get_sentiment_for_signal
+        _sentiment = get_sentiment_for_signal(pair, signal)
+    except Exception:
+        _sentiment = {"available": False, "interpretation": "Sentiment unavailable", "adjusted_score": 0}
+    model_dict["sentiment"] = _sentiment
 
     # Component activity snapshot (stored in DB for learning)
     _component_snapshot = json.dumps({
@@ -1026,4 +1469,10 @@ def analyze_signal(
         component_snapshot = _component_snapshot,
         weights_used       = _weights_used,
         data_source        = _data_src,
+        ob                 = ob_result,
+        ote                = ote_result,
+        dxy                = dxy_result,
+        daily_open         = do_result,
+        london_fix         = fix_result,
+        premium_gates_passed = premium_passed,
     )

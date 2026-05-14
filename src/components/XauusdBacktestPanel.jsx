@@ -42,8 +42,9 @@ const DEFAULTS = {
   slippage_points: 0.5,
   min_score:       80,
   min_rr:          2.5,
-  include_news_filter: true,
-  allow_overlap:   false,
+  include_news_filter:   true,
+  allow_overlap:         false,
+  enable_premium_gates:  true,
 };
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
@@ -611,6 +612,11 @@ export default function XauusdBacktestPanel() {
               <Select value={params.allow_overlap ? 'true' : 'false'}
                       onChange={v => set('allow_overlap', v === 'true')}
                       options={[{ value: 'false', label: 'Disabled (default)' }, { value: 'true', label: 'Allowed' }]} />
+            </Field>
+            <Field label="Premium ICT gates" hint="OB+OTE+DXY+DailyOpen+LondonFix">
+              <Select value={params.enable_premium_gates ? 'true' : 'false'}
+                      onChange={v => set('enable_premium_gates', v === 'true')}
+                      options={[{ value: 'true', label: 'Enforced (top-tier)' }, { value: 'false', label: 'Disabled (loose)' }]} />
             </Field>
           </div>
 

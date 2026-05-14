@@ -130,6 +130,7 @@ def run_xauusd_backtest(
     allow_synthetic_fallback: bool        = True,
     allow_overlap:        Optional[bool]  = None,
     auto_seed:            bool            = True,
+    enable_premium_gates: bool            = True,
 ) -> dict:
     """
     Run the strict XAU/USD backtest.
@@ -267,6 +268,8 @@ def run_xauusd_backtest(
                 sl_buffer_pips=sl_buffer_points,
                 min_rr=min_rr,
                 fvg_min_pips=fvg_min_points,
+                enable_premium_gates=enable_premium_gates,
+                historical_mode=True,         # skip live DXY fetch
             )
         except Exception as e:
             log.debug("[backtest] Engine error at bar %d: %s", i, e)
@@ -454,6 +457,7 @@ def run_xauusd_backtest(
         "dataSource":          source,
         "barsAnalyzed":        len(candles),
         "macroEventsLoaded":   len(macro_events),
+        "premiumGatesEnabled": enable_premium_gates,
     }
 
     return {

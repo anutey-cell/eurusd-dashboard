@@ -116,6 +116,13 @@ class SignalModelDetail(BaseModel):
     fvg: str
     session: str
     sentiment: dict | None = None    # MyFXBook community sentiment (optional)
+    # ─── Premium ICT gate descriptions (top retail tier) ─────────────────────
+    order_block:           str | None = None
+    ote_zone:              str | None = None
+    dxy_alignment:         str | None = None
+    daily_open:            str | None = None
+    london_fix:            str | None = None
+    premium_gates_passed:  bool | None = None
 
 
 class SignalAnalysisOutput(BaseModel):
