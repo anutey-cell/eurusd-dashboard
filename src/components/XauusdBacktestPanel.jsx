@@ -286,6 +286,43 @@ function OverfittingPanel({ of }) {
   );
 }
 
+function DataQualityPanel({ dq }) {
+  if (!dq) return null;
+  const cfg = {
+    PASS: { cls: 'border-emerald-600/40 bg-emerald-900/15 text-emerald-300', icon: CheckCircle },
+    WARN: { cls: 'border-amber-600/40   bg-amber-900/15   text-amber-300',   icon: AlertTriangle },
+    FAIL: { cls: 'border-red-600/40     bg-red-900/15     text-red-300',     icon: XCircle },
+  }[dq.status] ?? { cls: 'border-gray-600 bg-gray-900/15 text-gray-400', icon: AlertTriangle };
+  const Icon = cfg.icon;
+  return (
+    <div className={`rounded-lg p-3 border ${cfg.cls}`}>
+      <div className="flex items-center gap-2 mb-2">
+        <Icon size={13} />
+        <span className="text-xs font-bold uppercase tracking-widest">
+          Data Quality — {dq.status}
+        </span>
+        <span className="text-[10px] opacity-70 ml-auto">{dq.dataSource} / {dq.timeframe}</span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-2">
+        <Stat label="Candles"    value={dq.totalCandles?.toLocaleString()} small />
+        <Stat label="Missing"    value={dq.missingCandles} color={dq.missingCandles > 0 ? 'text-amber-400' : 'text-emerald-400'} small />
+        <Stat label="Duplicates" value={dq.duplicateCandles} color={dq.duplicateCandles > 0 ? 'text-amber-400' : 'text-emerald-400'} small />
+        <Stat label="Invalid"    value={dq.invalidCandles} color={dq.invalidCandles > 0 ? 'text-red-400' : 'text-emerald-400'} small />
+        <Stat label="Flat"       value={dq.flatCandles}    small />
+        <Stat label="Abnormal"   value={dq.abnormalCandles} small />
+      </div>
+      <p className="text-[10px] opacity-90">{dq.interpretation}</p>
+      {dq.warnings?.length > 0 && (
+        <ul className="mt-1 space-y-0.5">
+          {dq.warnings.map((w, i) => (
+            <li key={i} className="text-[10px] opacity-80 leading-tight">- {w}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function RiskSensitivityPanel({ rs }) {
   if (!rs || rs.length === 0) return null;
   return (
@@ -840,6 +877,7 @@ export default function XauusdBacktestPanel() {
           <>
             {/* Warnings + reliability */}
             <ReliabilityCard reliability={result.qualityScore ?? result.reliability} />
+            <DataQualityPanel dq={result.dataQuality} />
             <OverfittingPanel of={result.overfittingRisk} />
             <WarningsBanner warnings={result.warnings} />
 
@@ -962,6 +1000,25 @@ export default function XauusdBacktestPanel() {
                     cls: r => r.expectancyR > 0 ? 'text-emerald-400' : 'text-red-400' },
                   { key: 'averageBarsHeld',   label: 'Bars' },
                   { key: 'failureRate',       label: 'Fail %', fmt: r => `${r.failureRate}%` },
+                ]} />
+            )}
+
+            {/* Hypothetical skipped outcomes (Phase 2b) */}
+            {result.skippedDiagnostics?.hypotheticalOutcomes?.length > 0 && (
+              <BreakdownTable
+                title="Hypothetical Skipped-Trade Outcomes (diagnostic)"
+                rows={result.skippedDiagnostics.hypotheticalOutcomes}
+                cols={[
+                  { key: 'reason',                  label: 'Skip reason' },
+                  { key: 'simulated',               label: 'Sim' },
+                  { key: 'hypotheticalWins',        label: 'W' },
+                  { key: 'hypotheticalLosses',      label: 'L' },
+                  { key: 'hypotheticalWinRate',     label: 'WR %', fmt: r => `${r.hypotheticalWinRate}%` },
+                  { key: 'hypotheticalExpectancyR', label: 'Exp R', fmt: r => `${r.hypotheticalExpectancyR > 0 ? '+' : ''}${r.hypotheticalExpectancyR}R`,
+                    cls: r => r.hypotheticalExpectancyR > 0 ? 'text-emerald-400' : r.hypotheticalExpectancyR < -0.1 ? 'text-red-400' : 'text-gray-400' },
+                  { key: 'interpretation',          label: 'Verdict',
+                    cls: r => r.interpretation?.includes('saved') ? 'text-emerald-400' :
+                              r.interpretation?.includes('cost')  ? 'text-amber-400'   : 'text-gray-400' },
                 ]} />
             )}
 

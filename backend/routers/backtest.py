@@ -227,6 +227,7 @@ def xauusd_backtest(
     monte_carlo_runs:      int = Query(default=500, ge=0, le=5000, description="Phase 2a — Monte Carlo runs (0 = disabled)"),
     classify_regimes:      bool = Query(default=True, description="Phase 2a — classify each trade's market regime"),
     risk_sensitivity_flag: bool = Query(default=True, alias="risk_sensitivity", description="Phase 2a — project equity at 0.25/0.5/1.0 risk levels"),
+    analyze_skipped:       bool = Query(default=True, description="Phase 2b — simulate hypothetical outcomes for skipped trades"),
     save:                bool = Query(default=True, description="Save run to backtest_runs table"),
     db: Session = Depends(get_db),
 ) -> APIResponse[dict]:
@@ -275,6 +276,7 @@ def xauusd_backtest(
             monte_carlo_runs=monte_carlo_runs,
             classify_regimes=classify_regimes,
             risk_sensitivity=risk_sensitivity_flag,
+            analyze_skipped=analyze_skipped,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

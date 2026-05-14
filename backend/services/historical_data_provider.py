@@ -403,6 +403,13 @@ def generate_historical_dataset(
         o = round(close, 2)
         c = round(o + body, 2)
 
+        # Keep close in realistic gold range BEFORE computing high/low,
+        # otherwise the high/low can violate OHLC sanity.
+        if c > 3500:
+            c = round(3500 - rng.uniform(0, 50), 2)
+        elif c < 2400:
+            c = round(2400 + rng.uniform(0, 50), 2)
+
         # Wicks — occasional liquidity-sweep wick (4%)
         wick_hi_scale = 0.6
         wick_lo_scale = 0.6
@@ -416,14 +423,6 @@ def generate_historical_dataset(
         wick_lo = abs(rng.gauss(0, eff_vol * wick_lo_scale))
         h = round(max(o, c) + wick_hi, 2)
         l = round(min(o, c) - wick_lo, 2)
-
-        # Keep price in realistic gold range (2400-3500)
-        if c > 3500:
-            close = 3500 - rng.uniform(0, 50)
-            c = round(close, 2)
-        elif c < 2400:
-            close = 2400 + rng.uniform(0, 50)
-            c = round(close, 2)
 
         vol_units = int(rng.uniform(800, 2400) * sess_mult)
 
@@ -620,6 +619,17 @@ def seed_historical_data(
             "candlesInserted": 0,
             "eventsInserted":  0,
         }
+
+    # force=true: purge existing rows for this TF/instrument before re-seeding
+    if force and existing > 0:
+        deleted = (
+            db.query(HistoricalCandle)
+              .filter(HistoricalCandle.instrument == instrument,
+                      HistoricalCandle.timeframe  == tf)
+              .delete(synchronize_session=False)
+        )
+        db.commit()
+        log.info("[seed] force=true — deleted %d existing %s %s rows", deleted, instrument, tf)
 
     log.info(
         "[seed] Generating %d days of %s %s data (seed=%d)",

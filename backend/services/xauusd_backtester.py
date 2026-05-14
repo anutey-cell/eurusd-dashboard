@@ -95,6 +95,7 @@ class Trade:
     reason:         str
     bars_held:      int
     market_state:   str = ""
+    setup_type:     str = "unknown"   # structured classification from engine
     blockers:       list[str] = field(default_factory=list)
     costs:          dict = field(default_factory=dict)
 
@@ -106,6 +107,15 @@ class SkippedTrade:
     score:   int
     reason:  str          # e.g. RR_AFTER_COST_TOO_LOW
     detail:  str = ""
+    # Optional fields for hypothetical-outcome simulation
+    bar_idx:     int   = -1
+    entry:       float = 0.0
+    stop_loss:   float = 0.0
+    take_profit: float = 0.0
+    risk_points: float = 0.0
+    target_points: float = 0.0
+    hypothetical_result: str = ""    # WIN | LOSS | EXPIRED (filled when analyze_skipped=true)
+    hypothetical_r:      float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -235,6 +245,11 @@ def run_xauusd_backtest(
     # Convert to engine candles (engine functions duck-type but be explicit)
     bars = [_to_engine_candle(c) for c in candles]
 
+    # ── Pre-flight data quality audit (Phase 2b) ─────────────────────────────
+    data_quality_report = _audit_data_quality(bars, timeframe, source)
+    if data_quality_report["status"] == "FAIL":
+        log.warning("[backtest] Data quality FAIL — proceeding with reliability caveat")
+
     # ── Walk-forward loop ───────────────────────────────────────────────────
     trades:  list[Trade]        = []
     skipped: list[SkippedTrade] = []
@@ -351,6 +366,12 @@ def run_xauusd_backtest(
                 time=candle_ts.isoformat(), signal=result.signal,
                 score=result.quality_score, reason="RR_AFTER_COST_TOO_LOW",
                 detail=f"rr={rr_after:.2f} < {min_rr}",
+                bar_idx=i,
+                entry=adj_entry,
+                stop_loss=float(result.stop_loss),
+                take_profit=float(result.take_profit),
+                risk_points=risk_pts,
+                target_points=reward_pts,
             ))
             continue
 
@@ -389,8 +410,8 @@ def run_xauusd_backtest(
 
         # Classify market regime at the trade bar (uses window up to i)
         regime = _classify_regime(window, pip_size) if classify_regimes else "UNKNOWN"
-        # News-day classification
-        news_class = _classify_news_day(candle_ts, macro_events)
+        # News-day classification (fine-grained: news_window_30 / pre_news / post_news_*)
+        news_class = _classify_news_window_fine(candle_ts, macro_events)
 
         trade = Trade(
             id=len(trades) + 1,
@@ -416,6 +437,7 @@ def run_xauusd_backtest(
             reason=_short_reason(result.model, result.reason),
             bars_held=bars_held,
             market_state=regime,
+            setup_type=getattr(result, "setup_type", None) or result.model.get("setupType", "unknown"),
             blockers=[news_class] if news_class != "normal_day" else [],
             costs={"spreadPoints": spread_points, "slippagePoints": slippage_points,
                    "commission": commission_per_trade},
@@ -460,6 +482,9 @@ def run_xauusd_backtest(
     risk_sens   = _risk_sensitivity_analysis(
         trades, initial_balance=initial_balance,
     ) if risk_sensitivity else []
+    # Phase 2b — simulate hypothetical outcomes for skipped trades
+    if analyze_skipped:
+        _simulate_skipped_outcomes(skipped, bars, max_holding_candles)
     skipped_diag = _skipped_diagnostics(skipped)
 
     overfitting = _assess_overfitting(
@@ -471,7 +496,7 @@ def run_xauusd_backtest(
     rating = _compute_quality_score(
         summary=summary, trades=trades, walk_forward=walk_forward,
         breakdowns=breakdowns, regime_perf=regime_perf, overfitting=overfitting,
-        data_source=source,
+        data_source=source, data_quality=data_quality_report,
     )
 
     settings_obj = {
@@ -504,6 +529,7 @@ def run_xauusd_backtest(
             "end":   bars[-1].time.isoformat() if bars else None,
         },
         "settings":     settings_obj,
+        "dataQuality":  data_quality_report,   # Phase 2b
         "summary":      summary,
         "qualityScore": rating,
         "reliability":  rating,    # alias for backwards compat
@@ -1191,29 +1217,33 @@ def _news_day_breakdown(trades: list[Trade]) -> list[dict]:
 
 def _setup_type_breakdown(trades: list[Trade]) -> list[dict]:
     """
-    Classify trades by reason-text keywords. This is heuristic until the signal
-    engine emits a structured setup_type field. Useful as a directional signal
-    of which setups have edge.
+    Group trades by the engine's structured setup_type field.
+    Used to identify which setup categories actually have edge.
     """
     if not trades:
         return []
+
+    # Human-readable display labels for each canonical setup type
+    display = {
+        "liquidity_sweep_choch_fvg":  "Liquidity sweep + CHoCH + FVG",
+        "bos_continuation_fvg":       "BOS continuation + FVG",
+        "choch_ob_reversal":          "CHoCH + OB retest reversal",
+        "bos_continuation":           "BOS continuation (no FVG retest)",
+        "choch_reversal":             "CHoCH reversal (no FVG retest)",
+        "fvg_retest_only":            "FVG retest only",
+        "session_sweep_reversal":     "Session sweep reversal",
+        "premium_discount_reversal":  "Premium/discount FVG+OB",
+        "post_news_displacement":     "Post-news displacement",
+        "ote_pullback":               "OTE pullback (no clear pattern)",
+        "weak_setup":                 "Weak setup (marginal)",
+        "no_signal":                  "No primary signal",
+        "unknown":                    "Unclassified",
+    }
+
     groups: dict[str, list[Trade]] = {}
     for t in trades:
-        rl = (t.reason or "").lower()
-        if "bos" in rl and "fvg" in rl:
-            label = "BOS continuation + FVG"
-        elif "choch" in rl and ("swept" in rl or "liquidity" in rl) and "fvg" in rl:
-            label = "Liquidity sweep + CHoCH + FVG"
-        elif "choch" in rl:
-            label = "CHoCH reversal"
-        elif "bos" in rl:
-            label = "BOS continuation"
-        elif "swept" in rl or "liquidity" in rl:
-            label = "Liquidity sweep"
-        elif "fvg" in rl:
-            label = "FVG retest"
-        else:
-            label = "Other ICT setup"
+        key = t.setup_type or "unknown"
+        label = display.get(key, key)
         groups.setdefault(label, []).append(t)
 
     rows = []
@@ -1278,11 +1308,12 @@ def _risk_sensitivity_analysis(
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Phase 2a — Skipped diagnostics
+# Phase 2b — Hypothetical skipped-trade outcomes
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _skipped_diagnostics(skipped: list[SkippedTrade]) -> dict:
     if not skipped:
-        return {"totalSkipped": 0, "byReason": []}
+        return {"totalSkipped": 0, "byReason": [], "hypotheticalOutcomes": None}
     counter: dict[str, int] = {}
     for s in skipped:
         counter[s.reason] = counter.get(s.reason, 0) + 1
@@ -1291,14 +1322,256 @@ def _skipped_diagnostics(skipped: list[SkippedTrade]) -> dict:
          for k, v in counter.items()],
         key=lambda r: -r["count"],
     )
+
+    # Hypothetical-outcome aggregates (only for skipped trades with simulation data)
+    hypothetical_rows: list[dict] = []
+    by_reason_hyp: dict[str, list[SkippedTrade]] = {}
+    for s in skipped:
+        if s.hypothetical_result in ("WIN", "LOSS", "EXPIRED"):
+            by_reason_hyp.setdefault(s.reason, []).append(s)
+
+    for reason, lst in by_reason_hyp.items():
+        wins = sum(1 for s in lst if s.hypothetical_result == "WIN")
+        losses = sum(1 for s in lst if s.hypothetical_result == "LOSS")
+        expired = sum(1 for s in lst if s.hypothetical_result == "EXPIRED")
+        total = len(lst)
+        exp_r = sum(s.hypothetical_r for s in lst) / total if total else 0
+        win_rate = wins / total * 100 if total else 0
+        hypothetical_rows.append({
+            "reason":             reason,
+            "simulated":          total,
+            "hypotheticalWins":   wins,
+            "hypotheticalLosses": losses,
+            "hypotheticalExpired": expired,
+            "hypotheticalWinRate":     round(win_rate, 2),
+            "hypotheticalExpectancyR": round(exp_r, 3),
+            "interpretation": (
+                "Skipping saved you losses"  if exp_r < -0.1 else
+                "Skipping cost you wins"     if exp_r > 0.3  else
+                "Skipping had neutral impact"
+            ),
+        })
+    hypothetical_rows.sort(key=lambda r: -r["simulated"])
+
     return {
         "totalSkipped": len(skipped),
         "byReason":     rows,
+        "hypotheticalOutcomes": hypothetical_rows if hypothetical_rows else None,
         "note": (
             "Skipped trades are NOT counted in main performance. "
-            "Provided for diagnostic insight only."
+            "Hypothetical outcomes show what would have happened if "
+            "the skip-reason had been relaxed — diagnostic insight only."
         ),
     }
+
+
+def _simulate_skipped_outcomes(
+    skipped: list[SkippedTrade],
+    bars: list,
+    max_holding: int,
+) -> None:
+    """
+    For each skipped trade with a defined entry/SL/TP, walk forward through
+    bars and determine whether it would have WIN/LOSS/EXPIRED. Mutates the
+    SkippedTrade in place. Only simulates skips that have entry geometry.
+    """
+    for s in skipped:
+        if s.bar_idx < 0 or s.risk_points <= 0 or s.target_points <= 0:
+            continue
+        exit_time, result_label, points_captured, r_mult, bars_held = _resolve_trade(
+            bars=bars,
+            entry_idx=s.bar_idx,
+            signal=s.signal,
+            adj_entry=s.entry,
+            stop_loss=s.stop_loss,
+            take_profit=s.take_profit,
+            max_holding=max_holding,
+            risk_points=s.risk_points,
+            reward_points=s.target_points,
+        )
+        s.hypothetical_result = result_label
+        s.hypothetical_r      = round(r_mult, 3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2b — Historical data quality audit
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _audit_data_quality(candles: list, timeframe: str, data_source: str) -> dict:
+    """
+    Pre-backtest data quality audit. Detects:
+      - Missing candles (gaps in expected interval sequence)
+      - Duplicate candles (consecutive identical timestamps)
+      - Invalid candles (OHLC sanity violations)
+      - Flat candles (high == low — zero range)
+      - Abnormal candles (range > 5 stdev from mean)
+      - Coverage start/end
+    """
+    if not candles:
+        return {
+            "status": "FAIL",
+            "totalCandles": 0,
+            "warnings": ["No candles available"],
+        }
+
+    n = len(candles)
+    warnings: list[str] = []
+
+    # Expected interval in minutes
+    interval_min_map = {"M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
+    interval_min = interval_min_map.get(timeframe, 15)
+    interval_sec = interval_min * 60
+
+    # Coverage
+    first_t = candles[0].time
+    last_t  = candles[-1].time
+    if first_t.tzinfo is None: first_t = first_t.replace(tzinfo=timezone.utc)
+    if last_t.tzinfo  is None: last_t  = last_t.replace(tzinfo=timezone.utc)
+
+    # Missing/duplicate detection — count adjacent intervals that aren't ~= expected
+    missing   = 0
+    duplicates = 0
+    prev = None
+    for c in candles:
+        t = c.time if c.time.tzinfo else c.time.replace(tzinfo=timezone.utc)
+        if prev is not None:
+            diff_sec = (t - prev).total_seconds()
+            if diff_sec == 0:
+                duplicates += 1
+            elif diff_sec > interval_sec * 3:
+                # Allow up to 3x gap (weekend/holiday)
+                # Count how many candles were skipped
+                if not _is_weekend_gap(prev, t):
+                    missing += int(diff_sec / interval_sec) - 1
+        prev = t
+
+    # Invalid OHLC + flat detection
+    invalid = 0
+    flat = 0
+    ranges = []
+    for c in candles:
+        if c.high < max(c.open, c.close, c.low):
+            invalid += 1
+        elif c.low > min(c.open, c.close, c.high):
+            invalid += 1
+        elif c.high <= 0 or c.low <= 0:
+            invalid += 1
+        elif c.high == c.low:
+            flat += 1
+        ranges.append(c.high - c.low)
+
+    # Abnormal range detection (range > 5 stdev from mean)
+    abnormal = 0
+    if len(ranges) >= 20:
+        mean_r = sum(ranges) / len(ranges)
+        var = sum((r - mean_r) ** 2 for r in ranges) / len(ranges)
+        std = var ** 0.5
+        threshold = mean_r + 5 * std
+        abnormal = sum(1 for r in ranges if r > threshold)
+
+    # Status determination
+    issues_pct = (missing + duplicates + invalid) / max(n, 1) * 100
+    if invalid > 0 or issues_pct > 5:
+        status = "FAIL"
+    elif missing > n * 0.02 or flat > n * 0.05 or duplicates > 0:
+        status = "WARN"
+    else:
+        status = "PASS"
+
+    if missing > 0:
+        warnings.append(f"Missing candles detected: {missing}")
+    if duplicates > 0:
+        warnings.append(f"Duplicate timestamps: {duplicates}")
+    if invalid > 0:
+        warnings.append(f"Invalid OHLC candles: {invalid}")
+    if flat > n * 0.05:
+        warnings.append(f"High flat-candle rate: {flat} ({flat / n * 100:.1f}%)")
+    if abnormal > n * 0.02:
+        warnings.append(f"High abnormal-range candle count: {abnormal}")
+    if data_source == "synthetic":
+        warnings.append("Synthetic data — results are illustrative only. "
+                        "Import real candles for statistical validity.")
+
+    return {
+        "status":          status,
+        "totalCandles":    n,
+        "missingCandles":  missing,
+        "duplicateCandles": duplicates,
+        "invalidCandles":  invalid,
+        "flatCandles":     flat,
+        "abnormalCandles": abnormal,
+        "coverageStart":   first_t.isoformat(),
+        "coverageEnd":     last_t.isoformat(),
+        "timeframe":       timeframe,
+        "dataSource":      data_source,
+        "warnings":        warnings,
+        "interpretation": (
+            "Data quality acceptable."          if status == "PASS" else
+            "Data quality reduced — backtest reliability impacted." if status == "WARN" else
+            "Critical data quality issues — backtest reliability significantly reduced."
+        ),
+    }
+
+
+def _is_weekend_gap(prev: datetime, curr: datetime) -> bool:
+    """True if the gap spans a weekend (Sat/Sun)."""
+    # Heuristic: gap > 24h and prev was Fri or curr is Mon
+    delta = (curr - prev).total_seconds()
+    if delta < 24 * 3600:
+        return False
+    return prev.weekday() == 4 or curr.weekday() == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2b — Refined news-day windows
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _classify_news_window_fine(at: datetime, macro_events: list[dict]) -> str:
+    """
+    Finer-grained news classification than _classify_news_day.
+
+    Returns:
+      news_window_30        within ±30 min of high-impact event
+      post_news_30_120      30-120 min after release
+      post_news_120_240     2-4 hours after release
+      pre_news_120          0-120 min before release
+      high_impact_day       same day, outside windows
+      normal_day            no high-impact USD event same day
+    """
+    if not macro_events:
+        return "normal_day"
+
+    if not at.tzinfo:
+        at = at.replace(tzinfo=timezone.utc)
+
+    same_day_events: list[datetime] = []
+    for e in macro_events:
+        if str(e.get("impact", "")).lower() != "high":
+            continue
+        try:
+            ev_time = datetime.fromisoformat(str(e.get("time", "")).replace("Z", "+00:00"))
+            if ev_time.tzinfo is None:
+                ev_time = ev_time.replace(tzinfo=timezone.utc)
+            if ev_time.date() == at.date():
+                same_day_events.append(ev_time)
+        except Exception:
+            continue
+
+    if not same_day_events:
+        return "normal_day"
+
+    nearest = min(same_day_events, key=lambda t: abs((t - at).total_seconds()))
+    diff_min = (at - nearest).total_seconds() / 60
+
+    if -30 <= diff_min <= 30:
+        return "news_window_30"
+    if 30 < diff_min <= 120:
+        return "post_news_30_120"
+    if 120 < diff_min <= 240:
+        return "post_news_120_240"
+    if -120 <= diff_min < 0:
+        return "pre_news_120"
+    return "high_impact_day"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1429,6 +1702,7 @@ def _compute_quality_score(
     regime_perf:  list[dict],
     overfitting:  dict,
     data_source:  str,
+    data_quality: dict | None = None,
 ) -> dict:
     """
     Backtest Quality Score (0-100). Replaces older reliability rating.
@@ -1455,9 +1729,14 @@ def _compute_quality_score(
 
     score = 0
 
-    # Data quality (15) — penalise synthetic
-    if data_source == "database":
+    # Data quality (15) — combines source + audit status
+    dq_status = (data_quality or {}).get("status", "PASS")
+    if data_source == "database" and dq_status == "PASS":
         score += 15
+    elif data_source == "database" and dq_status == "WARN":
+        score += 10
+    elif data_source == "database":
+        score += 5    # FAIL — keep some signal but penalise
     elif data_source == "synthetic":
         score += 5    # honest about synthetic limitation
     else:

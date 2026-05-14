@@ -240,6 +240,7 @@ class SignalResult:
     daily_open:   Optional["DailyOpenBias"]  = None
     london_fix:   Optional["LondonFixStatus"] = None
     premium_gates_passed: bool = False    # True if all 5 premium gates aligned
+    setup_type:   str  = "no_signal"      # structured setup classification
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +991,111 @@ def check_london_fix(at: datetime | None = None) -> LondonFixStatus:
 
 
 # ---------------------------------------------------------------------------
+# 7g. SETUP TYPE classification (structured)
+#
+# Replaces ad-hoc regex on reason text. Inspects which gates were
+# actually triggered and tags the trade with a canonical setup label.
+# Used by backtester breakdowns to identify which setup types have edge.
+# ---------------------------------------------------------------------------
+
+SETUP_TYPES = {
+    "liquidity_sweep_choch_fvg",  # full premium reversal
+    "bos_continuation_fvg",       # trend continuation
+    "choch_ob_reversal",          # CHoCH + OB-zone retest
+    "bos_continuation",           # BOS without FVG retest
+    "choch_reversal",             # CHoCH alone
+    "fvg_retest_only",            # FVG present, no liquidity/BOS
+    "ote_pullback",               # OTE zone entry, weak primary
+    "post_news_displacement",     # within 30 min after news
+    "session_sweep_reversal",     # liquidity sweep in killzone
+    "premium_discount_reversal",  # FVG + OB in opposite extreme
+    "weak_setup",                 # gates passed but quality marginal
+    "no_signal",
+    "unknown",
+}
+
+
+def classify_setup_type(
+    htf, liq, ms, fvg, ob, sess, news, signal: str,
+    quality_score: int = 0,
+    at: datetime | None = None,
+    macro_events: list[dict] | None = None,
+) -> str:
+    """
+    Inspect which ICT components were active and tag the setup canonically.
+    Order of checks goes from most-specific to most-generic.
+    """
+    if signal not in ("BUY", "SELL"):
+        return "no_signal"
+
+    has_sweep    = bool(liq and liq.swept and liq.score >= 15)
+    has_choch    = bool(ms  and ms.shifted and ms.pattern == "CHoCH")
+    has_bos      = bool(ms  and ms.shifted and ms.pattern == "BOS")
+    has_fvg_zone = bool(fvg and fvg.detected and fvg.in_zone)
+    has_fvg_any  = bool(fvg and fvg.detected)
+    has_ob_zone  = bool(ob  and ob.detected and ob.in_zone)
+    has_ob_any   = bool(ob  and ob.detected)
+    in_kz        = bool(sess and sess.in_kill_zone)
+
+    # Post-news displacement: signal fired within 30 min after a high-impact event
+    if at and macro_events:
+        try:
+            now = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+            for ev in macro_events:
+                if str(ev.get("impact", "")).lower() != "high":
+                    continue
+                try:
+                    et = datetime.fromisoformat(str(ev.get("time", "")).replace("Z", "+00:00"))
+                    if et.tzinfo is None:
+                        et = et.replace(tzinfo=timezone.utc)
+                    delta_min = (now - et).total_seconds() / 60
+                    if 0 < delta_min <= 30:
+                        return "post_news_displacement"
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # Premium full-confluence reversal
+    if has_sweep and has_choch and has_fvg_zone:
+        return "liquidity_sweep_choch_fvg"
+
+    # Trend continuation with FVG retest
+    if has_bos and has_fvg_zone:
+        return "bos_continuation_fvg"
+
+    # CHoCH + OB retest reversal
+    if has_choch and has_ob_zone:
+        return "choch_ob_reversal"
+
+    # Session sweep without structure shift (liquidity grab in killzone)
+    if has_sweep and in_kz and not (has_choch or has_bos):
+        return "session_sweep_reversal"
+
+    # FVG + OB at extreme (premium/discount)
+    if has_fvg_zone and has_ob_zone and not has_sweep:
+        return "premium_discount_reversal"
+
+    # CHoCH alone (reversal without FVG retest)
+    if has_choch and not has_fvg_zone:
+        return "choch_reversal"
+
+    # BOS continuation without FVG
+    if has_bos and not has_fvg_zone:
+        return "bos_continuation"
+
+    # FVG retest only
+    if has_fvg_zone and not (has_choch or has_bos or has_sweep):
+        return "fvg_retest_only"
+
+    # Marginal — gates passed but no strong pattern
+    if quality_score < 85:
+        return "weak_setup"
+
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
 # 8. Reason builder -- specific, gate-aware messages
 #
 # FIX #10 : Each gate failure now returns a distinct, actionable message
@@ -1387,6 +1493,12 @@ def analyze_signal(
             if fix_result.active:
                 score = min(100, score + 5)
 
+    # ── Structured setup type classification ─────────────────────────────
+    setup_type_label = classify_setup_type(
+        htf=htf, liq=liq, ms=ms, fvg=fvg, ob=ob_result, sess=sess, news=news,
+        signal=signal, quality_score=score, at=at, macro_events=macro_events,
+    )
+
     model_dict = {
         "higherTimeframeBias": htf.bias_text,
         "liquidity":           liq.liq_text,
@@ -1400,6 +1512,7 @@ def analyze_signal(
         "dailyOpen":           do_result.do_text  if do_result  else "Not evaluated",
         "londonFix":           fix_result.label   if fix_result else "Not evaluated",
         "premiumGatesPassed":  premium_passed,
+        "setupType":           setup_type_label,
     }
 
     # ── MyFXBook sentiment (non-blocking, supplementary) ──────────────────
@@ -1475,4 +1588,5 @@ def analyze_signal(
         daily_open         = do_result,
         london_fix         = fix_result,
         premium_gates_passed = premium_passed,
+        setup_type         = setup_type_label,
     )
