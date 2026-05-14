@@ -64,6 +64,8 @@ _session_token:   str   = ""
 _session_created: float = 0.0
 _sentiment_cache: dict  = {}   # {pair_code: SentimentData}
 _cache_fetched:   float = 0.0
+_login_failed_at: float = 0.0  # timestamp of last failed login attempt
+LOGIN_RETRY_BACKOFF = 1800     # 30-minute backoff after failed login
 
 
 @dataclass
@@ -83,12 +85,19 @@ class SentimentData:
 
 def _login() -> str | None:
     """Authenticate and return a session token. Returns None on failure."""
-    global _session_token, _session_created
+    global _session_token, _session_created, _login_failed_at
 
     if not MYFXBOOK_ENABLED:
         return None
     if not MYFXBOOK_EMAIL or not MYFXBOOK_PASSWORD:
         log.warning("[myfxbook] MYFXBOOK_EMAIL or MYFXBOOK_PASSWORD not set")
+        return None
+
+    # Exponential backoff: do not retry within LOGIN_RETRY_BACKOFF seconds of last failure
+    now = time.time()
+    if _login_failed_at and (now - _login_failed_at) < LOGIN_RETRY_BACKOFF:
+        remaining = int(LOGIN_RETRY_BACKOFF - (now - _login_failed_at))
+        log.debug("[myfxbook] Login backoff active — retry in %ds", remaining)
         return None
 
     try:
@@ -101,14 +110,19 @@ def _login() -> str | None:
         if data.get("error") is False and data.get("session"):
             _session_token   = data["session"]
             _session_created = time.time()
+            _login_failed_at = 0.0   # reset failure timestamp on success
             log.info("[myfxbook] Authenticated successfully as %s", MYFXBOOK_EMAIL)
             return _session_token
         else:
             msg = data.get("message", "Unknown error")
-            log.warning("[myfxbook] Login failed: %s", msg)
+            _login_failed_at = time.time()
+            log.warning("[myfxbook] Login failed: %s — will retry in %dm",
+                        msg, LOGIN_RETRY_BACKOFF // 60)
             return None
     except Exception as exc:
-        log.warning("[myfxbook] Login error: %s", exc)
+        _login_failed_at = time.time()
+        log.warning("[myfxbook] Login error: %s — will retry in %dm",
+                    exc, LOGIN_RETRY_BACKOFF // 60)
         return None
 
 
