@@ -33,7 +33,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         method = request.method
         path   = request.url.path
 
-        level = logging.WARNING if status >= 400 else logging.INFO
+        # MT5 routes always return 503 inside Docker (Windows-only package).
+        # Treat those as expected INFO noise rather than actionable warnings.
+        _is_expected_503 = status == 503 and "/mt5/" in path
+        level = logging.INFO if (status < 400 or _is_expected_503) else logging.WARNING
         logger.log(
             level,
             "%s %s → %s  %.1fms  rid=%s",

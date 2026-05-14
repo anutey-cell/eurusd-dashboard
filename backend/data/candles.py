@@ -6,6 +6,7 @@ In live mode (DATA_MODE=live), delegates to candle_provider which routes to
 the configured FX_DATA_PROVIDER (twelvedata | alpha_vantage | oanda | polygon | fmp).
 """
 import random
+import time
 from datetime import datetime, timedelta, timezone
 
 from models.candle import Candle, CandleResponse
@@ -27,7 +28,10 @@ SPREAD = 0.00002
 
 
 def _generate_candles(interval: str, limit: int) -> list[Candle]:
-    rng = random.Random(42)  # seeded so responses are deterministic
+    # Seed rotates every hour so mock scores vary over time while staying
+    # deterministic within the same hour (reproducible for debugging).
+    _hour_bucket = int(time.time() // 3600)
+    rng = random.Random(42 + _hour_bucket)
     step_min = INTERVAL_MINUTES[interval]
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     # Align to interval boundary
@@ -69,8 +73,9 @@ def _get_mock_candles(interval: str, limit: int) -> CandleResponse:
 
 
 def _generate_xauusd_candles(interval: str, limit: int) -> list[Candle]:
-    """Deterministic seeded mock gold candles around $2350–2380."""
-    rng = random.Random(99)   # different seed from EUR/USD
+    """Mock gold candles around $2350-2380. Seed rotates hourly."""
+    _hour_bucket = int(time.time() // 3600)
+    rng = random.Random(99 + _hour_bucket)
     step_min = INTERVAL_MINUTES[interval]
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     total_min = int(now.timestamp() // 60) * 60

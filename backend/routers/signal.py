@@ -102,6 +102,55 @@ def analyze(
         raise HTTPException(status_code=502, detail=f"Signal analysis error: {exc}") from exc
 
 
+# ── GET convenience alias ─────────────────────────────────────────────────────
+
+@router.get(
+    "/{pair}",
+    response_model=APIResponse[SignalAnalysisOutput],
+    summary="Run ICT signal engine via GET (pair in URL path)",
+    description=(
+        "Convenience alias for POST /analyze — runs the full ICT/SMC pipeline "
+        "for the specified pair. No request body required. "
+        "Valid values: eurusd, xauusd."
+    ),
+)
+@limiter.limit("10/minute")
+def analyze_get(
+    pair: str = Path(description="Trading pair: eurusd | xauusd"),
+    request: Request = ...,
+) -> APIResponse[SignalAnalysisOutput]:
+    """GET wrapper so callers can hit /api/v1/signal/eurusd without a body."""
+    logger.info("Signal GET analysis pair=%s ip=%s", pair, request.client.host if request.client else "unknown")
+    try:
+        from pair_config import validate_pair as _validate_pair
+        pair = _validate_pair(pair)
+        result = run_signal_analysis([], pair=pair)
+        logger.info(
+            "Signal GET analyzed signal=%s quality=%s session=%s",
+            getattr(result, "signal", "?"),
+            getattr(result, "quality_score", "?"),
+            getattr(result, "session", "?"),
+        )
+
+        alert_status: str = "disabled"
+        try:
+            from services.telegram_alert_service import send_signal_alert as _tg_send
+            payload_dict = result.model_dump(by_alias=True)
+            alert_status = _tg_send(payload_dict)
+        except Exception as _tg_exc:
+            logger.debug("Telegram alert (non-fatal): %s", _tg_exc)
+            alert_status = "failed"
+
+        result.alert_status = alert_status
+        return APIResponse(data=result)
+    except ProviderError as exc:
+        logger.warning("Provider error in GET signal analysis: %s", exc)
+        raise HTTPException(status_code=exc.http_code, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Unexpected error in GET signal analysis")
+        raise HTTPException(status_code=502, detail=f"Signal analysis error: {exc}") from exc
+
+
 # ── DB-backed routes ──────────────────────────────────────────────────────────
 
 @router.post(
