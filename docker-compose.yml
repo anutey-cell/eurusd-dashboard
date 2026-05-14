@@ -1,7 +1,7 @@
 ﻿services:
 
   backend:
-    image: anudhe/eurusd-backend:latest
+    image: anudhe/xauusd-backend:latest
     ports:
       - "8000:8000"
     volumes:
@@ -22,7 +22,7 @@
       retries: 3
 
   frontend:
-    image: anudhe/eurusd-frontend:latest
+    image: anudhe/xauusd-frontend:latest
     ports:
       - "5173:5173"
     environment:
