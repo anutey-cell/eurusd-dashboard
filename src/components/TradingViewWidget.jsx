@@ -8,7 +8,8 @@ const TIMEFRAMES = [
   { label: 'D1',  value: 'D'   },
 ];
 
-export default function TradingViewWidget({ symbol = 'FX:EURUSD' }) {
+// XAU/USD chart — symbol candidates: OANDA:XAUUSD → TVC:GOLD → FOREXCOM:XAUUSD
+export default function TradingViewWidget({ symbol = 'OANDA:XAUUSD' }) {
   const containerRef = useRef(null);
   const [interval, setInterval_] = useState('240');
   const [loaded, setLoaded] = useState(false);
@@ -74,7 +75,7 @@ export default function TradingViewWidget({ symbol = 'FX:EURUSD' }) {
       <div className="card-header">
         <div className="flex items-center gap-2">
           <BarChart2 size={13} className="text-blue-400" />
-          <span className="card-title">Chart — {symbol}</span>
+          <span className="card-title">XAU/USD Chart</span>
         </div>
         <div className="flex items-center gap-2">
           {/* Timeframe buttons */}

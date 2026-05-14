@@ -22,7 +22,7 @@ import { confirmSignal } from '../services/api';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
-async function runAnalysis(macroEvents = [], pairCode = 'eurusd') {
+async function runAnalysis(macroEvents = [], pairCode = 'xauusd') {
   const res = await fetch(`${API_BASE}/api/v1/signal/analyze?pair=${pairCode}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -124,9 +124,9 @@ function PriceBox({ label, value, cls = 'text-white', decimals = 5 }) {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function PaperTradePanel({ onConfirmed, selectedPair }) {
-  const pairCode     = selectedPair?.code     ?? 'eurusd';
-  const pairLabel    = selectedPair?.label    ?? 'EUR/USD';
-  const pairDecimals = selectedPair?.decimals ?? 5;
+  const pairCode     = selectedPair?.code     ?? 'xauusd';
+  const pairLabel    = selectedPair?.label    ?? 'XAU/USD';
+  const pairDecimals = selectedPair?.decimals ?? 2;
 
   const [running,   setRunning]   = useState(false);
   const [result,    setResult]    = useState(null);
@@ -247,11 +247,11 @@ export default function PaperTradePanel({ onConfirmed, selectedPair }) {
           {isTradeable && (
             <div className="grid grid-cols-3 gap-2 text-center text-xs">
               <div className="bg-[#1e2535] rounded-lg p-2">
-                <div className="text-[10px] text-gray-500">Risk Pips</div>
+                <div className="text-[10px] text-gray-500">Risk Pts</div>
                 <div className="font-mono font-bold text-red-400">{result.riskPips}</div>
               </div>
               <div className="bg-[#1e2535] rounded-lg p-2">
-                <div className="text-[10px] text-gray-500">Target Pips</div>
+                <div className="text-[10px] text-gray-500">Target Pts</div>
                 <div className="font-mono font-bold text-emerald-400">{result.targetPips}</div>
               </div>
               <div className="bg-[#1e2535] rounded-lg p-2">

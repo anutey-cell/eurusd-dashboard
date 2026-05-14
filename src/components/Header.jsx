@@ -16,13 +16,14 @@ function getCurrentSession() {
 }
 
 function useSimulatedPrice(basePrice) {
-  const [price, setPrice] = useState(basePrice);
+  const [price, setPrice] = useState(basePrice ?? 3285.00);
   const [tick, setTick] = useState(null);
   useEffect(() => {
     const id = setInterval(() => {
-      const delta = (Math.random() - 0.5) * 0.0004;
+      // XAU/USD moves in dollars — simulate ±$0.30 per tick
+      const delta = (Math.random() - 0.5) * 0.60;
       setPrice(prev => {
-        const next = Math.round((prev + delta) * 100000) / 100000;
+        const next = Math.round((prev + delta) * 100) / 100;
         setTick(delta >= 0 ? 'up' : 'down');
         return next;
       });
@@ -47,11 +48,12 @@ function useDataStatus() {
   return { status, error };
 }
 
-export default function Header({ selectedPair }) {
+export default function Header({ instrument }) {
   const [now, setNow] = useState(new Date());
   const { price, tick } = useSimulatedPrice(currentSignal.price);
   const { status, error: statusError } = useDataStatus();
-  const pairLabel = selectedPair?.label ?? 'EUR/USD';
+  const pairLabel = instrument?.label ?? 'XAU/USD';
+  const decimals  = instrument?.decimals ?? 2;
 
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 1000);
@@ -77,10 +79,10 @@ export default function Header({ selectedPair }) {
           <div className="w-7 h-7 rounded-lg bg-blue-600 flex items-center justify-center">
             <Activity size={14} className="text-white" />
           </div>
-          <span className="text-sm font-semibold text-white tracking-wide">FX Signal Pro</span>
+          <span className="text-sm font-semibold text-white tracking-wide">XAU/USD Signal Pro</span>
         </div>
         <span className="text-[#263044] hidden sm:block">|</span>
-        <span className="text-xs text-gray-500 hidden sm:block">EUR/USD Intelligence Dashboard</span>
+        <span className="text-xs text-gray-500 hidden sm:block">Gold · ICT Signal Dashboard</span>
       </div>
 
       {/* Live Price Ticker */}
@@ -91,7 +93,7 @@ export default function Header({ selectedPair }) {
             tick === 'up' ? 'text-emerald-400' : tick === 'down' ? 'text-red-400' : 'text-white'
           }`}
         >
-          {price.toFixed(5)}
+          {price.toFixed(decimals)}
         </span>
         <div className={`flex items-center gap-0.5 text-xs font-mono ${isUp ? 'text-emerald-400' : 'text-red-400'}`}>
           {isUp ? <TrendingUp size={12} /> : <TrendingDown size={12} />}

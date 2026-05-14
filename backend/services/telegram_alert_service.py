@@ -10,7 +10,7 @@ Exports the five required public functions:
 
 Alert trigger rules (all must pass):
   signal in BUY/SELL · qualityScore >= 80 · rr >= 2.5 · newsStatus == CLEAR
-  pair in eurusd/xauusd · entry/stopLoss/takeProfit/invalidation present
+  pair == xauusd · entry/stopLoss/takeProfit/invalidation present
   liquidity/FVG/structure model fields non-empty
   TELEGRAM_ALERTS_ENABLED=true · BOT_TOKEN set · CHAT_ID set
 
@@ -88,14 +88,13 @@ def format_signal_alert(signal_payload: dict) -> str:
       pair, signal, qualityScore, entry, stopLoss, takeProfit, riskPips, targetPips,
       rr, invalidation, reason, newsStatus, model{liquidity, structure, fvg, session}
     """
-    pair         = signal_payload.get("pair", "").lower()
     signal       = signal_payload.get("signal", "")
     score        = signal_payload.get("qualityScore", 0)
     entry        = signal_payload.get("entry")
     sl           = signal_payload.get("stopLoss")
     tp           = signal_payload.get("takeProfit")
-    risk_pips    = signal_payload.get("riskPips")
-    target_pips  = signal_payload.get("targetPips", 40)
+    risk_points  = signal_payload.get("riskPips")   # internally riskPips, displayed as points
+    target_pts   = signal_payload.get("targetPips", 50)
     rr           = signal_payload.get("rr")
     invalidation = signal_payload.get("invalidation")
     reason       = signal_payload.get("reason", "")
@@ -107,10 +106,10 @@ def format_signal_alert(signal_payload: dict) -> str:
     fvg          = model_dict.get("fvg", "")
     session_str  = model_dict.get("session", "")
 
-    # Display names and units
-    display_pair = "XAU/USD" if pair == "xauusd" else "EUR/USD"
-    unit         = "points" if pair == "xauusd" else "pips"
-    decimals     = 2 if pair == "xauusd" else 5
+    # XAU/USD only — always use points and 2-decimal prices
+    display_pair = "XAU/USD"
+    unit         = "points"
+    decimals     = 2
 
     def _fmt(v: float | None) -> str:
         if v is None:
@@ -133,21 +132,22 @@ def format_signal_alert(signal_payload: dict) -> str:
     reason_short = (reason[:157] + "…") if len(reason) > 160 else reason
 
     msg = (
-        f"🚨 <b>{display_pair} {signal} Signal Ready</b>\n"
+        f"🚨 <b>XAU/USD {signal} Signal Ready</b>\n"
         f"\n"
+        f"<b>Instrument:</b> XAU/USD (Gold)\n"
         f"<b>Quality Score:</b> {score}/100\n"
         f"<b>Entry:</b> {_fmt(entry)}\n"
         f"<b>Stop Loss:</b> {_fmt(sl)}\n"
         f"<b>Take Profit:</b> {_fmt(tp)}\n"
-        f"<b>Target:</b> {target_pips} {unit}\n"
-        f"<b>Risk:</b> {risk_pips or '—'} {unit}\n"
+        f"<b>Target:</b> {target_pts} {unit}\n"
+        f"<b>Risk:</b> {risk_points or '—'} {unit}\n"
         f"<b>RR:</b> {rr_str}\n"
         f"\n"
         f"<b>Model:</b>\n"
         f"Liquidity: {liquidity or '—'}\n"
         f"Structure: {structure or '—'}\n"
         f"FVG: {fvg or '—'}\n"
-        f"News: {news_status}\n"
+        f"News (USD): {news_status}\n"
         f"Session: {session_str or '—'}\n"
         f"\n"
         f"<b>Invalidation:</b>\n"
@@ -156,7 +156,7 @@ def format_signal_alert(signal_payload: dict) -> str:
         f"<b>Reason:</b>\n"
         f"{reason_short}\n"
         f"\n"
-        f"⚠️ Manual confirmation required. This is not automatic execution."
+        f"⚠️ Manual confirmation required. Broker execution is disabled."
     )
     return msg
 
@@ -303,8 +303,8 @@ def _qualify(payload: dict) -> tuple[bool, list[str]]:
         failures.append(f"RR {rr:.2f} < 2.5")
     if news != "CLEAR":
         failures.append(f"newsStatus is {news!r} (must be CLEAR)")
-    if pair not in ("eurusd", "xauusd"):
-        failures.append(f"pair {pair!r} not supported")
+    if pair != "xauusd":
+        failures.append(f"instrument {pair!r} not supported — only xauusd alerts are sent")
     if entry is None:
         failures.append("entry price missing")
     if sl is None:

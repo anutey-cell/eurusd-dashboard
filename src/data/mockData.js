@@ -1,65 +1,41 @@
-// ─── Current Signal ───────────────────────────────────────────────────────────
+// ─── XAU/USD Current Signal (fallback mock) ───────────────────────────────────
 export const currentSignal = {
-  direction: 'BUY',
-  strength: 78,
-  confidence: 72,
-  timestamp: '2026-05-13T08:42:00Z',
-  session: 'London',
-  timeframe: 'H4',
-  price: 1.08432,
-  change: +0.00087,
-  changePct: +0.08,
-  factors: [
-    { name: 'Trend Alignment',   value: 'Bullish (H4/D1)',     score: 85, positive: true  },
-    { name: 'Market Structure',  value: 'Higher Highs / HLs',  score: 80, positive: true  },
-    { name: 'RSI (H4)',          value: '58.4 — Bullish Zone', score: 68, positive: true  },
-    { name: 'MACD',              value: 'Bullish Cross',        score: 72, positive: true  },
-    { name: 'Volume Delta',      value: 'Accumulation +2.8M',  score: 70, positive: true  },
-    { name: 'DXY Correlation',   value: 'Weakening (bearish)',  score: 62, positive: true  },
-    { name: 'Spread',            value: '1.2 pips (normal)',    score: 90, positive: true  },
-    { name: 'Session Overlap',   value: 'London Open Active',  score: 75, positive: true  },
-  ],
-};
-
-// ─── XAU/USD Mock Signal ──────────────────────────────────────────────────────
-export const xauusdSignal = {
   direction:  'WAIT',
-  strength:   62,
-  confidence: 55,
-  timestamp:  '2026-05-13T09:30:00Z',
+  strength:   30,
+  confidence: 30,
+  timestamp:  '2026-05-14T09:00:00Z',
   session:    'London',
   timeframe:  'H4',
-  price:      2358.40,
+  price:      3285.00,
   change:     -3.20,
-  changePct:  -0.14,
+  changePct:  -0.10,
+  pair:       'xauusd',
+  displayPair: 'XAU/USD',
   factors: [
-    { name: 'DXY Trend',        value: 'USD strengthening', score: 45, positive: false },
-    { name: 'Real Yields',      value: 'Rising (bearish Au)', score: 40, positive: false },
-    { name: 'Market Structure', value: 'Waiting for CHoCH',  score: 50, positive: false },
-    { name: 'Liquidity',        value: 'Buy-side not swept', score: 30, positive: false },
-    { name: 'FVG',              value: 'No valid FVG yet',   score: 35, positive: false },
-    { name: 'Session',          value: 'London kill zone',   score: 70, positive: true  },
-    { name: 'News Risk',        value: 'NFP Friday — CAUTION', score: 0, positive: false },
-    { name: 'Spread',           value: '0.3 pts (normal)',   score: 85, positive: true  },
+    { name: 'HTF Bias',         value: 'Waiting for D1 confirmation',  score: 5,  positive: false },
+    { name: 'Market Structure', value: 'Waiting for CHoCH',             score: 0,  positive: false },
+    { name: 'Liquidity Sweep',  value: 'No sweep detected',             score: 0,  positive: false },
+    { name: 'Fair Value Gap',   value: 'No valid FVG yet',              score: 0,  positive: false },
+    { name: 'News Risk',        value: 'CLEAR',                         score: 15, positive: true  },
+    { name: 'Session',          value: 'London kill zone',              score: 10, positive: true  },
+    { name: 'Spread',           value: '0.3 pts (normal)',              score: 85, positive: true  },
   ],
 };
 
-// ─── Trade Plan ───────────────────────────────────────────────────────────────
+// ─── XAU/USD Trade Plan (fallback mock — no active setup) ────────────────────
 export const tradePlan = {
-  entry: 1.08450,
-  stopLoss: 1.08100,
-  stopLossPips: 35,
-  targets: [
-    { label: 'TP1', price: 1.08800, rr: '1.0', pips: 35,  partial: '50%' },
-    { label: 'TP2', price: 1.09100, rr: '1.86', pips: 65, partial: '30%' },
-    { label: 'TP3', price: 1.09450, rr: '2.86', pips: 100, partial: '20%' },
-  ],
-  riskPercent: 1.5,
-  positionSize: 0.75,
-  accountSize: 10000,
-  riskAmount: 150,
-  validity: '2026-05-13T20:00:00Z',
-  notes: 'Wait for London close H1 candle confirmation above 1.0840. Entry on pullback to the 1.0840–1.0845 demand zone. Invalidated on close below 1.0810.',
+  entry:           null,
+  stopLoss:        null,
+  stopLossPips:    null,
+  stopLossPoints:  null,
+  targetPoints:    50,
+  targets:         [],
+  riskPercent:     null,
+  positionSize:    null,
+  accountSize:     null,
+  riskAmount:      null,
+  validity:        '2026-05-14T20:00:00Z',
+  notes:           'XAU/USD — waiting for all ICT gates to align. Target: 50 points. Min RR: 2.5. Manual confirmation only. Broker execution disabled.',
 };
 
 // ─── Institutional Data ───────────────────────────────────────────────────────
@@ -191,7 +167,7 @@ export const recentNews = [
   {
     id: 5,
     time: '06:12',
-    headline: 'EUR/USD tests key 1.0850 resistance — break opens path to 1.0920',
+    headline: 'XAU/USD consolidates near 3285 — gold bulls eye break above 3300 resistance',
     source: 'FXStreet',
     sentiment: 'bullish',
   },
@@ -341,20 +317,12 @@ const _buildMockEquityCurve = () => {
   return pips.map((p, i) => ({ trade: i + 1, pips: p, cumulativePips: (cum += p) }));
 };
 
-// ─── Pair Configurations ──────────────────────────────────────────────────────
+// ─── Pair Configurations (XAU/USD only) ──────────────────────────────────────
 export const PAIR_CONFIGS = {
-  eurusd: {
-    code: 'eurusd',
-    label: 'EUR/USD',
-    symbol: 'FX:EURUSD',
-    decimals: 5,
-    pipUnit: 'pips',
-    targetLabel: '40 pips',
-  },
   xauusd: {
     code: 'xauusd',
     label: 'XAU/USD',
-    symbol: 'OANDA:XAU_USD',
+    symbol: 'OANDA:XAUUSD',
     decimals: 2,
     pipUnit: 'pts',
     targetLabel: '50 pts',

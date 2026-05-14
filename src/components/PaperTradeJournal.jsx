@@ -46,9 +46,11 @@ function ResultBadge({ result }) {
 // ── Log-result inline form ────────────────────────────────────────────────────
 
 function LogResultForm({ record, onSaved, onCancel }) {
+  // XAU/USD: 2 decimals; pip_size = 1.0 (1 point = 1 price unit)
+  const recDecimals = record.pair?.toUpperCase().includes('XAU') ? 2 : 5;
   const [form, setForm] = useState({
     result:    'WIN',
-    exitPrice: record.entry?.toFixed(5) ?? '',
+    exitPrice: record.entry?.toFixed(recDecimals) ?? '',
     pips:      '',
     pnl:       '',
     notes:     '',
@@ -56,14 +58,17 @@ function LogResultForm({ record, onSaved, onCancel }) {
   const [saving, setSaving]   = useState(false);
   const [err,    setErr]      = useState(null);
 
-  // Auto-compute pips from exit price when user types
+  // Auto-compute points/pips from exit price when user types
   function handleExitChange(val) {
     setForm(f => {
       const exit  = parseFloat(val);
       const entry = record.entry;
       let pips    = f.pips;
       if (!isNaN(exit) && entry != null) {
-        const rawPips = (exit - entry) * (record.pair?.includes('JPY') ? 100 : 10000);
+        const isGold = record.pair?.toUpperCase().includes('XAU') || record.pair?.toUpperCase().includes('GOLD');
+        const rawPips = isGold
+          ? (exit - entry)                                               // XAU/USD: 1 pt = 1.0 price unit
+          : (exit - entry) * (record.pair?.includes('JPY') ? 100 : 10000);
         pips = String(Math.round(record.signal === 'SELL' ? -rawPips : rawPips));
       }
       return { ...f, exitPrice: val, pips };
@@ -136,7 +141,7 @@ function LogResultForm({ record, onSaved, onCancel }) {
           />
         </div>
         <div>
-          <label className="block text-[10px] text-gray-500 mb-1">Pips (± auto)</label>
+          <label className="block text-[10px] text-gray-500 mb-1">Points (± auto)</label>
           <input
             type="number"
             value={form.pips}
@@ -198,6 +203,7 @@ function LogResultForm({ record, onSaved, onCancel }) {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function PaperTradeJournal({ refreshKey = 0, selectedPair }) {
+  const decimals = selectedPair?.decimals ?? 2;
   const [records,    setRecords]    = useState([]);
   const [total,      setTotal]      = useState(0);
   const [loading,    setLoading]    = useState(true);
@@ -211,7 +217,7 @@ export default function PaperTradeJournal({ refreshKey = 0, selectedPair }) {
     setError(null);
     try {
       const sig        = filterSig !== 'ALL' ? filterSig : undefined;
-      const pairFilter = selectedPair?.label;  // e.g. "EUR/USD"
+      const pairFilter = selectedPair?.label;  // e.g. "XAU/USD"
       const data       = await getDbSignalHistory({ page: 1, pageSize: 50, signal: sig });
       // Filter client-side by pair if a specific pair is selected
       const allSigs  = data.signals ?? [];
@@ -299,7 +305,7 @@ export default function PaperTradeJournal({ refreshKey = 0, selectedPair }) {
               settled.reduce((a, r) => a + (r.pips ?? 0), 0) >= 0 ? 'text-emerald-400' : 'text-red-400'
             }`}>
               {settled.reduce((a, r) => a + (r.pips ?? 0), 0) >= 0 ? '+' : ''}
-              {settled.reduce((a, r) => a + (r.pips ?? 0), 0)} pips
+              {settled.reduce((a, r) => a + (r.pips ?? 0), 0)} pts
             </span>
           )}
         </div>
@@ -362,15 +368,15 @@ export default function PaperTradeJournal({ refreshKey = 0, selectedPair }) {
                   <div className="flex gap-2 text-[10px] font-mono flex-shrink-0">
                     <div>
                       <div className="text-gray-600">Entry</div>
-                      <div className="text-blue-300">{rec.entry?.toFixed(5)}</div>
+                      <div className="text-blue-300">{rec.entry?.toFixed(decimals)}</div>
                     </div>
                     <div>
                       <div className="text-gray-600">SL</div>
-                      <div className="text-red-400">{rec.stopLoss?.toFixed(5) ?? '—'}</div>
+                      <div className="text-red-400">{rec.stopLoss?.toFixed(decimals) ?? '—'}</div>
                     </div>
                     <div>
                       <div className="text-gray-600">TP</div>
-                      <div className="text-emerald-400">{rec.takeProfit?.toFixed(5) ?? '—'}</div>
+                      <div className="text-emerald-400">{rec.takeProfit?.toFixed(decimals) ?? '—'}</div>
                     </div>
                   </div>
                 )}
@@ -395,7 +401,7 @@ export default function PaperTradeJournal({ refreshKey = 0, selectedPair }) {
                       <ResultBadge result={rec.result} />
                       {rec.pips != null && (
                         <div className={`text-[10px] font-mono mt-0.5 ${rec.pips >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                          {rec.pips >= 0 ? '+' : ''}{rec.pips} pips
+                          {rec.pips >= 0 ? '+' : ''}{rec.pips} pts
                         </div>
                       )}
                     </div>

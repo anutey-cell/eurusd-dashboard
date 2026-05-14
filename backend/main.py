@@ -1,7 +1,7 @@
 """
-EUR/USD Signal Dashboard — FastAPI Backend
-Phase 11: Production hardening — structured logging, rate limiting,
-consistent error responses, request tracing middleware.
+XAU/USD Signal Dashboard — FastAPI Backend
+Single-instrument: XAU/USD (spot gold) only.
+ICT/SMC signal engine · SQLite storage · Manual confirmation workflow.
 """
 from contextlib import asynccontextmanager
 
@@ -41,9 +41,10 @@ app = FastAPI(
     title=settings.app_name,
     version=settings.version,
     description=(
-        "REST API for the EUR/USD Signal Dashboard. "
-        "ICT/SMC signal engine · SQLite storage · Live provider abstraction. "
-        "Set DATA_MODE=live in .env to switch from demo to real data."
+        "REST API for the XAU/USD Signal Dashboard. "
+        "ICT/SMC signal engine · SQLite storage · XAU/USD (spot gold) only. "
+        "Manual confirmation workflow — broker execution disabled. "
+        "Set DATA_MODE=live in .env to switch from demo to real candle data."
     ),
     docs_url="/docs",
     redoc_url="/redoc",

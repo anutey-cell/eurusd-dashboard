@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { RefreshCw, Clock, Shield } from 'lucide-react';
+import { RefreshCw, Clock, Shield, Zap } from 'lucide-react';
 
 import { getSignalForPair, getMacroCalendar, getSignalHistory, getAnalytics } from '../services/api';
 import {
@@ -26,32 +26,9 @@ import PaperTradeJournal   from './PaperTradeJournal';
 import MT5Panel            from './MT5Panel';
 import EngineMaturityCard  from './EngineMaturityCard';
 
-// ─── Pair options ────────────────────────────────────────────────────────────
-
-const PAIR_OPTIONS = [
-  { code: 'eurusd', label: 'EUR/USD', symbol: 'FX:EURUSD',      decimals: 5 },
-  { code: 'xauusd', label: 'XAU/USD', symbol: 'TVC:GOLD',       decimals: 2 },
-];
-
-function PairSelector({ selected, onChange }) {
-  return (
-    <div className="flex items-center gap-1 bg-[#131c27] border border-[#263044] rounded-lg p-0.5">
-      {PAIR_OPTIONS.map(p => (
-        <button
-          key={p.code}
-          onClick={() => onChange(p)}
-          className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${
-            selected === p.code
-              ? 'bg-blue-600 text-white'
-              : 'text-gray-500 hover:text-gray-300'
-          }`}
-        >
-          {p.label}
-        </button>
-      ))}
-    </div>
-  );
-}
+// ─── Instrument ───────────────────────────────────────────────────────────────
+// XAU/USD is the only supported instrument.
+const INSTRUMENT = { code: 'xauusd', label: 'XAU/USD', symbol: 'OANDA:XAUUSD', decimals: 2 };
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -107,8 +84,6 @@ function useDataSource(fetchFn, fallback, refreshMs = null) {
         lastUpdated:     null,
       }));
     }
-  // fallback is a module-level constant; fnRef keeps fetchFn current without
-  // being a dependency, so run() is intentionally stable.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -137,10 +112,10 @@ function useRefreshCountdown(ms) {
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
-export default function Dashboard({ selectedPair, onPairChange }) {
-  // Signal fetch is pair-aware — re-fires whenever selectedPair changes
+export default function Dashboard({ instrument = INSTRUMENT }) {
+  // Signal fetch for XAU/USD only
   const signal    = useDataSource(
-    () => getSignalForPair(selectedPair.code),
+    () => getSignalForPair(instrument.code),
     FALLBACKS.signal,
     REFRESH_MS,
   );
@@ -148,18 +123,8 @@ export default function Dashboard({ selectedPair, onPairChange }) {
   const history   = useDataSource(getSignalHistory, FALLBACKS.history,   null);
   const analytics = useDataSource(getAnalytics,     FALLBACKS.analytics, null);
 
-  // Re-fetch signal immediately when the active pair changes
-  // (useDataSource keeps fnRef current but won't auto-fire on prop change)
-  useEffect(() => {
-    signal.refetch();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPair.code]);
-
   // journalKey bumps each time a trade is confirmed → triggers PaperTradeJournal reload
   const [journalKey, setJournalKey] = useState(0);
-
-  // selectedPair / onPairChange lifted to App.jsx so Header can also read it
-  const setSelectedPair = onPairChange ?? (() => {});
 
   const countdown    = useRefreshCountdown(REFRESH_MS);
   const refreshing   = signal.loading || calendar.loading;
@@ -181,7 +146,7 @@ export default function Dashboard({ selectedPair, onPairChange }) {
             />
             <span>
               {refreshing
-                ? 'Refreshing signal & calendar…'
+                ? 'Refreshing XAU/USD signal & calendar…'
                 : <>Signal &amp; Calendar refresh in <span className="font-mono text-gray-400">{countdown}s</span></>}
             </span>
           </div>
@@ -195,7 +160,12 @@ export default function Dashboard({ selectedPair, onPairChange }) {
           )}
         </div>
         <div className="flex items-center gap-3">
-          <PairSelector selected={selectedPair.code} onChange={setSelectedPair} />
+          {/* Instrument badge — no pair selector, XAU/USD only */}
+          <div className="flex items-center gap-1.5 bg-[#131c27] border border-amber-500/30 rounded-lg px-3 py-1.5">
+            <Zap size={10} className="text-amber-400" />
+            <span className="text-xs font-semibold text-amber-300">XAU/USD</span>
+            <span className="text-[10px] text-gray-500 ml-1">Gold · 50 pts target</span>
+          </div>
           {anyFallback && (
             <span className="text-[10px] text-amber-400/60 italic">
               One or more panels using mock fallback
@@ -208,8 +178,8 @@ export default function Dashboard({ selectedPair, onPairChange }) {
       <div className="flex items-center gap-3 px-4 py-1.5 bg-amber-500/5 border-b border-amber-500/10 text-[10px] text-amber-400/70">
         <Shield size={10} className="flex-shrink-0" />
         <span>
-          Manual confirmation mode — this system does not execute trades.
-          {selectedPair.code === 'xauusd' && ' XAU/USD uses 1.0 point = 1 USD move.'}
+          XAU/USD · Manual confirmation mode · 50-point target · 1.0 point = $1 move ·
+          Broker execution disabled · MONITOR_ONLY
         </span>
       </div>
 
@@ -226,21 +196,22 @@ export default function Dashboard({ selectedPair, onPairChange }) {
               error={signal.error}
               isUsingFallback={signal.isUsingFallback}
               currentSignal={signal.data?.currentSignal}
-              pairLabel={selectedPair.label}
+              pairLabel="XAU/USD"
             />
             <TradePlanCard
               loading={signal.loading}
               error={signal.error}
               isUsingFallback={signal.isUsingFallback}
               tradePlan={signal.data?.tradePlan}
-              decimals={selectedPair.decimals}
+              decimals={2}
+              targetLabel="points"
             />
           </div>
 
-          {/* Center — chart stays frontend-only */}
+          {/* Center — TradingView chart for XAU/USD */}
           <div className="flex-1 min-w-0 flex flex-col gap-4">
             <div style={{ height: 540 }}>
-              <TradingViewWidget key={selectedPair.symbol} symbol={selectedPair.symbol} />
+              <TradingViewWidget symbol={instrument.symbol} />
             </div>
             <AnalyticsDashboard
               loading={analytics.loading}
@@ -274,20 +245,20 @@ export default function Dashboard({ selectedPair, onPairChange }) {
         {/* Row 4: paper trading — run analysis + confirm */}
         <PaperTradePanel
           onConfirmed={() => setJournalKey(k => k + 1)}
-          selectedPair={selectedPair}
+          selectedPair={instrument}
         />
 
         {/* Row 4: paper trading journal — DB-backed history with Log Result */}
-        <PaperTradeJournal refreshKey={journalKey} selectedPair={selectedPair} />
+        <PaperTradeJournal refreshKey={journalKey} selectedPair={instrument} />
 
-        {/* Row: MT5 Demo Panel — self-contained, manages its own data fetching */}
+        {/* Row: MT5 Demo Panel — XAU/USD only */}
         <MT5Panel
-          selectedPair={selectedPair}
+          selectedPair={instrument}
           currentSignal={signal.data?.currentSignal}
           tradePlan={signal.data?.tradePlan}
         />
 
-        {/* Row 5: mock signal history */}
+        {/* Row 5: signal history (XAU/USD only) */}
         <SignalHistory
           loading={history.loading}
           error={history.error}
@@ -296,10 +267,10 @@ export default function Dashboard({ selectedPair, onPairChange }) {
           trades={history.data?.trades}
         />
 
-        {/* Row 4: backtesting */}
+        {/* Row: backtesting */}
         <BacktestDashboard />
 
-        {/* Row 5: broker execution (disabled panel) */}
+        {/* Row: broker execution (disabled panel) */}
         <ExecutionPanel />
       </main>
     </div>

@@ -3,9 +3,10 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    app_name: str    = "FX Signal Pro"
-    version: str     = "1.0.0"
-    api_prefix: str  = "/api/v1"
+    app_name: str           = "XAU/USD Signal Dashboard"
+    version: str            = "1.0.0"
+    api_prefix: str         = "/api/v1"
+    supported_instrument:   str = "xauusd"   # single-instrument mode
 
     # ── Data mode ─────────────────────────────────────────────────────────────
     # "demo"  → deterministic seeded mock data, no API key required
@@ -31,7 +32,7 @@ class Settings(BaseSettings):
     calendar_te_secret: str = ""
 
     # ── Database ──────────────────────────────────────────────────────────────
-    database_url: str = "sqlite:///./eurusd_signals.db"
+    database_url: str = "sqlite:///./xauusd_signals.db"
 
     # ── Backtesting ───────────────────────────────────────────────────────────
     # Applied at entry to simulate real execution costs.
@@ -57,8 +58,7 @@ class Settings(BaseSettings):
     mt5_execution_enabled:    bool  = False       # both this AND allow_demo_trading must be true
     allow_demo_trading:       bool  = False
     max_open_trades:          int   = 1
-    max_spread_eurusd_pips:   float = 2.0
-    max_spread_xauusd_points: float = 5.0
+    max_spread_xauusd_points: float = 5.0   # XAU/USD spread gate in points
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     # Accepts a comma-separated string from .env or a JSON array

@@ -45,14 +45,10 @@ TV_PASSWORD = os.getenv("TRADINGVIEW_PASSWORD", "")
 CACHE_TTL   = 300       # 5 min — TradingView rate-limits frequent requests
 PROBE_TTL   = 600       # re-test connectivity every 10 min
 
-# TradingView exchange + symbol per pair code
-# OANDA verified working for XAUUSD (real price ~4700, confirmed 2026-05-14)
-# TVC was returning empty for XAUUSD — do not use TVC for gold
+# XAU/USD only. OANDA exchange confirmed working (returns real gold prices ~$4700+).
+# TVC:GOLD / TVC:XAUUSD returns empty for XAUUSD — do not use TVC for this symbol.
 _TV_SYMBOLS: dict[str, tuple[str, str]] = {
-    "eurusd": ("EURUSD", "FX_IDC"),
     "xauusd": ("XAUUSD", "OANDA"),
-    "gbpusd": ("GBPUSD", "FX_IDC"),
-    "usdjpy": ("USDJPY", "FX_IDC"),
 }
 
 # Map timeframe strings to tvDatafeed Interval enum values

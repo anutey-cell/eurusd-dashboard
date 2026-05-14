@@ -38,7 +38,10 @@ def mock_analytics() -> APIResponse[AnalyticsResponse]:
 )
 def full_analytics(
     db: Session = Depends(get_db),
-    pair: str | None = Query(default=None, description="Filter by pair code: eurusd | xauusd"),
+    pair: str | None = Query(
+        default="xauusd",
+        description="Instrument code — only xauusd supported",
+    ),
 ) -> APIResponse[FullAnalyticsResponse]:
     confirmed_records = (
         db.query(SignalRecord)
@@ -46,14 +49,15 @@ def full_analytics(
           .all()
     )
 
-    if pair:
-        from pair_config import get_pair_config
-        try:
-            pair_cfg = get_pair_config(pair)
-            pair_display = pair_cfg["display"]
-            confirmed_records = [r for r in confirmed_records if r.pair == pair_display]
-        except ValueError:
-            pass  # invalid pair code — return all
+    # Validate instrument — only xauusd is supported
+    from pair_config import get_pair_config
+    from fastapi import HTTPException as _HTTPException
+    try:
+        pair_cfg = get_pair_config(pair or "xauusd")
+        pair_display = pair_cfg["display"]
+    except ValueError as _ve:
+        raise _HTTPException(status_code=400, detail=str(_ve))
+    confirmed_records = [r for r in confirmed_records if r.pair == pair_display]
 
     completed_records = [r for r in confirmed_records if r.result in ("WIN", "LOSS", "BREAKEVEN")]
 

@@ -50,7 +50,7 @@ export async function getPairs() {
   return apiFetch('/pairs');
 }
 
-export async function getCandles({ pair = 'eurusd', interval = 'H4', limit = 200 } = {}) {
+export async function getCandles({ pair = 'xauusd', interval = 'H4', limit = 200 } = {}) {
   const params = new URLSearchParams({ pair, interval, limit });
   return apiFetch(`/candles?${params}`);
 }
@@ -71,7 +71,7 @@ export async function getSignal() {
  * Calls GET /signal/{pairCode} — pair-aware, returns live engine data
  * shaped to match what SignalCard + TradePlanCard expect.
  */
-export async function getSignalForPair(pairCode = 'eurusd') {
+export async function getSignalForPair(pairCode = 'xauusd') {
   const res = await apiFetch(`/signal/${pairCode}`);
   return adaptLiveSignal(res);
 }
@@ -89,12 +89,12 @@ export async function getAnalytics() {
   return adaptAnalytics(res);
 }
 
-export async function runBacktest({ pair = 'EUR/USD', timeframe = 'H4', lookback = 500 } = {}) {
+export async function runBacktest({ pair = 'XAU/USD', timeframe = 'H4', lookback = 500 } = {}) {
   const params = new URLSearchParams({ pair, timeframe, lookback });
   return apiFetch(`/backtest/run?${params}`);
 }
 
-export async function runOptimize({ pair = 'EUR/USD', timeframe = 'H4', lookback = 1000 } = {}) {
+export async function runOptimize({ pair = 'XAU/USD', timeframe = 'H4', lookback = 1000 } = {}) {
   const params = new URLSearchParams({ pair, timeframe, lookback });
   return apiFetch(`/backtest/optimize?${params}`);
 }
@@ -134,7 +134,7 @@ export async function getDbSignalHistory({ page = 1, pageSize = 20, signal, resu
   };
 }
 
-export async function analyzeSignalForPair(pair = 'eurusd', macroEvents = []) {
+export async function analyzeSignalForPair(pair = 'xauusd', macroEvents = []) {
   const res = await apiFetch('/signal/analyze', {
     method: 'POST',
     body: JSON.stringify(macroEvents),
@@ -325,8 +325,9 @@ function adaptLiveSignal(res) {
     ? new Date(new Date(d.generatedAt).getTime() + 30 * 60_000).toISOString()
     : new Date(Date.now() + 30 * 60_000).toISOString();
 
+  // XAU/USD uses points, not pips. targetPips internally = 50 points.
   const targets = d.takeProfit != null
-    ? [{ label: 'TP1', price: d.takeProfit, rr: d.rr ?? 0, pips: d.targetPips ?? 0, partial: 100 }]
+    ? [{ label: 'TP1', price: d.takeProfit, rr: d.rr ?? 0, pips: d.targetPips ?? 50, partial: 100 }]
     : [];
 
   const sessionLabel = m.session
@@ -357,18 +358,20 @@ function adaptLiveSignal(res) {
       sentiment:   d.model?.sentiment ?? null,
     },
     tradePlan: {
-      entry:        d.entry,
-      stopLoss:     d.stopLoss,
-      stopLossPips: d.riskPips,
+      entry:           d.entry,
+      stopLoss:        d.stopLoss,
+      stopLossPips:    d.riskPips,   // internally riskPips — displayed as points for XAU/USD
+      stopLossPoints:  d.riskPips,   // alias with correct label
+      targetPoints:    d.targetPips ?? 50,
       targets,
-      riskPercent:  null,
-      positionSize: null,
-      accountSize:  null,
-      riskAmount:   null,
+      riskPercent:     null,
+      positionSize:    null,
+      accountSize:     null,
+      riskAmount:      null,
       validity,
       notes: d.signal === 'WAIT'
-        ? (d.reason ?? 'Waiting for signal conditions to align.')
-        : `${d.displayPair ?? ''} ${d.signal} — ${d.reason ?? 'All gates passed.'}`,
+        ? (d.reason ?? 'Waiting for XAU/USD signal conditions to align.')
+        : `XAU/USD ${d.signal} — ${d.reason ?? 'All gates passed.'}`,
     },
   };
 }

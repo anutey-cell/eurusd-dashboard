@@ -14,6 +14,7 @@ from database import get_db
 from db_models import SignalRecord
 from models.common import APIResponse
 from pair_config import SUPPORTED_PAIRS, get_pair_mode, set_pair_mode, VALID_MODES
+# NOTE: get_pair_mode() and set_pair_mode() now operate on xauusd only
 from services.pair_readiness import assess_pair_readiness, PairReadinessResult
 
 router = APIRouter(prefix="/readiness", tags=["readiness"])
@@ -69,25 +70,18 @@ def _to_out(r: PairReadinessResult) -> PairReadinessOut:
 @router.get(
     "",
     response_model=APIResponse[ReadinessResponse],
-    summary="Per-pair readiness scores and promotion eligibility",
+    summary="XAU/USD readiness score and promotion eligibility",
     description=(
-        "Returns a 0–100 readiness score for each supported pair. "
-        "A pair needs >= 85 with no blockers to be promoted above MONITOR_ONLY. "
+        "Returns the 0–100 readiness score for XAU/USD. "
+        "Score ≥ 85 with no blockers required to promote above MONITOR_ONLY. "
         "Computed live from the DB — no caching."
     ),
 )
 def readiness_report(
-    pair: str | None = Query(default=None, description="Filter to a single pair code"),
     db: Session = Depends(get_db),
 ) -> APIResponse[ReadinessResponse]:
-    pair_codes = list(SUPPORTED_PAIRS.keys())
-    if pair:
-        code = pair.lower().replace("/", "").replace("_", "")
-        if code in SUPPORTED_PAIRS:
-            pair_codes = [code]
-
     results: list[PairReadinessOut] = []
-    for code in pair_codes:
+    for code in SUPPORTED_PAIRS:
         cfg_display = SUPPORTED_PAIRS[code]["display"]
         records = (
             db.query(SignalRecord)
@@ -130,13 +124,21 @@ class ModeUpdateBody(BaseModel):
 )
 def update_mode(body: ModeUpdateBody) -> APIResponse[dict]:
     try:
-        set_pair_mode(body.pair_code, body.mode)
-        log.info("Mode updated pair=%s mode=%s", body.pair_code, body.mode.upper())
+        # Only xauusd is supported
+        if body.pair_code.lower().replace("/", "").replace("_", "") != "xauusd":
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=400,
+                detail="Only XAU/USD (xauusd) is supported by this dashboard.",
+            )
+        set_pair_mode(body.mode)
+        log.info("Mode updated instrument=XAU/USD mode=%s", body.mode.upper())
         return APIResponse(data={
-            "pair_code":  body.pair_code.lower(),
+            "pair_code":  "xauusd",
+            "instrument": "XAU/USD",
             "mode":       body.mode.upper(),
-            "message":    f"{body.pair_code.upper()} mode set to {body.mode.upper()}. "
-                          "Restart the server or set the environment variable to persist.",
+            "message":    f"XAU/USD mode set to {body.mode.upper()}. "
+                          "Set XAUUSD_MODE env var to persist across restarts.",
             "valid_modes": sorted(VALID_MODES),
         })
     except ValueError as exc:

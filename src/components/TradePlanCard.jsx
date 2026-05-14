@@ -22,7 +22,7 @@ function useCountdown(targetIso) {
   return remaining;
 }
 
-function PriceRow({ label, price, pips, badge, badgeCls, pipsCls, decimals = 5 }) {
+function PriceRow({ label, price, pips, badge, badgeCls, pipsCls, decimals = 5, pipsLabel = 'pips' }) {
   // Hide the row entirely when no price (e.g. WAIT state with no entry/SL/TP)
   if (price == null) return null;
   return (
@@ -33,7 +33,7 @@ function PriceRow({ label, price, pips, badge, badgeCls, pipsCls, decimals = 5 }
       </div>
       <div className="flex items-center gap-3">
         {pips != null && (
-          <span className={`text-xs font-mono ${pipsCls}`}>{pips > 0 ? '+' : ''}{pips} pips</span>
+          <span className={`text-xs font-mono ${pipsCls}`}>{pips > 0 ? '+' : ''}{pips} {pipsLabel}</span>
         )}
         <span className="font-mono text-sm font-semibold text-white">{price.toFixed(decimals)}</span>
       </div>
@@ -48,6 +48,7 @@ export default function TradePlanCard({
   isUsingFallback = false,
   tradePlan:      p = mockTradePlan,
   decimals        = 5,
+  targetLabel     = 'pips',
 }) {
   const countdown = useCountdown(p?.validity ?? mockTradePlan.validity);
 
@@ -83,14 +84,14 @@ export default function TradePlanCard({
             <PriceRow
               label="Stop Loss" price={p.stopLoss} pips={p.stopLossPips != null ? -p.stopLossPips : null}
               badge="SL" badgeCls="bg-red-500/20 text-red-400 border border-red-500/30"
-              pipsCls="text-red-400" decimals={decimals}
+              pipsCls="text-red-400" decimals={decimals} pipsLabel={targetLabel}
             />
             {(p.targets ?? []).map(t => (
               <PriceRow
                 key={t.label}
                 label={`${t.partial}% close`} price={t.price} pips={t.pips}
                 badge={t.label} badgeCls="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-                pipsCls="text-emerald-400" decimals={decimals}
+                pipsCls="text-emerald-400" decimals={decimals} pipsLabel={targetLabel}
               />
             ))}
           </div>

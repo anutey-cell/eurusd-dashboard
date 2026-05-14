@@ -232,12 +232,9 @@ export default function EngineMaturityCard() {
       </div>
 
       {/* ── Pair breakdown ──────────────────────────────────────────────── */}
-      {(pairs.eurusd?.n_outcomes > 0 || pairs.xauusd?.n_outcomes > 0) && (
-        <div className="grid grid-cols-2 gap-2">
-          {[
-            { code: 'eurusd', label: 'EUR/USD' },
-            { code: 'xauusd', label: 'XAU/USD' },
-          ].map(({ code, label }) => {
+      {pairs.xauusd?.n_outcomes > 0 && (
+        <div className="grid grid-cols-1 gap-2">
+          {[{ code: 'xauusd', label: 'XAU/USD' }].map(({ code, label }) => {
             const p = pairs[code] ?? {};
             return (
               <div key={code} className="bg-[#1e2535] rounded-lg p-2.5">

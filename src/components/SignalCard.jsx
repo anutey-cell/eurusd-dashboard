@@ -24,7 +24,7 @@ export default function SignalCard({
   error           = null,
   isUsingFallback = false,
   currentSignal:  s = mockSignal,
-  pairLabel       = 'EUR/USD',
+  pairLabel       = 'XAU/USD',
 }) {
   const cfg      = DIRECTION_CONFIG[s?.direction] ?? DIRECTION_CONFIG.NEUTRAL;
   const Icon     = cfg.icon;

@@ -117,8 +117,8 @@ function DirectionIcon({ direction }) {
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 export default function MT5Panel({ selectedPair, currentSignal, tradePlan }) {
-  const pairCode  = selectedPair?.code  ?? 'eurusd';
-  const pairLabel = selectedPair?.label ?? 'EUR/USD';
+  const pairCode  = selectedPair?.code  ?? 'xauusd';
+  const pairLabel = selectedPair?.label ?? 'XAU/USD';
 
   // ── state ──────────────────────────────────────────────────────────────────
   const [status,       setStatus]       = useState(null);
@@ -209,7 +209,7 @@ export default function MT5Panel({ selectedPair, currentSignal, tradePlan }) {
       const tp1 = tradePlan?.targets?.find(t => t.label === 'TP2') ?? tradePlan?.targets?.[1] ?? tradePlan?.targets?.[0];
       const rrValue = parseFloat(tp1?.rr ?? 0);
       const payload = {
-        pair:         pairCode,                               // "eurusd" | "xauusd"
+        pair:         pairCode,                               // "xauusd"
         signal:       currentSignal.direction,                // 'BUY' | 'SELL'
         entry:        tradePlan?.entry ?? currentSignal.price,
         stopLoss:     tradePlan?.stopLoss,

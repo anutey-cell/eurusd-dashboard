@@ -67,16 +67,19 @@ def signal_history(
 def analyze(
     request: Request,
     macro_events: list[dict] = Body(default=[], description="Optional macro calendar events"),
-    pair: str = Query(default="eurusd", description="Trading pair code: eurusd | xauusd"),
+    pair: str = Query(default="xauusd", description="Instrument code — only xauusd supported"),
     db: Session = Depends(get_db),
 ) -> APIResponse[SignalAnalysisOutput]:
     logger.info("Signal analysis requested pair=%s ip=%s", pair, request.client.host if request.client else "unknown")
     try:
         from pair_config import validate_pair as _validate_pair
-        pair = _validate_pair(pair)
+        try:
+            pair = _validate_pair(pair)
+        except ValueError as _ve:
+            raise HTTPException(status_code=400, detail=str(_ve)) from _ve
         result = run_signal_analysis(macro_events, pair=pair, db=db)
         logger.info(
-            "Signal analyzed signal=%s quality=%s session=%s",
+            "Signal analyzed instrument=XAU/USD signal=%s quality=%s session=%s",
             getattr(result, "signal", "?"),
             getattr(result, "quality_score", "?"),
             getattr(result, "session", "?"),
@@ -95,6 +98,8 @@ def analyze(
 
         result.alert_status = alert_status
         return APIResponse(data=result)
+    except HTTPException:
+        raise
     except ProviderError as exc:
         logger.warning("Provider error in signal analysis: %s", exc)
         raise HTTPException(status_code=exc.http_code, detail=str(exc)) from exc
@@ -121,11 +126,14 @@ def analyze_get(
     request: Request = ...,
     db: Session = Depends(get_db),
 ) -> APIResponse[SignalAnalysisOutput]:
-    """GET wrapper so callers can hit /api/v1/signal/eurusd without a body."""
+    """GET wrapper — only /api/v1/signal/xauusd is supported."""
     logger.info("Signal GET analysis pair=%s ip=%s", pair, request.client.host if request.client else "unknown")
     try:
         from pair_config import validate_pair as _validate_pair
-        pair = _validate_pair(pair)
+        try:
+            pair = _validate_pair(pair)
+        except ValueError as _ve:
+            raise HTTPException(status_code=400, detail=str(_ve)) from _ve
         result = run_signal_analysis([], pair=pair, db=db)
         logger.info(
             "Signal GET analyzed signal=%s quality=%s session=%s",
@@ -145,6 +153,8 @@ def analyze_get(
 
         result.alert_status = alert_status
         return APIResponse(data=result)
+    except HTTPException:
+        raise
     except ProviderError as exc:
         logger.warning("Provider error in GET signal analysis: %s", exc)
         raise HTTPException(status_code=exc.http_code, detail=str(exc)) from exc

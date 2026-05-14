@@ -16,48 +16,44 @@ from services.signal_engine import analyze_signal
 
 # ── Current signal ────────────────────────────────────────────────────────────
 
+# XAU/USD fallback mock signal (shown when live engine is unavailable)
 _FACTORS = [
-    SignalFactor(name="Trend Alignment",   value="Bullish (H4/D1)",     score=85, positive=True),
-    SignalFactor(name="Market Structure",  value="Higher Highs / HLs",  score=80, positive=True),
-    SignalFactor(name="RSI (H4)",          value="58.4 — Bullish Zone", score=68, positive=True),
-    SignalFactor(name="MACD",              value="Bullish Cross",        score=72, positive=True),
-    SignalFactor(name="Volume Delta",      value="Accumulation +2.8M",  score=70, positive=True),
-    SignalFactor(name="DXY Correlation",   value="Weakening (bearish)", score=62, positive=True),
-    SignalFactor(name="Spread",            value="1.2 pips (normal)",   score=90, positive=True),
-    SignalFactor(name="Session Overlap",   value="London Open Active",  score=75, positive=True),
+    SignalFactor(name="HTF Bias",         value="Waiting for D1 confirmation", score=5,  positive=False),
+    SignalFactor(name="Market Structure", value="Waiting for CHoCH",            score=0,  positive=False),
+    SignalFactor(name="Liquidity Sweep",  value="No sweep detected",            score=0,  positive=False),
+    SignalFactor(name="Fair Value Gap",   value="No valid FVG yet",             score=0,  positive=False),
+    SignalFactor(name="News Risk",        value="CLEAR",                        score=15, positive=True),
+    SignalFactor(name="Session",          value="London kill zone",             score=10, positive=True),
+    SignalFactor(name="Spread",           value="0.3 pts (normal)",             score=85, positive=True),
 ]
 
 _CURRENT_SIGNAL = CurrentSignal(
-    direction="BUY",
-    strength=78,
-    confidence=72,
-    timestamp=datetime(2026, 5, 13, 8, 42, 0, tzinfo=timezone.utc),
+    direction="WAIT",
+    strength=30,
+    confidence=30,
+    timestamp=datetime(2026, 5, 14, 9, 0, 0, tzinfo=timezone.utc),
     session="London",
     timeframe="H4",
-    price=1.08432,
-    change=0.00087,
-    change_pct=0.08,
+    price=3285.00,
+    change=-3.20,
+    change_pct=-0.10,
     factors=_FACTORS,
 )
 
 _TRADE_PLAN = TradePlan(
-    entry=1.08450,
-    stop_loss=1.08100,
-    stop_loss_pips=35,
-    targets=[
-        TradePlanTarget(label="TP1", price=1.08800, rr="1.0",  pips=35,  partial="50%"),
-        TradePlanTarget(label="TP2", price=1.09100, rr="1.86", pips=65,  partial="30%"),
-        TradePlanTarget(label="TP3", price=1.09450, rr="2.86", pips=100, partial="20%"),
-    ],
-    risk_percent=1.5,
-    position_size=0.75,
-    account_size=10000.0,
-    risk_amount=150.0,
-    validity=datetime(2026, 5, 13, 20, 0, 0, tzinfo=timezone.utc),
+    entry=None,
+    stop_loss=None,
+    stop_loss_pips=None,
+    targets=[],
+    risk_percent=None,
+    position_size=None,
+    account_size=None,
+    risk_amount=None,
+    validity=datetime(2026, 5, 14, 20, 0, 0, tzinfo=timezone.utc),
     notes=(
-        "Wait for London close H1 candle confirmation above 1.0840. "
-        "Entry on pullback to the 1.0840–1.0845 demand zone. "
-        "Invalidated on close below 1.0810."
+        "XAU/USD — waiting for all ICT gates to align. "
+        "No active setup. Target: 50 points. Minimum RR: 2.5. "
+        "Manual confirmation only — broker execution disabled."
     ),
 )
 
@@ -68,7 +64,7 @@ def get_current_signal() -> SignalOutput:
 
 def run_signal_analysis(
     macro_events: list[dict] | None = None,
-    pair: str = "eurusd",
+    pair: str = "xauusd",
     db=None,            # SQLAlchemy Session — enables adaptive weights + live feed
 ) -> SignalAnalysisOutput:
     """
