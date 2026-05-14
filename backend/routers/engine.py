@@ -131,3 +131,31 @@ def bridge_status():
             ),
         },
     }
+
+
+@router.get(
+    "/providers",
+    summary="Status of all market data providers",
+)
+def provider_status():
+    """
+    Returns connection status for all configured data providers:
+    MT5 bridge, TradingView, MyFXBook sentiment.
+    """
+    from services.live_feed import bridge_status as _bridge_st
+    from services.tradingview_provider import tv_status
+    from services.myfxbook_provider import myfxbook_status
+
+    return {
+        "status": "ok",
+        "data": {
+            "mt5_bridge":  _bridge_st(),
+            "tradingview": tv_status(),
+            "myfxbook":    myfxbook_status(),
+            "candle_chain": [
+                "MT5 Bridge  (live broker prices — highest priority)",
+                "TradingView (real OHLCV when bridge offline)",
+                "Synthetic   (seeded demo — always available)",
+            ],
+        },
+    }

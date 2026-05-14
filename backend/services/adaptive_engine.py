@@ -368,7 +368,9 @@ def full_engine_status(db: Session, pair: str = "all") -> dict:
     Single dict that the /engine/status endpoint returns.
     Aggregates maturity, weights, per-component stats, and bridge status.
     """
-    from services.live_feed import bridge_status  # local import to avoid circular
+    from services.live_feed import bridge_status          # local import — avoid circular
+    from services.tradingview_provider import tv_status
+    from services.myfxbook_provider import myfxbook_status
 
     weights = get_current_weights(db, pair=pair)
     stats   = get_component_stats(db, pair=pair)
@@ -418,7 +420,9 @@ def full_engine_status(db: Session, pair: str = "all") -> dict:
             for s in stats
         ],
         "pair_breakdown": pair_stats,
-        "bridge": bridge_status(),
+        "bridge":      bridge_status(),
+        "tradingview": tv_status(),
+        "myfxbook":    myfxbook_status(),
     }
 
 

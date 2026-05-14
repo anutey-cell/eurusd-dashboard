@@ -89,34 +89,44 @@ def bridge_status() -> dict:
 
 def get_live_candles(pair: str, timeframe: str = "H4", limit: int = 300) -> list[dict] | None:
     """
-    Fetch OHLCV candle list from the MT5 bridge.
+    Fetch OHLCV candle list from the best available live source.
+
+    Priority:
+      1. MT5 Windows Bridge  (live broker prices — highest quality)
+      2. TradingView         (real market data via tvDatafeed)
+      3. Returns None        (caller falls back to synthetic)
 
     Returns:
         list of dicts with keys: time (ISO str), open, high, low, close, volume
-        None if bridge is unavailable (caller should fall back to synthetic data)
+        None if all live sources unavailable
     """
-    if not _probe_bridge():
-        return None
+    # ── Priority 1: MT5 Windows Bridge ────────────────────────────────────
+    if _probe_bridge():
+        cache_key = f"mt5:{pair}:{timeframe}"
+        entry = _candle_cache.get(cache_key)
+        if entry and (time.monotonic() - entry.fetched_at) < CACHE_TTL_SECONDS:
+            return entry.candles
+        try:
+            url = f"{BRIDGE_BASE}/candles/{pair}/{timeframe}"
+            r = requests.get(url, params={"limit": limit}, timeout=BRIDGE_TIMEOUT)
+            if r.status_code == 200:
+                candles = r.json()["data"]["candles"]
+                _candle_cache[cache_key] = _CacheEntry(candles=candles, fetched_at=time.monotonic())
+                log.info("[live_feed] MT5 bridge: %d %s candles for %s", len(candles), timeframe, pair)
+                return candles
+        except Exception as exc:
+            log.warning("[live_feed] MT5 bridge fetch failed: %s", exc)
 
-    cache_key = f"{pair}:{timeframe}"
-    entry = _candle_cache.get(cache_key)
-    if entry and (time.monotonic() - entry.fetched_at) < CACHE_TTL_SECONDS:
-        return entry.candles
-
+    # ── Priority 2: TradingView ────────────────────────────────────────────
     try:
-        url = f"{BRIDGE_BASE}/candles/{pair}/{timeframe}"
-        r = requests.get(url, params={"limit": limit}, timeout=BRIDGE_TIMEOUT)
-        if r.status_code != 200:
-            log.warning("[live_feed] Bridge returned %d for %s/%s", r.status_code, pair, timeframe)
-            return None
-        data = r.json()
-        candles = data["data"]["candles"]
-        _candle_cache[cache_key] = _CacheEntry(candles=candles, fetched_at=time.monotonic())
-        log.info("[live_feed] Fetched %d live %s candles for %s", len(candles), timeframe, pair)
-        return candles
+        from services.tradingview_provider import get_tv_candles
+        tv_candles = get_tv_candles(pair, timeframe=timeframe, limit=limit)
+        if tv_candles:
+            return tv_candles
     except Exception as exc:
-        log.warning("[live_feed] Candle fetch failed for %s/%s: %s", pair, timeframe, exc)
-        return None
+        log.debug("[live_feed] TradingView unavailable: %s", exc)
+
+    return None
 
 
 def get_multi_candles(pair: str) -> dict[str, list[dict]] | None:

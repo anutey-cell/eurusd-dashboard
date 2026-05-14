@@ -92,6 +92,16 @@ class Settings(BaseSettings):
     # Legacy fallback — honoured if TELEGRAM_ENABLED is set in older .env files
     telegram_enabled:                bool = False
 
+    # ── TradingView market data ───────────────────────────────────────────────
+    tradingview_enabled:  bool = False
+    tradingview_username: str  = ""    # NEVER logged or returned in responses
+    tradingview_password: str  = ""    # NEVER logged or returned in responses
+
+    # ── MyFXBook community sentiment ──────────────────────────────────────────
+    myfxbook_enabled:  bool = False
+    myfxbook_email:    str  = ""
+    myfxbook_password: str  = ""       # NEVER logged or returned in responses
+
     # ── Auth (optional API key protection) ───────────────────────────────────
     auth_enabled: bool = False
     api_key:      str  = "change_me"

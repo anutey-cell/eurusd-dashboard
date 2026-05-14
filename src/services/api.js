@@ -354,6 +354,7 @@ function adaptLiveSignal(res) {
       alertStatus: d.alertStatus,
       dataSource:  d.dataSource  ?? 'synthetic',
       weightsUsed: d.weightsUsed ?? null,
+      sentiment:   d.model?.sentiment ?? null,
     },
     tradePlan: {
       entry:        d.entry,

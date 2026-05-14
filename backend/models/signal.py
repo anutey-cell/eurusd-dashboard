@@ -115,6 +115,7 @@ class SignalModelDetail(BaseModel):
     structure: str
     fvg: str
     session: str
+    sentiment: dict | None = None    # MyFXBook community sentiment (optional)
 
 
 class SignalAnalysisOutput(BaseModel):

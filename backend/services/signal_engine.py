@@ -817,12 +817,21 @@ def analyze_signal(
         reason = _build_reason(news, liq, ms, fvg, score,
                                bull_votes, bear_votes, n_votes, sess=sess)
 
+    # ── MyFXBook sentiment (non-blocking, supplementary) ──────────────────
+    _sentiment: dict = {}
+    try:
+        from services.myfxbook_provider import get_sentiment_for_signal
+        _sentiment = get_sentiment_for_signal(pair, signal)
+    except Exception:
+        _sentiment = {"available": False, "interpretation": "Sentiment unavailable", "adjusted_score": 0}
+
     model_dict = {
         "higherTimeframeBias": htf.bias_text,
         "liquidity":           liq.liq_text,
         "structure":           ms.structure_text,
         "fvg":                 fvg.fvg_text,
         "session":             sess.session_text,
+        "sentiment":           _sentiment,
     }
 
     # Component activity snapshot (stored in DB for learning)

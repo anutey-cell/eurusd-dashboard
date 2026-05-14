@@ -114,6 +114,7 @@ def run_signal_analysis(
             structure=r.model["structure"],
             fvg=r.model["fvg"],
             session=r.model["session"],
+            sentiment=r.model.get("sentiment"),
         ),
         data_source=getattr(r, "data_source", "synthetic"),
         weights_used=getattr(r, "weights_used", None),
