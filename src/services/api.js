@@ -197,6 +197,61 @@ export async function getScanBacktest(lookback = 100) {
   return res.data ?? res;
 }
 
+// ─── XAU/USD Backtest API ─────────────────────────────────────────────────────
+
+/**
+ * Run a strict XAU/USD backtest. All params are query string filters.
+ * Returns the full diagnostic dict: summary, equityCurve, trades, skipped, breakdowns, reliability.
+ */
+export async function runXauusdBacktest(params = {}) {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') {
+      q.set(k, String(v));
+    }
+  }
+  const res = await apiFetch(`/backtest/xauusd?${q}`);
+  return res.data ?? res;
+}
+
+/** Upload a historical XAU/USD candle CSV. file = File, timeframe = "M15" etc. */
+export async function importBacktestCsv(file, timeframe = 'M15') {
+  const fd = new FormData();
+  fd.append('file', file);
+  const url = `${API_BASE}${PREFIX}/backtest/import-csv?timeframe=${encodeURIComponent(timeframe)}`;
+  const res = await fetch(url, { method: 'POST', body: fd });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = body.message || body.detail || `HTTP ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+  }
+  return body.data ?? body;
+}
+
+/** GET /backtest/data-status — historical candle availability for chosen timeframe. */
+export async function getBacktestDataStatus(timeframe = 'M15') {
+  const res = await apiFetch(`/backtest/data-status?timeframe=${encodeURIComponent(timeframe)}`);
+  return res.data ?? res;
+}
+
+/** GET /backtest/runs — list saved backtest runs (newest first). */
+export async function listBacktestRuns(limit = 20) {
+  const res = await apiFetch(`/backtest/runs?limit=${limit}`);
+  return res.data ?? res;
+}
+
+/** GET /backtest/runs/:id — full saved backtest payload. */
+export async function getBacktestRun(id) {
+  const res = await apiFetch(`/backtest/runs/${id}`);
+  return res.data ?? res;
+}
+
+/** DELETE /backtest/runs/:id — remove a saved backtest run. */
+export async function deleteBacktestRun(id) {
+  const res = await apiFetch(`/backtest/runs/${id}`, { method: 'DELETE' });
+  return res.data ?? res;
+}
+
 // ─── MT5 API ──────────────────────────────────────────────────────────────────
 
 export async function getMT5Status() {

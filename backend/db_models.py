@@ -152,6 +152,81 @@ class TelegramAlertLog(Base):
     raw_response_json = Column(Text,       nullable=True)
 
 
+# ── historical_candles ────────────────────────────────────────────────────────
+
+class HistoricalCandle(Base):
+    """
+    Imported historical XAU/USD candles for backtesting.
+    Separate from candle_cache (which is for live-feed caching).
+    """
+    __tablename__ = "historical_candles"
+
+    id           = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    instrument   = Column(String(16),  nullable=False, default="XAU/USD", index=True)
+    timeframe    = Column(String(8),   nullable=False, index=True)
+    candle_time  = Column(DateTime(timezone=True), nullable=False, index=True)
+    open         = Column(Float, nullable=False)
+    high         = Column(Float, nullable=False)
+    low          = Column(Float, nullable=False)
+    close        = Column(Float, nullable=False)
+    volume       = Column(Integer, nullable=False, default=0)
+    source       = Column(String(32), nullable=False, default="csv")   # csv | provider | sync
+    created_at   = Column(DateTime(timezone=True), default=_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("instrument", "timeframe", "candle_time",
+                         name="uq_historical_candle"),
+    )
+
+
+# ── backtest_runs ─────────────────────────────────────────────────────────────
+
+class BacktestRun(Base):
+    """
+    Persisted strict-backtest results for the XAU/USD signal engine.
+    settings_json / summary_json / trades_json are JSON-serialised blobs.
+    """
+    __tablename__ = "backtest_runs"
+
+    id                    = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    created_at            = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    instrument            = Column(String(16), nullable=False, default="XAU/USD")
+    timeframe             = Column(String(8),  nullable=False, default="M15")
+
+    # Date window
+    start_date            = Column(DateTime(timezone=True), nullable=True)
+    end_date              = Column(DateTime(timezone=True), nullable=True)
+
+    # Run settings (also mirrored in settings_json for full audit)
+    initial_balance       = Column(Float, nullable=False, default=10000.0)
+    risk_percent          = Column(Float, nullable=False, default=0.25)
+    spread_points         = Column(Float, nullable=False, default=1.5)
+    slippage_points       = Column(Float, nullable=False, default=0.5)
+    min_score             = Column(Integer, nullable=False, default=80)
+    min_rr                = Column(Float,   nullable=False, default=2.5)
+
+    # Summary metrics
+    total_signals_scanned = Column(Integer, nullable=False, default=0)
+    valid_trades          = Column(Integer, nullable=False, default=0)
+    win_rate              = Column(Float,   nullable=False, default=0.0)
+    expectancy_points     = Column(Float,   nullable=False, default=0.0)
+    expectancy_r          = Column(Float,   nullable=False, default=0.0)
+    profit_factor         = Column(Float,   nullable=True)
+    max_drawdown_percent  = Column(Float,   nullable=False, default=0.0)
+    final_balance         = Column(Float,   nullable=False, default=0.0)
+    net_return_percent    = Column(Float,   nullable=False, default=0.0)
+    reliability_rating    = Column(Integer, nullable=False, default=0)
+    reliability_band      = Column(String(32), nullable=True)
+
+    # Full payloads
+    settings_json         = Column(Text, nullable=True)
+    summary_json          = Column(Text, nullable=True)
+    trades_json           = Column(Text, nullable=True)
+    skipped_json          = Column(Text, nullable=True)
+    breakdowns_json       = Column(Text, nullable=True)
+    equity_curve_json     = Column(Text, nullable=True)
+
+
 # ── institutional_scans ───────────────────────────────────────────────────────
 
 class InstitutionalScan(Base):

@@ -27,6 +27,7 @@ import MT5Panel               from './MT5Panel';
 import EngineMaturityCard     from './EngineMaturityCard';
 import InstitutionalScanPanel from './InstitutionalScanPanel';
 import ScanHistoryPanel       from './ScanHistoryPanel';
+import XauusdBacktestPanel    from './XauusdBacktestPanel';
 
 // ─── Instrument ───────────────────────────────────────────────────────────────
 // XAU/USD is the only supported instrument.
@@ -279,7 +280,10 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
           trades={history.data?.trades}
         />
 
-        {/* Row: backtesting */}
+        {/* Row: strict XAU/USD backtest (primary) */}
+        <XauusdBacktestPanel />
+
+        {/* Row: legacy walk-forward backtest (kept for reference) */}
         <BacktestDashboard />
 
         {/* Row: broker execution (disabled panel) */}

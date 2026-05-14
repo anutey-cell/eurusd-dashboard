@@ -17,6 +17,9 @@ requests>=2.31.0
 slowapi>=0.1.9
 limits>=3.7.0
 
+# ── File uploads (CSV historical candle import) ──────────────────────────────
+python-multipart>=0.0.9
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dateutil>=2.9.0
 
