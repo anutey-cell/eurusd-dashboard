@@ -66,16 +66,33 @@ def get_current_signal() -> SignalOutput:
     return SignalOutput(signal=_CURRENT_SIGNAL, trade_plan=_TRADE_PLAN)
 
 
-def run_signal_analysis(macro_events: list[dict] | None = None, pair: str = "eurusd") -> SignalAnalysisOutput:
-    """Run the ICT engine on H4 candles and return the flat signal output."""
+def run_signal_analysis(
+    macro_events: list[dict] | None = None,
+    pair: str = "eurusd",
+    db=None,            # SQLAlchemy Session — enables adaptive weights + live feed
+) -> SignalAnalysisOutput:
+    """
+    Run the ICT engine on H4 candles and return the flat signal output.
+
+    When `db` is provided:
+      - Adaptive scoring weights are loaded from DB (learned from past outcomes)
+      - Live MT5 bridge candles are tried before synthetic fallback
+    """
     from pair_config import get_pair_config
     pair_cfg = get_pair_config(pair)
-    candle_resp = get_candles(interval="H4", limit=300, pair=pair)
+
+    # Engine handles both live-feed fetch and adaptive weights internally
+    # when db is supplied. Pass empty candles so engine tries live feed first.
     r = analyze_signal(
         pair=pair,
-        candles=candle_resp.candles,
+        candles=[],                 # engine fills from live feed if bridge online
         macro_events=macro_events or [],
+        db=db,
     )
+
+    # If engine returned empty (bridge down, synthetic fallback needed), supply candles
+    # NOTE: analyze_signal already handles this internally via synthetic fallback,
+    # so we only hit this branch if the engine genuinely returned with no bars.
 
     return SignalAnalysisOutput(
         pair=pair,
@@ -98,6 +115,9 @@ def run_signal_analysis(macro_events: list[dict] | None = None, pair: str = "eur
             fvg=r.model["fvg"],
             session=r.model["session"],
         ),
+        data_source=getattr(r, "data_source", "synthetic"),
+        weights_used=getattr(r, "weights_used", None),
+        component_snapshot=getattr(r, "component_snapshot", "{}"),
     )
 
 

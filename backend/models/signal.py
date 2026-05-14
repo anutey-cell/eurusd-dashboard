@@ -138,3 +138,8 @@ class SignalAnalysisOutput(BaseModel):
     # Telegram alert delivery status — set by the signal router after analysis.
     # Values: "sent" | "disabled" | "not_qualified" | "duplicate_skipped" | "failed"
     alert_status: str | None = None
+
+    # Learning / data-source transparency fields
+    data_source:        str  | None = None   # "live" | "synthetic"
+    weights_used:       dict | None = None   # adaptive weights applied {htf, liq, ms, fvg, news, session}
+    component_snapshot: str  | None = None   # JSON — which ICT gates were active (for DB learning)

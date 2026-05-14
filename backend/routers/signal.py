@@ -68,12 +68,13 @@ def analyze(
     request: Request,
     macro_events: list[dict] = Body(default=[], description="Optional macro calendar events"),
     pair: str = Query(default="eurusd", description="Trading pair code: eurusd | xauusd"),
+    db: Session = Depends(get_db),
 ) -> APIResponse[SignalAnalysisOutput]:
     logger.info("Signal analysis requested pair=%s ip=%s", pair, request.client.host if request.client else "unknown")
     try:
         from pair_config import validate_pair as _validate_pair
         pair = _validate_pair(pair)
-        result = run_signal_analysis(macro_events, pair=pair)
+        result = run_signal_analysis(macro_events, pair=pair, db=db)
         logger.info(
             "Signal analyzed signal=%s quality=%s session=%s",
             getattr(result, "signal", "?"),
@@ -118,13 +119,14 @@ def analyze(
 def analyze_get(
     pair: str = Path(description="Trading pair: eurusd | xauusd"),
     request: Request = ...,
+    db: Session = Depends(get_db),
 ) -> APIResponse[SignalAnalysisOutput]:
     """GET wrapper so callers can hit /api/v1/signal/eurusd without a body."""
     logger.info("Signal GET analysis pair=%s ip=%s", pair, request.client.host if request.client else "unknown")
     try:
         from pair_config import validate_pair as _validate_pair
         pair = _validate_pair(pair)
-        result = run_signal_analysis([], pair=pair)
+        result = run_signal_analysis([], pair=pair, db=db)
         logger.info(
             "Signal GET analyzed signal=%s quality=%s session=%s",
             getattr(result, "signal", "?"),
@@ -272,6 +274,17 @@ def record_result(
         "Signal result recorded id=%s result=%s pips=%s",
         signal_id, body.result, body.pips,
     )
+
+    # ── Trigger adaptive learning cycle (non-blocking, best-effort) ───────
+    try:
+        from services.adaptive_engine import run_learning_cycle
+        updated = run_learning_cycle(db, pair="all")
+        logger.info(
+            "Adaptive learning updated maturity=%d%% win_rate=%.0f%% outcomes=%d",
+            updated.maturity_score, updated.overall_win_rate * 100, updated.n_outcomes,
+        )
+    except Exception as _learn_exc:
+        logger.debug("Adaptive learning (non-fatal): %s", _learn_exc)
 
     # Fire Telegram result alert (fire-and-forget)
     try:

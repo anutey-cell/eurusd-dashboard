@@ -5,7 +5,7 @@ Intentionally separate from Pydantic models in models/ to avoid naming collision
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, Integer, String, Text, UniqueConstraint,
+    Boolean, Column, DateTime, Float, Integer, String, Text, UniqueConstraint, Index,
 )
 from sqlalchemy.sql import func
 
@@ -55,6 +55,10 @@ class SignalRecord(Base):
     pips            = Column(Integer, nullable=True)
     pnl             = Column(Float,  nullable=True)
     notes           = Column(Text,   nullable=True)
+
+    # Snapshot of which ICT components were active at signal time (JSON)
+    # e.g. {"htf": true, "liq": true, "ms": false, "fvg": true, "news": true, "session": true}
+    component_snapshot = Column(Text, nullable=True)
 
 
 # ── macro_events ──────────────────────────────────────────────────────────────
@@ -146,3 +150,31 @@ class TelegramAlertLog(Base):
     status           = Column(String(32),  nullable=False)   # sent|duplicate_skipped|not_qualified|failed
     error_message    = Column(Text,        nullable=True)
     raw_response_json = Column(Text,       nullable=True)
+
+
+# ── engine_weights ────────────────────────────────────────────────────────────
+
+class EngineWeightsRecord(Base):
+    """
+    Stores adaptive scoring weights learned from historical outcomes.
+    One row per pair (+ one 'all' aggregate row).
+    """
+    __tablename__ = "engine_weights"
+
+    id               = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    updated_at       = Column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+    pair             = Column(String(16),  nullable=False, unique=True, index=True)  # 'all' | 'eurusd' | 'xauusd'
+
+    # Learned weights (integers, sum = 100)
+    htf_weight       = Column(Integer, nullable=False, default=15)
+    liq_weight       = Column(Integer, nullable=False, default=20)
+    ms_weight        = Column(Integer, nullable=False, default=20)
+    fvg_weight       = Column(Integer, nullable=False, default=20)
+    news_weight      = Column(Integer, nullable=False, default=15)
+    session_weight   = Column(Integer, nullable=False, default=10)
+
+    # Metadata
+    n_samples        = Column(Integer, nullable=False, default=0)    # completed outcomes analysed
+    overall_win_rate = Column(Float,   nullable=False, default=0.0)
+    maturity_score   = Column(Integer, nullable=False, default=0)    # 0–100
+    calibrated       = Column(Boolean, nullable=False, default=False) # True if any weight adjusted

@@ -352,6 +352,8 @@ function adaptLiveSignal(res) {
       displayPair: d.displayPair,
       newsStatus:  d.newsStatus,
       alertStatus: d.alertStatus,
+      dataSource:  d.dataSource  ?? 'synthetic',
+      weightsUsed: d.weightsUsed ?? null,
     },
     tradePlan: {
       entry:        d.entry,

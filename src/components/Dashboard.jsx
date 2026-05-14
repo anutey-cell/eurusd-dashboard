@@ -24,6 +24,7 @@ import ExecutionPanel      from './ExecutionPanel';
 import PaperTradePanel     from './PaperTradePanel';
 import PaperTradeJournal   from './PaperTradeJournal';
 import MT5Panel            from './MT5Panel';
+import EngineMaturityCard  from './EngineMaturityCard';
 
 // ─── Pair options ────────────────────────────────────────────────────────────
 
@@ -267,7 +268,10 @@ export default function Dashboard({ selectedPair, onPairChange }) {
         {/* Row 2: checklist (local state only — no API) */}
         <PreTradeChecklist />
 
-        {/* Row 3: paper trading — run analysis + confirm */}
+        {/* Row 3: adaptive learning engine self-assessment */}
+        <EngineMaturityCard />
+
+        {/* Row 4: paper trading — run analysis + confirm */}
         <PaperTradePanel
           onConfirmed={() => setJournalKey(k => k + 1)}
           selectedPair={selectedPair}

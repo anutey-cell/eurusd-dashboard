@@ -51,9 +51,13 @@ News blackout:
 """
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -170,8 +174,11 @@ class SignalResult:
     fvg:  FVGResult
     news: NewsResult
     sess: SessionResult
-    pair:         str = "eurusd"
-    display_pair: str = "EUR/USD"
+    pair:               str  = "eurusd"
+    display_pair:       str  = "EUR/USD"
+    component_snapshot: str  = "{}"    # JSON — which ICT gates were active
+    weights_used:       dict = None    # adaptive weights applied (None = base weights)
+    data_source:        str  = "synthetic"  # "live" | "synthetic"
 
 
 # ---------------------------------------------------------------------------
@@ -526,11 +533,44 @@ def detect_session(at: datetime | None = None) -> SessionResult:
 
 
 # ---------------------------------------------------------------------------
-# 7. Quality score
+# 7. Quality score  (adaptive-weight aware)
 # ---------------------------------------------------------------------------
 
-def calculate_quality_score(htf, liq, ms, fvg, news, sess) -> int:
-    return htf.score + liq.score + ms.score + fvg.score + news.score + sess.score
+# Base weights — must match adaptive_engine.BASE_WEIGHTS
+_BASE_W = {"htf": 15, "liq": 20, "ms": 20, "fvg": 20, "news": 15, "session": 10}
+
+
+def calculate_quality_score(htf, liq, ms, fvg, news, sess,
+                             adaptive_weights: Optional[dict] = None) -> int:
+    """
+    Compute quality score 0-100.
+
+    If `adaptive_weights` is provided (dict with keys htf/liq/ms/fvg/news/session),
+    each component's raw score is scaled proportionally to its learned weight vs base.
+
+    Example: base liq=20, raw liq_score=10 (50% of max), learned liq_weight=24
+             → adjusted = round(0.5 * 24) = 12  instead of 10
+
+    Max possible score always stays 100 because adaptive_engine normalises weights to sum=100.
+    """
+    aw = adaptive_weights or {}
+
+    def _adj(raw: int, key: str) -> int:
+        base = _BASE_W[key]
+        if not aw or base == 0:
+            return raw
+        learned = aw.get(key, base)
+        pct = raw / base
+        return round(pct * learned)
+
+    return (
+        _adj(htf.score,  "htf")
+        + _adj(liq.score,  "liq")
+        + _adj(ms.score,   "ms")
+        + _adj(fvg.score,  "fvg")
+        + _adj(news.score, "news")
+        + _adj(sess.score, "session")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +642,7 @@ def analyze_signal(
     sl_buffer_pips: int             = SL_BUFFER_PIPS,
     min_rr:         float           = MIN_RR,
     fvg_min_pips:   int             = 3,
+    db=None,                        # SQLAlchemy Session — optional, enables adaptive weights
 ) -> SignalResult:
     """
     Run the full ICT/SMC pipeline.
@@ -618,6 +659,27 @@ def analyze_signal(
         candles = []
     if macro_events is None:
         macro_events = []
+
+    # ── Live feed: try MT5 bridge before synthetic data ───────────────────
+    if not candles:
+        try:
+            from services.live_feed import get_live_candles
+            live = get_live_candles(pair, timeframe="H4", limit=300)
+            if live:
+                candles = live
+                log.info("[engine] Using live MT5 candles for %s (%d bars)", pair, len(candles))
+        except Exception as _lf_exc:
+            log.debug("[engine] Live feed unavailable (%s) — synthetic fallback", _lf_exc)
+
+    # ── Adaptive weights: load from DB if session provided ────────────────
+    _adaptive_w: dict | None = None
+    if db is not None:
+        try:
+            from services.adaptive_engine import get_current_weights
+            aw = get_current_weights(db, pair="all")
+            _adaptive_w = aw.as_score_dict()
+        except Exception as _aw_exc:
+            log.debug("[engine] Adaptive weights unavailable (%s) — using base weights", _aw_exc)
 
     # Load pair-specific config (explicit params take precedence)
     from pair_config import get_pair_config
@@ -667,7 +729,8 @@ def analyze_signal(
     news = check_news_risk(macro_events, at=at)
     sess = detect_session(at=at)
 
-    score = calculate_quality_score(htf, liq, ms, fvg, news, sess)
+    score = calculate_quality_score(htf, liq, ms, fvg, news, sess,
+                                    adaptive_weights=_adaptive_w)
     price = round(bars[-1].close, _price_decimals) if bars else 1.08432
 
     # FIX #5: directional votes only count detected/active components
@@ -752,6 +815,19 @@ def analyze_signal(
         "session":             sess.session_text,
     }
 
+    # Component activity snapshot (stored in DB for learning)
+    _component_snapshot = json.dumps({
+        "htf":     bool(htf.score >= 8),
+        "liq":     liq.swept,
+        "ms":      ms.shifted,
+        "fvg":     fvg.detected,
+        "news":    news.clear,
+        "session": sess.score >= 5,
+    })
+
+    # Weights used (for audit transparency)
+    _weights_used = _adaptive_w or _BASE_W
+
     # Fire alert channel (non-blocking)
     if signal in ("BUY", "SELL"):
         try:
@@ -769,6 +845,10 @@ def analyze_signal(
         except Exception:
             pass
 
+    _data_src = "live" if (candles and hasattr(candles[0], "get") and
+                            candles[0].get("source") == "mt5") else (
+                "live" if _adaptive_w is None and candles else "synthetic")
+
     return SignalResult(
         signal        = signal,
         quality_score = score,
@@ -783,6 +863,9 @@ def analyze_signal(
         news_status   = news.status,
         model         = model_dict,
         htf=htf, liq=liq, ms=ms, fvg=fvg, news=news, sess=sess,
-        pair         = pair,
-        display_pair = _pcfg["display"] if _pcfg else "EUR/USD",
+        pair               = pair,
+        display_pair       = _pcfg["display"] if _pcfg else "EUR/USD",
+        component_snapshot = _component_snapshot,
+        weights_used       = _weights_used,
+        data_source        = _data_src,
     )
