@@ -167,17 +167,15 @@ def backtest_optimize(
     return result
 
 
-# ── /backtest/eurusd — backwards-compatible alias ─────────────────────────────
+# ── /backtest/eurusd — explicitly rejected ─────────────────────────────────────
 
 @router.get(
     "/eurusd",
-    summary="Backtest EUR/USD (legacy alias — use /backtest/run instead)",
+    summary="EUR/USD not supported",
     include_in_schema=False,
 )
-@limiter.limit("5/minute")
-def backtest_eurusd(
-    request: Request,
-    timeframe: str = Query(default="H4"),
-    lookback:  int = Query(default=500, ge=100, le=5000),
-) -> dict:
-    return backtest_run(request=request, pair="EUR/USD", timeframe=timeframe, lookback=lookback)
+def backtest_eurusd_rejected() -> None:
+    raise HTTPException(
+        status_code=400,
+        detail="EUR/USD is not supported. This dashboard is XAU/USD only. Use /backtest/run?pair=XAU/USD."
+    )

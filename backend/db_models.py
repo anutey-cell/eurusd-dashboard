@@ -23,7 +23,7 @@ class SignalRecord(Base):
 
     id              = Column(Integer,  primary_key=True, index=True, autoincrement=True)
     created_at      = Column(DateTime(timezone=True), default=_now, nullable=False)
-    pair            = Column(String(16),  default="EUR/USD", nullable=False)
+    pair            = Column(String(16),  default="XAU/USD", nullable=False)
     timeframe       = Column(String(8),   default="H4",      nullable=False)
 
     # Engine output
@@ -87,7 +87,7 @@ class CandleCacheRecord(Base):
     __tablename__ = "candle_cache"
 
     id          = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    pair        = Column(String(16),  default="EUR/USD", nullable=False)
+    pair        = Column(String(16),  default="XAU/USD", nullable=False)
     timeframe   = Column(String(8),   nullable=False)
     candle_time = Column(DateTime(timezone=True), nullable=False, index=True)
     open        = Column(Float, nullable=False)

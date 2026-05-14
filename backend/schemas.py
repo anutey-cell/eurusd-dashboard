@@ -42,7 +42,7 @@ class SignalCreate(BaseModel):
     """
     model_config = _cc
 
-    pair:             str          = "EUR/USD"
+    pair:             str          = "XAU/USD"
     timeframe:        str          = "H4"
     signal:           SignalDir
     quality_score:    int          = Field(ge=0, le=100)
@@ -50,7 +50,7 @@ class SignalCreate(BaseModel):
     stop_loss:        float | None = None
     take_profit:      float | None = None
     risk_pips:        int   | None = None
-    target_pips:      int          = 40
+    target_pips:      int          = 50
     rr:               float | None = None
     invalidation:     float | None = None
     liquidity_status: str          = ""

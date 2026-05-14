@@ -1,5 +1,5 @@
 """
-EUR/USD macro calendar data layer.
+XAU/USD macro calendar data layer.
 
 In demo mode (DATA_MODE=demo), returns the static mock events below.
 In live mode (DATA_MODE=live), delegates to calendar_provider which routes to
@@ -101,7 +101,7 @@ _NEWS: list[NewsItem] = [
     NewsItem(
         id=5,
         time="06:12",
-        headline="EUR/USD tests key 1.0850 resistance — break opens path to 1.0920",
+        headline="XAU/USD consolidates near $3285 — gold bulls target 3300 breakout on USD weakness",
         source="FXStreet",
         sentiment="bullish",
     ),

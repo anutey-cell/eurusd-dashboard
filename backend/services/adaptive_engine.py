@@ -377,7 +377,7 @@ def full_engine_status(db: Session, pair: str = "all") -> dict:
 
     # Per-pair breakdown
     pair_stats = {}
-    for p_code in ("eurusd", "xauusd"):
+    for p_code in ("xauusd",):
         query = db.query(SignalRecord).filter(
             SignalRecord.result.isnot(None),
             SignalRecord.pair.ilike(f"%{p_code.upper()[:3]}%"),

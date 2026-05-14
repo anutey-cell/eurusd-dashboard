@@ -312,7 +312,7 @@ def test_connection() -> dict:
             f"✅ Telegram connection verified!\n"
             f"🕐 {ts}\n"
             f"\n"
-            f"<i>EUR/USD & XAU/USD signal alerts are active.</i>"
+            f"<i>XAU/USD signal alerts are active. MONITOR_ONLY mode.</i>"
         )
 
         ok = _send(msg)

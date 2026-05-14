@@ -146,7 +146,7 @@ app.include_router(risk_router.router,      prefix=prefix)
 @app.get("/", include_in_schema=False)
 async def root() -> JSONResponse:
     return JSONResponse({
-        "message": "EUR/USD Signal API",
+        "message": "XAU/USD Signal Dashboard API",
         "docs":    "/docs",
         "version": settings.version,
     })

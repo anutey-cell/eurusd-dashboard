@@ -33,9 +33,9 @@ except ImportError:
     _MT5_AVAILABLE = False
 
 # ── Symbol candidates per internal pair code ──────────────────────────────────
+# XAU/USD is the only supported instrument — EUR/USD candidates removed
 SYMBOL_CANDIDATES: dict[str, list[str]] = {
-    "eurusd": ["EURUSD", "EURUSDm", "EURUSD.raw", "EURUSD.", "EURUSD_i"],
-    "xauusd": ["XAUUSD", "XAUUSDm", "GOLD", "XAUUSD.raw", "GOLD.spot", "XAUUSD_"],
+    "xauusd": ["XAUUSD", "XAUUSDm", "GOLD", "XAUUSD.raw", "XAUUSD.", "XAUUSD_"],
 }
 
 # ── Module-level symbol cache (resolved once per session) ─────────────────────
@@ -523,12 +523,7 @@ def validate_demo_order(signal: dict) -> tuple[bool, list[str]]:
                     pip_size = pair_cfg["pip_size"]
                     spread_pips = (tick.ask - tick.bid) / pip_size
                     code2 = pair_cfg.get("code", pair)
-                    if code2 == "eurusd" and spread_pips > settings.max_spread_eurusd_pips:
-                        reasons.append(
-                            f"EUR/USD spread {spread_pips:.1f} pips exceeds "
-                            f"max {settings.max_spread_eurusd_pips} pips."
-                        )
-                    elif code2 == "xauusd" and spread_pips > settings.max_spread_xauusd_points:
+                    if code2 == "xauusd" and spread_pips > settings.max_spread_xauusd_points:
                         reasons.append(
                             f"XAU/USD spread {spread_pips:.1f} points exceeds "
                             f"max {settings.max_spread_xauusd_points} points."

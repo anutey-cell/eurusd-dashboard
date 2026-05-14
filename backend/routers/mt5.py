@@ -34,7 +34,7 @@ router = APIRouter(prefix="/mt5", tags=["mt5"])
 # ── Request / response models ─────────────────────────────────────────────────
 
 class DemoOrderRequest(BaseModel):
-    pair:         str   = Field(..., description="eurusd or xauusd")
+    pair:         str   = Field(..., description="xauusd (only supported instrument)")
     signal:       str   = Field(..., description="BUY or SELL")
     entry:        float = Field(..., description="Expected entry price")
     stopLoss:     float = Field(..., description="Stop loss price")
@@ -99,17 +99,16 @@ def mt5_status() -> dict:
         return _not_connected_response(f"Unexpected error: {exc}")
 
 
-@router.get("/symbols", summary="Resolved broker symbols for all supported pairs")
+@router.get("/symbols", summary="Resolved broker symbol for XAU/USD")
 def mt5_symbols() -> dict:
     """
-    Attempts to resolve broker symbol names for EUR/USD and XAU/USD.
+    Attempts to resolve the broker symbol name for XAU/USD (XAUUSD, XAUUSDm, GOLD, etc.).
     Returns a graceful response when MT5 is not available.
     """
     from services.mt5_provider import get_symbol_info
 
     try:
         return {
-            "eurusd": get_symbol_info("eurusd"),
             "xauusd": get_symbol_info("xauusd"),
         }
     except MT5UnavailableError as exc:
@@ -124,8 +123,8 @@ def mt5_symbols() -> dict:
 @router.get("/tick/{pair}", summary="Live bid/ask/spread for a pair")
 def mt5_tick(pair: str) -> dict:
     """
-    Returns the latest bid, ask, and spread (in pips/points) for the given pair.
-    Pair codes: eurusd, xauusd
+    Returns the latest bid, ask, and spread (in points) for XAU/USD.
+    Only xauusd is supported. Other pair codes return 422.
     """
     from services.mt5_provider import get_tick
 

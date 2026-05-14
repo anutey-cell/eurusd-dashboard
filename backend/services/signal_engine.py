@@ -804,7 +804,8 @@ def analyze_signal(
         pass
 
     # Operating-mode guard: DISABLED pairs return WAIT immediately
-    _pair_mode = get_pair_mode(pair)
+    # get_pair_mode() takes no args — XAU/USD is the only supported instrument
+    _pair_mode = get_pair_mode()
     if _pair_mode == "DISABLED":
         log.info("[engine] Pair %s is DISABLED — skipping analysis", pair.upper())
         return SignalResult(

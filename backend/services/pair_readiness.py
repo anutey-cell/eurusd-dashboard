@@ -262,14 +262,14 @@ def _spread_volatility_score(pair_code: str) -> tuple[ReadinessDimension, list[s
     max_spread = cfg.get("max_spread")
     if max_spread:
         score += 4
-        details.append(f"max spread: {max_spread} {cfg.get('target_units', 'pips')}")
+        details.append(f"max spread: {max_spread} {cfg.get('target_label', 'points')}")
 
     if cfg.get("volatility_filter_enabled"):
         atr_min = cfg.get("atr_min", 0)
         atr_max = cfg.get("atr_max", 0)
         if atr_min > 0 and atr_max > 0:
             score += 6
-            details.append(f"ATR filter: {atr_min}–{atr_max} {cfg.get('target_units', 'pips')}")
+            details.append(f"ATR filter: {atr_min}–{atr_max} {cfg.get('target_label', 'points')}")
         else:
             score += 2
             details.append("volatility filter enabled but ATR limits not set")

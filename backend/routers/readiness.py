@@ -119,7 +119,7 @@ class ModeUpdateBody(BaseModel):
         "Promote or demote a pair's operating mode at runtime. "
         "Valid modes: MONITOR_ONLY | PAPER_OBSERVATION | DEMO_ELIGIBLE | LIVE_READ_ONLY | DISABLED. "
         "Changes are in-memory only and revert on server restart. "
-        "Persist by setting EURUSD_MODE / XAUUSD_MODE env vars."
+        "Persist by setting XAUUSD_MODE env var."
     ),
 )
 def update_mode(body: ModeUpdateBody) -> APIResponse[dict]:
