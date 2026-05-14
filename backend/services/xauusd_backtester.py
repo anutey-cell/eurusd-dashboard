@@ -48,7 +48,9 @@ from services.signal_engine import (
     detect_session,
     Candle as EngineCandle,
 )
-from services.historical_data_provider import get_historical_candles
+from services.historical_data_provider import (
+    get_historical_candles, load_historical_macro_events, seed_historical_data,
+)
 
 log = logging.getLogger(__name__)
 
@@ -126,6 +128,8 @@ def run_xauusd_backtest(
     max_trades:           Optional[int]   = None,
     max_holding_candles:  int             = DEFAULT_HOLDING,
     allow_synthetic_fallback: bool        = True,
+    allow_overlap:        Optional[bool]  = None,
+    auto_seed:            bool            = True,
 ) -> dict:
     """
     Run the strict XAU/USD backtest.
@@ -153,6 +157,9 @@ def run_xauusd_backtest(
     fvg_min_points   = cfg["fvg_min_pips"]        # 5 for XAU/USD
     price_decimals   = cfg["price_decimals"]      # 2 for XAU/USD
 
+    # ── Resolve overlap setting ──────────────────────────────────────────────
+    overlap_enabled = ALLOW_OVERLAP if allow_overlap is None else bool(allow_overlap)
+
     # ── Load historical candles ─────────────────────────────────────────────
     candles, source = get_historical_candles(
         db=db,
@@ -160,16 +167,55 @@ def run_xauusd_backtest(
         start_date=start_date,
         end_date=end_date,
         lookback=lookback,
-        allow_synthetic_fallback=allow_synthetic_fallback,
+        allow_synthetic_fallback=False,    # try DB first; we control fallback
     )
+
+    # Auto-seed a year of historical data on first backtest if DB is empty
+    if (not candles or len(candles) < MIN_WARMUP_BARS) and auto_seed:
+        log.info("[backtest] Auto-seeding 365 days of historical data for %s", timeframe)
+        seed_result = seed_historical_data(
+            db=db, days=365, timeframe=timeframe, instrument="XAU/USD", seed=42,
+        )
+        log.info(
+            "[backtest] Seed complete: %d candles, %d macro events",
+            seed_result.get("candlesInserted", 0),
+            seed_result.get("eventsInserted", 0),
+        )
+        # Reload
+        candles, source = get_historical_candles(
+            db=db, timeframe=timeframe,
+            start_date=start_date, end_date=end_date, lookback=lookback,
+            allow_synthetic_fallback=False,
+        )
+
+    # Synthetic fallback only if explicitly allowed and DB still empty
+    if (not candles or len(candles) < MIN_WARMUP_BARS) and allow_synthetic_fallback:
+        candles, source = get_historical_candles(
+            db=db, timeframe=timeframe,
+            start_date=start_date, end_date=end_date, lookback=lookback,
+            allow_synthetic_fallback=True,
+        )
 
     if not candles or len(candles) < MIN_WARMUP_BARS:
         raise RuntimeError(
             f"Historical XAU/USD candle data unavailable "
             f"(got {len(candles)} bars, need >= {MIN_WARMUP_BARS}). "
-            f"Import candles via POST /api/v1/backtest/import-csv or configure a "
-            f"historical data provider."
+            f"Import candles via POST /api/v1/backtest/import-csv or call "
+            f"POST /api/v1/backtest/seed-historical."
         )
+
+    # ── Load historical macro events for the candle range ────────────────────
+    macro_events: list[dict] = []
+    if include_news_filter and candles:
+        first_t = candles[0].time
+        last_t  = candles[-1].time
+        if not first_t.tzinfo:
+            first_t = first_t.replace(tzinfo=timezone.utc)
+        if not last_t.tzinfo:
+            last_t = last_t.replace(tzinfo=timezone.utc)
+        macro_events = load_historical_macro_events(db=db, start=first_t, end=last_t)
+        log.info("[backtest] Loaded %d historical macro events for the period",
+                 len(macro_events))
 
     log.info(
         "[backtest] Starting XAU/USD backtest bars=%d source=%s tf=%s "
@@ -203,16 +249,18 @@ def run_xauusd_backtest(
         window = bars[: i + 1]
         candle_ts = bars[i].time
 
-        if i < next_entry and not ALLOW_OVERLAP:
+        if i < next_entry and not overlap_enabled:
             # An earlier trade is still open — skip scanning while it resolves
             continue
 
         # ── Run signal engine on the historical window ──────────────────────
+        # NOTE: macro_events are pre-loaded from the historical macro_events table
+        # and filtered by check_news_risk() at each candle timestamp.
         try:
             result = analyze_signal(
                 pair="xauusd",
                 candles=window,
-                macro_events=[],          # TODO: wire historical news when available
+                macro_events=macro_events,
                 at=candle_ts,
                 pip_size=pip_size,
                 target_pips=target_points,
@@ -366,8 +414,8 @@ def run_xauusd_backtest(
             "result":      result_label,
         })
 
-        # Block further entries until this trade closes (or always, if !ALLOW_OVERLAP)
-        if not ALLOW_OVERLAP:
+        # Block further entries until this trade closes (or always, if !overlap_enabled)
+        if not overlap_enabled:
             next_entry = i + bars_held + 1
 
         if max_trades and len(trades) >= max_trades:
@@ -402,9 +450,10 @@ def run_xauusd_backtest(
         "includeNewsFilter":   include_news_filter,
         "sessionFilter":       session_filter,
         "maxHoldingCandles":   max_holding_candles,
-        "allowOverlap":        ALLOW_OVERLAP,
+        "allowOverlap":        overlap_enabled,
         "dataSource":          source,
         "barsAnalyzed":        len(candles),
+        "macroEventsLoaded":   len(macro_events),
     }
 
     return {

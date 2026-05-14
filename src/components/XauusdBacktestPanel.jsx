@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import {
   runXauusdBacktest, importBacktestCsv, getBacktestDataStatus, listBacktestRuns,
+  seedHistoricalData,
 } from '../services/api';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ const DEFAULTS = {
   min_score:       80,
   min_rr:          2.5,
   include_news_filter: true,
+  allow_overlap:   false,
 };
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
@@ -140,6 +142,55 @@ function WarningsBanner({ warnings = [] }) {
       {warnings.map((w, i) => (
         <p key={i} className="text-[10px] text-amber-200/70 leading-tight">- {w}</p>
       ))}
+    </div>
+  );
+}
+
+function SeedDatasetButton({ timeframe, onSeeded }) {
+  const [busy, setBusy] = useState(false);
+  const [msg,  setMsg]  = useState(null);
+  const [err,  setErr]  = useState(null);
+
+  async function handleSeed() {
+    if (!confirm(`Seed 365 days of deterministic historical XAU/USD ${timeframe} candles + realistic macro calendar? This is idempotent.`)) return;
+    setBusy(true); setMsg(null); setErr(null);
+    try {
+      const r = await seedHistoricalData({ days: 365, timeframe });
+      if (r.already_seeded) {
+        setMsg(`Already seeded: ${r.candleCount.toLocaleString()} ${r.timeframe} candles in DB.`);
+      } else {
+        setMsg(`Seeded ${r.candlesInserted.toLocaleString()} candles + ${r.eventsInserted} macro events (${r.earliest?.slice(0,10)} -> ${r.latest?.slice(0,10)}).`);
+      }
+      onSeeded?.(r);
+    } catch (e) {
+      setErr(e.message ?? 'Seed failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="bg-[#0a0f17] border border-emerald-700/30 rounded-lg p-3 space-y-2">
+      <div className="flex items-center gap-2 text-[10px] text-emerald-300 uppercase tracking-widest font-semibold">
+        <Database size={11} /> One-Click Dataset (365 days + USD macro calendar)
+      </div>
+      <p className="text-[10px] text-gray-500 leading-tight">
+        Deterministic seeded generator. Realistic session-weighted volatility,
+        regime shifts, NFP/CPI/FOMC schedule. Idempotent — safe to click again.
+      </p>
+      <button
+        onClick={handleSeed}
+        disabled={busy}
+        className={`w-full py-2 rounded-md text-xs font-semibold transition-all ${
+          busy
+            ? 'bg-emerald-900/40 text-emerald-300/60 cursor-not-allowed'
+            : 'bg-emerald-700 hover:bg-emerald-600 text-white'
+        }`}
+      >
+        {busy ? 'Seeding…' : `Seed 365-day ${timeframe} dataset`}
+      </button>
+      {msg && <p className="text-[10px] text-emerald-400">{msg}</p>}
+      {err && <p className="text-[10px] text-red-400">{err}</p>}
     </div>
   );
 }
@@ -556,12 +607,18 @@ export default function XauusdBacktestPanel() {
                         { value: 'Asian',    label: 'Asian' },
                       ]} />
             </Field>
+            <Field label="Concurrent trades" hint="off = 1 trade at a time">
+              <Select value={params.allow_overlap ? 'true' : 'false'}
+                      onChange={v => set('allow_overlap', v === 'true')}
+                      options={[{ value: 'false', label: 'Disabled (default)' }, { value: 'true', label: 'Allowed' }]} />
+            </Field>
           </div>
 
-          {/* Run + CSV import */}
+          {/* Run + data sources */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+            <SeedDatasetButton timeframe={params.timeframe} onSeeded={refreshStatus} />
             <CsvImportBox onImported={refreshStatus} timeframe={params.timeframe} />
-            <div className="lg:col-span-2 flex items-end">
+            <div className="flex items-end">
               <button
                 onClick={handleRun}
                 disabled={running}
@@ -684,13 +741,15 @@ export default function XauusdBacktestPanel() {
             <TradeList trades={result.trades} />
             <SkippedList skipped={result.skipped} />
 
-            {/* Saved run id */}
-            {result.savedRunId && (
-              <p className="text-[10px] text-gray-600 italic">
-                <History size={9} className="inline mr-1" />
-                Saved as backtest run #{result.savedRunId} — available at GET /api/v1/backtest/runs/{result.savedRunId}
-              </p>
-            )}
+            {/* Footer: data source + macro events */}
+            <div className="flex flex-wrap items-center gap-3 text-[10px] text-gray-600 pt-2 border-t border-[#1e2535]">
+              <span><Database size={9} className="inline mr-1" />Source: <span className={`font-mono ${result.settings?.dataSource === 'database' ? 'text-emerald-400' : 'text-amber-400'}`}>{result.settings?.dataSource}</span></span>
+              <span>· Bars analyzed: <span className="font-mono text-gray-400">{result.settings?.barsAnalyzed?.toLocaleString()}</span></span>
+              <span>· Macro events loaded: <span className="font-mono text-gray-400">{result.settings?.macroEventsLoaded ?? 0}</span></span>
+              {result.savedRunId && (
+                <span>· <History size={9} className="inline mr-1" />Saved as run <span className="font-mono text-blue-400">#{result.savedRunId}</span></span>
+              )}
+            </div>
           </>
         )}
       </div>

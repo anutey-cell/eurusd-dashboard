@@ -35,6 +35,7 @@ from pair_config import SUPPORTED_PAIRS, DEFAULT_PAIR, DEFAULT_PAIR_CODE, valida
 from rate_limit import limiter
 from services.historical_data_provider import (
     historical_data_available, import_csv as import_historical_csv,
+    seed_historical_data,
 )
 from services.xauusd_backtester import run_xauusd_backtest
 
@@ -219,6 +220,8 @@ def xauusd_backtest(
     min_score:           int = Query(default=80, ge=50, le=100),
     min_rr:              float = Query(default=2.5, ge=1.0, le=10),
     max_trades:          int | None = Query(default=None, ge=1, le=10000),
+    allow_overlap:       bool = Query(default=False, description="Allow concurrent trades"),
+    auto_seed:           bool = Query(default=True, description="Auto-seed 365 days if DB empty"),
     save:                bool = Query(default=True, description="Save run to backtest_runs table"),
     db: Session = Depends(get_db),
 ) -> APIResponse[dict]:
@@ -260,6 +263,8 @@ def xauusd_backtest(
             min_score=min_score,
             min_rr=min_rr,
             max_trades=max_trades,
+            allow_overlap=allow_overlap,
+            auto_seed=auto_seed,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -332,6 +337,40 @@ async def import_csv_route(
         "errors":     result.errors,
         "filename":   file.filename,
     })
+
+
+@router.post(
+    "/seed-historical",
+    response_model=APIResponse[dict],
+    summary="Seed deterministic historical XAU/USD data for backtesting",
+    description=(
+        "Generates a deterministic 365-day dataset (default) of XAU/USD candles "
+        "with realistic session-weighted volatility, regime shifts, and "
+        "liquidity sweeps. Also populates macro_events with a realistic "
+        "USD macro calendar (NFP, CPI, FOMC, GDP, Retail Sales, ISM, "
+        "Unemployment Claims). Idempotent: skips if data already exists "
+        "unless force=true. Rate-limited to 2 requests/minute."
+    ),
+)
+@limiter.limit("2/minute")
+def seed_historical(
+    request: Request,
+    days:      int  = Query(default=365, ge=30, le=1825),
+    timeframe: str  = Query(default="M15"),
+    seed:      int  = Query(default=42),
+    force:     bool = Query(default=False, description="Overwrite if data exists"),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    try:
+        result = seed_historical_data(
+            db=db, days=days, timeframe=timeframe, seed=seed, force=force,
+        )
+        return APIResponse(data=result)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("[backtest] Seed failed")
+        raise HTTPException(status_code=502, detail=f"Seed error: {exc}") from exc
 
 
 @router.get(

@@ -234,6 +234,13 @@ export async function getBacktestDataStatus(timeframe = 'M15') {
   return res.data ?? res;
 }
 
+/** POST /backtest/seed-historical — seed deterministic 365-day dataset + macro calendar. */
+export async function seedHistoricalData({ days = 365, timeframe = 'M15', seed = 42, force = false } = {}) {
+  const q = new URLSearchParams({ days, timeframe, seed, force });
+  const res = await apiFetch(`/backtest/seed-historical?${q}`, { method: 'POST' });
+  return res.data ?? res;
+}
+
 /** GET /backtest/runs — list saved backtest runs (newest first). */
 export async function listBacktestRuns(limit = 20) {
   const res = await apiFetch(`/backtest/runs?limit=${limit}`);
