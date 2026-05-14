@@ -5,7 +5,7 @@ Intentionally separate from Pydantic models in models/ to avoid naming collision
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, Integer, String, Text, UniqueConstraint, Index,
+    Boolean, Column, DateTime, Float, Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
@@ -150,6 +150,39 @@ class TelegramAlertLog(Base):
     status           = Column(String(32),  nullable=False)   # sent|duplicate_skipped|not_qualified|failed
     error_message    = Column(Text,        nullable=True)
     raw_response_json = Column(Text,       nullable=True)
+
+
+# ── institutional_scans ───────────────────────────────────────────────────────
+
+class InstitutionalScan(Base):
+    """
+    Stores institutional scanner results.
+    Written on every forced (manual) scan and on significant auto-scan changes.
+    """
+    __tablename__ = "institutional_scans"
+
+    id                 = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    created_at         = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    instrument         = Column(String(16),  nullable=False, default="XAU/USD")
+    scan_mode          = Column(String(8),   nullable=False, default="auto")   # auto | manual
+    market_state       = Column(String(32),  nullable=False)
+    signal             = Column(String(8),   nullable=False, default="WAIT")
+    institutional_bias = Column(String(32),  nullable=True)
+    confidence         = Column(Integer,     nullable=True)
+    readiness          = Column(String(32),  nullable=True)
+    summary            = Column(Text,        nullable=True)
+    action             = Column(String(64),  nullable=True)
+
+    # JSON-serialised sub-objects
+    key_drivers_json   = Column(Text, nullable=True)
+    blockers_json      = Column(Text, nullable=True)
+    opportunity_json   = Column(Text, nullable=True)
+    model_json         = Column(Text, nullable=True)
+    liquidity_json     = Column(Text, nullable=True)
+    fvg_json           = Column(Text, nullable=True)
+    news_json          = Column(Text, nullable=True)
+    risk_json          = Column(Text, nullable=True)
+    raw_payload_json   = Column(Text, nullable=True)
 
 
 # ── engine_weights ────────────────────────────────────────────────────────────

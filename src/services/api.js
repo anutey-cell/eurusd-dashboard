@@ -153,6 +153,44 @@ export async function logSignalResult(signalId, { result, exitPrice, pips, pnl =
   });
 }
 
+// ─── Institutional Scanner API ────────────────────────────────────────────────
+
+/**
+ * GET /scan/xauusd — return cached or fresh institutional scan.
+ * The backend caches for SCAN_CACHE_TTL_SECONDS (default 45 s).
+ */
+export async function getScan() {
+  const res = await apiFetch('/scan/xauusd');
+  return res.data ?? res;
+}
+
+/**
+ * POST /scan/xauusd/force — force a fresh scan.
+ * Called by the "Scan Institutional Setup" button.
+ */
+export async function forceScan() {
+  const res = await apiFetch('/scan/xauusd/force', { method: 'POST' });
+  return res.data ?? res;
+}
+
+/** GET /scan/history — last N scan records from DB. */
+export async function getScanHistory(limit = 20) {
+  const res = await apiFetch(`/scan/history?limit=${limit}`);
+  return res.data ?? res;
+}
+
+/** GET /scan/status — scanner health + cache info. */
+export async function getScanStatus() {
+  const res = await apiFetch('/scan/status');
+  return res.data ?? res;
+}
+
+/** GET /market-view/xauusd — latest stored market view from DB. */
+export async function getMarketView() {
+  const res = await apiFetch('/market-view/xauusd');
+  return res.data ?? res;
+}
+
 // ─── MT5 API ──────────────────────────────────────────────────────────────────
 
 export async function getMT5Status() {

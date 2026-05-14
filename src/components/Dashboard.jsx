@@ -23,8 +23,10 @@ import BacktestDashboard   from './BacktestDashboard';
 import ExecutionPanel      from './ExecutionPanel';
 import PaperTradePanel     from './PaperTradePanel';
 import PaperTradeJournal   from './PaperTradeJournal';
-import MT5Panel            from './MT5Panel';
-import EngineMaturityCard  from './EngineMaturityCard';
+import MT5Panel               from './MT5Panel';
+import EngineMaturityCard     from './EngineMaturityCard';
+import InstitutionalScanPanel from './InstitutionalScanPanel';
+import ScanHistoryPanel       from './ScanHistoryPanel';
 
 // ─── Instrument ───────────────────────────────────────────────────────────────
 // XAU/USD is the only supported instrument.
@@ -125,6 +127,8 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
 
   // journalKey bumps each time a trade is confirmed → triggers PaperTradeJournal reload
   const [journalKey, setJournalKey] = useState(0);
+  // scanKey bumps each time a forced scan completes → triggers ScanHistoryPanel reload
+  const [scanKey, setScanKey] = useState(0);
 
   const countdown    = useRefreshCountdown(REFRESH_MS);
   const refreshing   = signal.loading || calendar.loading;
@@ -241,6 +245,14 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
 
         {/* Row 3: adaptive learning engine self-assessment */}
         <EngineMaturityCard />
+
+        {/* Row: Institutional Scanner — opportunity scanning + market view */}
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <InstitutionalScanPanel
+            onScanComplete={() => setScanKey(k => k + 1)}
+          />
+          <ScanHistoryPanel refreshKey={scanKey} />
+        </div>
 
         {/* Row 4: paper trading — run analysis + confirm */}
         <PaperTradePanel

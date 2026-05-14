@@ -103,6 +103,12 @@ class Settings(BaseSettings):
     myfxbook_email:    str  = ""
     myfxbook_password: str  = ""       # NEVER logged or returned in responses
 
+    # ── Institutional scanner ─────────────────────────────────────────────────
+    auto_scan_enabled:          bool = True
+    scan_cache_ttl_seconds:     int  = 45    # cache freshness window in seconds
+    scan_interval_seconds:      int  = 60    # frontend auto-refresh interval hint
+    telegram_watchlist_alerts:  bool = False  # send WATCHLIST state alerts
+
     # ── Auth (optional API key protection) ───────────────────────────────────
     auth_enabled: bool = False
     api_key:      str  = "change_me"

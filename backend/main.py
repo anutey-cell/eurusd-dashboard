@@ -18,7 +18,7 @@ import db_models  # registers ORM classes with Base.metadata
 from logging_config import setup_logging
 from middleware import RequestLoggingMiddleware, AuthMiddleware
 from rate_limit import limiter
-from routers import health, candles, calendar, signal, analytics, backtest, execution, mt5 as mt5_router, telegram as telegram_router, engine as engine_router, readiness as readiness_router, risk as risk_router
+from routers import health, candles, calendar, signal, analytics, backtest, execution, mt5 as mt5_router, telegram as telegram_router, engine as engine_router, readiness as readiness_router, risk as risk_router, scan as scan_router
 
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
@@ -140,6 +140,7 @@ app.include_router(telegram_router.router, prefix=prefix)
 app.include_router(engine_router.router,   prefix=prefix)
 app.include_router(readiness_router.router, prefix=prefix)
 app.include_router(risk_router.router,      prefix=prefix)
+app.include_router(scan_router.router,      prefix=prefix)
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────
