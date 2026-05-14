@@ -164,6 +164,31 @@ def confirm_and_save(
     body: SignalCreate,
     db: Session = Depends(get_db),
 ) -> APIResponse[SignalRead]:
+    # Gate: reject confirmation when pair is in MONITOR_ONLY or DISABLED mode
+    from pair_config import get_pair_mode as _get_mode, get_pair_config as _get_cfg
+    try:
+        _pair_code = body.pair.lower().replace("/", "").replace("_", "").replace(" ", "")
+        # Map display name to code if needed
+        try:
+            _pair_code = _get_cfg(_pair_code)["code"]
+        except Exception:
+            pass
+        _mode = _get_mode(_pair_code)
+        if _mode in ("MONITOR_ONLY", "DISABLED"):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": True,
+                    "message": f"{body.pair} is in {_mode} mode — signal confirmation is not allowed.",
+                    "pair_mode": _mode,
+                    "hint": "Update mode via POST /api/v1/readiness/mode to PAPER_OBSERVATION or higher.",
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception as _mode_exc:
+        logger.debug("Mode check (non-fatal): %s", _mode_exc)
+
     record = SignalRecord(
         pair=body.pair,
         timeframe=body.timeframe,
@@ -217,13 +242,14 @@ def confirm_and_save(
 @router.get(
     "/db/history",
     response_model=APIResponse[SignalHistoryDB],
-    summary="Signal history from database (newest first)",
+    summary="Signal history from database (newest first, pair-filtered)",
 )
 def db_signal_history(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     signal: Literal["BUY", "SELL", "WAIT"] | None = Query(default=None),
     result: Literal["WIN", "LOSS", "BREAKEVEN"] | None = Query(default=None),
+    pair: str | None = Query(default=None, description="Filter by pair code: eurusd | xauusd"),
     db: Session = Depends(get_db),
 ) -> APIResponse[SignalHistoryDB]:
     q = db.query(SignalRecord).filter(SignalRecord.confirmed == True)
@@ -231,6 +257,13 @@ def db_signal_history(
         q = q.filter(SignalRecord.signal == signal)
     if result:
         q = q.filter(SignalRecord.result == result)
+    if pair:
+        from pair_config import get_pair_config as _get_cfg
+        try:
+            pair_display = _get_cfg(pair)["display"]
+            q = q.filter(SignalRecord.pair == pair_display)
+        except ValueError:
+            pass  # unknown pair code — return all
 
     total = q.count()
     records = (

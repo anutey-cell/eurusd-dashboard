@@ -116,6 +116,7 @@ def run_signal_analysis(
             session=r.model["session"],
             sentiment=r.model.get("sentiment"),
         ),
+        pair_mode=pair_cfg.get("mode", "MONITOR_ONLY"),
         data_source=getattr(r, "data_source", "synthetic"),
         weights_used=getattr(r, "weights_used", None),
         component_snapshot=getattr(r, "component_snapshot", "{}"),

@@ -268,7 +268,18 @@ def detect_higher_timeframe_bias(candles: list[Candle]) -> HTFResult:
 # FIX #10 : Add strength gate -- partial wick (< 3 pips) scores 10, not 20
 # ---------------------------------------------------------------------------
 
-def detect_liquidity_sweep(candles: list[Candle], pip_size: float = PIP) -> LiqResult:
+def detect_liquidity_sweep(
+    candles: list[Candle],
+    pip_size: float = PIP,
+    strong_wick_pips: int = STRONG_WICK_PIPS,
+) -> LiqResult:
+    """
+    Detect ICT liquidity sweeps.
+
+    strong_wick_pips: pair-specific minimum wick size for full 20-pt sweep score.
+      EUR/USD default: 3 pips
+      XAU/USD default: 8 points  (passed in from analyze_signal via pair config)
+    """
     _null = LiqResult(swept=False, bullish=True, score=0,
                       swept_level=0.0, liq_text="No liquidity sweep detected")
     if len(candles) < SWEEP_CANDIDATE_BARS + 10:
@@ -289,7 +300,7 @@ def detect_liquidity_sweep(candles: list[Candle], pip_size: float = PIP) -> LiqR
         wick_lo = c.low < swing_low and c.close > swing_low
         if wick_lo:
             wick_pips = (c.close - c.low) / pip_size
-            score = 20 if wick_pips >= STRONG_WICK_PIPS else 10
+            score = 20 if wick_pips >= strong_wick_pips else 10
             return LiqResult(
                 swept        = True,
                 bullish      = True,
@@ -305,7 +316,7 @@ def detect_liquidity_sweep(candles: list[Candle], pip_size: float = PIP) -> LiqR
         wick_hi = c.high > swing_high and c.close < swing_high
         if wick_hi:
             wick_pips = (c.high - c.close) / pip_size
-            score = 20 if wick_pips >= STRONG_WICK_PIPS else 10
+            score = 20 if wick_pips >= strong_wick_pips else 10
             return LiqResult(
                 swept        = True,
                 bullish      = False,
@@ -468,12 +479,51 @@ def _is_major(event_name: str) -> bool:
 def check_news_risk(
     macro_events: list[dict],
     at: datetime | None = None,
+    pair: str = "eurusd",
 ) -> NewsResult:
+    """
+    Check news risk for the given pair.
+
+    Uses pair-specific:
+      - news_currencies  — which currencies to filter events for
+      - critical_news_events — keyword list for major events (wider blackout)
+      - news_block_minutes_before / after — configurable blackout window
+
+    Falls back to EUR/USD defaults if pair config is unavailable.
+    """
     now = at or datetime.now(timezone.utc)
+
+    # Load pair-specific news config
+    _news_currencies = ["EUR", "USD"]
+    _critical_keywords: frozenset[str] = MAJOR_EVENT_KEYWORDS
+    _block_before_s = 3600   # 60 min
+    _block_after_s  = 1800   # 30 min
+    _minor_before_s = 1800   # 30 min
+    _minor_after_s  = 900    # 15 min
+
+    try:
+        from pair_config import get_pair_config as _gpc
+        _pcfg = _gpc(pair)
+        _news_currencies  = [c.upper() for c in _pcfg.get("news_currencies", _news_currencies)]
+        _critical_keywords = frozenset(
+            kw.upper() for kw in _pcfg.get("critical_news_events", list(MAJOR_EVENT_KEYWORDS))
+        )
+        # Use pair-specific blackout window for major events
+        _block_before_s = _pcfg.get("news_block_minutes_before", 60) * 60
+        _block_after_s  = _pcfg.get("news_block_minutes_after",  30) * 60
+        # Minor events: half the window
+        _minor_before_s = _block_before_s // 2
+        _minor_after_s  = _block_after_s  // 2
+    except Exception:
+        pass  # fall back to defaults
+
+    def _is_critical(event_name: str) -> bool:
+        return any(kw in event_name.upper() for kw in _critical_keywords)
+
     high_impact = [
         e for e in macro_events
         if str(e.get("impact", "")).lower() == "high"
-        and str(e.get("currency", "")).upper() in ("EUR", "USD")
+        and str(e.get("currency", "")).upper() in _news_currencies
     ]
 
     for ev in high_impact:
@@ -485,7 +535,8 @@ def check_news_risk(
 
         name   = str(ev.get("event", "Unknown"))
         diff_s = (ev_time - now).total_seconds()
-        before_s, after_s = (3600, 1800) if _is_major(name) else (1800, 900)
+        before_s = _block_before_s if _is_critical(name) else _minor_before_s
+        after_s  = _block_after_s  if _is_critical(name) else _minor_after_s
 
         if -after_s <= diff_s <= before_s:
             return NewsResult(clear=False, score=0, status="BLOCKED",
@@ -580,16 +631,17 @@ def calculate_quality_score(htf, liq, ms, fvg, news, sess,
 # ---------------------------------------------------------------------------
 
 def _build_reason(
-    news:       NewsResult,
-    liq:        LiqResult,
-    ms:         MSResult,
-    fvg:        FVGResult,
-    score:      int,
-    bull_votes: int,
-    bear_votes: int,
-    n_votes:    int,
-    rr_val:     float | None = None,
-    sess:       SessionResult | None = None,
+    news:             NewsResult,
+    liq:              LiqResult,
+    ms:               MSResult,
+    fvg:              FVGResult,
+    score:            int,
+    bull_votes:       int,
+    bear_votes:       int,
+    n_votes:          int,
+    rr_val:           float | None = None,
+    sess:             SessionResult | None = None,
+    strong_wick_pips: int = STRONG_WICK_PIPS,
 ) -> str:
     if not news.clear:
         return f"News blackout: {news.blocking_event} — wait for window to expire"
@@ -606,7 +658,7 @@ def _build_reason(
     if liq.score < 15:
         return (
             f"Sweep wick too small ({liq.liq_text}) — "
-            f"need >= {STRONG_WICK_PIPS} pip wick for full confirmation"
+            f"need >= {strong_wick_pips} pip wick for full confirmation"
         )
     if not ms.shifted:
         return (
@@ -735,7 +787,10 @@ def analyze_signal(
             log.debug("[engine] Adaptive weights unavailable (%s) — using base weights", _aw_exc)
 
     # Load pair-specific config (explicit params take precedence)
-    from pair_config import get_pair_config
+    from pair_config import get_pair_config, get_pair_mode
+    _pcfg           = None
+    _price_decimals = 5
+    _strong_wick_pips = STRONG_WICK_PIPS   # default (EUR/USD) — overridden below
     try:
         _pcfg = get_pair_config(pair)
         if pip_size       == PIP:            pip_size       = _pcfg["pip_size"]
@@ -743,10 +798,41 @@ def analyze_signal(
         if sl_buffer_pips == SL_BUFFER_PIPS: sl_buffer_pips = _pcfg["sl_buffer_pips"]
         if min_rr         == MIN_RR:         min_rr         = _pcfg["min_rr"]
         if fvg_min_pips   == 3:              fvg_min_pips   = _pcfg["fvg_min_pips"]
-        _price_decimals = _pcfg["price_decimals"]
+        _price_decimals   = _pcfg["price_decimals"]
+        _strong_wick_pips = _pcfg.get("strong_wick_pips", STRONG_WICK_PIPS)
     except ValueError:
-        _pcfg           = None
-        _price_decimals = 5
+        pass
+
+    # Operating-mode guard: DISABLED pairs return WAIT immediately
+    _pair_mode = get_pair_mode(pair)
+    if _pair_mode == "DISABLED":
+        log.info("[engine] Pair %s is DISABLED — skipping analysis", pair.upper())
+        return SignalResult(
+            signal="WAIT", quality_score=0,
+            entry=None, stop_loss=None, take_profit=None,
+            risk_pips=None, target_pips=target_pips, rr=None,
+            invalidation=None,
+            reason=f"Pair {pair.upper()} is DISABLED. Update mode via POST /api/v1/readiness/mode.",
+            news_status="CLEAR",
+            model={"higherTimeframeBias": "—", "liquidity": "—",
+                   "structure": "—", "fvg": "—", "session": "—"},
+            htf=HTFResult(bullish=False, score=0, ema21=0.0, ema50=0.0,
+                          structure="—", bias_text="Pair disabled"),
+            liq=LiqResult(swept=False, bullish=False, score=0,
+                          swept_level=0.0, liq_text="Pair disabled"),
+            ms=MSResult(shifted=False, bullish=False, score=0,
+                        pattern="None", structure_text="Pair disabled"),
+            fvg=FVGResult(detected=False, bullish=False, score=0,
+                          gap_low=0.0, gap_high=0.0, in_zone=False,
+                          fvg_text="Pair disabled"),
+            news=NewsResult(clear=True, score=0, blocking_event="", status="CLEAR"),
+            sess=SessionResult(score=0, session="—", in_kill_zone=False,
+                               session_text="Pair disabled"),
+            pair=pair,
+            display_pair=_pcfg["display"] if _pcfg else pair.upper(),
+            component_snapshot="{}", weights_used=None,
+            data_source="disabled",
+        )
 
     # Normalise input: accept dicts, Pydantic-like objects, or internal Candle
     def _to_candle(raw: Any) -> Candle:
@@ -776,10 +862,10 @@ def analyze_signal(
 
     # Run all detection modules
     htf  = detect_higher_timeframe_bias(bars)
-    liq  = detect_liquidity_sweep(bars, pip_size=pip_size)
+    liq  = detect_liquidity_sweep(bars, pip_size=pip_size, strong_wick_pips=_strong_wick_pips)
     ms   = detect_market_structure(bars, htf_bullish=htf.bullish)   # FIX #9
     fvg  = detect_fair_value_gap(bars, pip_size=pip_size, fvg_min_pips=fvg_min_pips)
-    news = check_news_risk(macro_events, at=at)
+    news = check_news_risk(macro_events, at=at, pair=pair)
     sess = detect_session(at=at)
 
     score = calculate_quality_score(htf, liq, ms, fvg, news, sess,
@@ -836,7 +922,8 @@ def analyze_signal(
                 invalidation = stop_loss
             else:
                 reason = _build_reason(news, liq, ms, fvg, score,
-                                       bull_votes, bear_votes, n_votes, rr_val, sess)
+                                       bull_votes, bear_votes, n_votes, rr_val, sess,
+                                       strong_wick_pips=_strong_wick_pips)
 
         elif bear_votes >= 3 and bear_votes > bull_votes:
             sl_level = liq.swept_level + _sl_buffer
@@ -852,13 +939,16 @@ def analyze_signal(
                 invalidation = stop_loss
             else:
                 reason = _build_reason(news, liq, ms, fvg, score,
-                                       bull_votes, bear_votes, n_votes, rr_val, sess)
+                                       bull_votes, bear_votes, n_votes, rr_val, sess,
+                                       strong_wick_pips=_strong_wick_pips)
         else:
             reason = _build_reason(news, liq, ms, fvg, score,
-                                   bull_votes, bear_votes, n_votes, sess=sess)
+                                   bull_votes, bear_votes, n_votes, sess=sess,
+                                   strong_wick_pips=_strong_wick_pips)
     else:
         reason = _build_reason(news, liq, ms, fvg, score,
-                               bull_votes, bear_votes, n_votes, sess=sess)
+                               bull_votes, bear_votes, n_votes, sess=sess,
+                               strong_wick_pips=_strong_wick_pips)
 
     # ── MyFXBook sentiment (non-blocking, supplementary) ──────────────────
     _sentiment: dict = {}

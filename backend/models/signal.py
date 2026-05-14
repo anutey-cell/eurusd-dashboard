@@ -140,7 +140,10 @@ class SignalAnalysisOutput(BaseModel):
     # Values: "sent" | "disabled" | "not_qualified" | "duplicate_skipped" | "failed"
     alert_status: str | None = None
 
+    # Operating mode — reflects the pair's current mode at the time of analysis
+    pair_mode: str | None = None   # "MONITOR_ONLY" | "PAPER_OBSERVATION" | "DEMO_ELIGIBLE" | "LIVE_READ_ONLY" | "DISABLED"
+
     # Learning / data-source transparency fields
-    data_source:        str  | None = None   # "live" | "synthetic"
+    data_source:        str  | None = None   # "live" | "tradingview" | "synthetic" | "stale" | "disabled"
     weights_used:       dict | None = None   # adaptive weights applied {htf, liq, ms, fvg, news, session}
     component_snapshot: str  | None = None   # JSON — which ICT gates were active (for DB learning)
