@@ -35,7 +35,7 @@ async function runAnalysis(macroEvents = [], pairCode = 'eurusd') {
   return res.json();
 }
 
-async function saveSignal(signal) {
+async function saveSignal(signal, pairLabel) {
   const res = await fetch(`${API_BASE}/api/v1/signal/confirm`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -155,7 +155,7 @@ export default function PaperTradePanel({ onConfirmed, selectedPair }) {
     setSaving(true);
     setError(null);
     try {
-      const saved = await saveSignal(result);
+      const saved = await saveSignal(result, pairLabel);
       setSaved(saved.data ?? saved);
       onConfirmed?.();      // tell Dashboard to refresh history
     } catch (e) {

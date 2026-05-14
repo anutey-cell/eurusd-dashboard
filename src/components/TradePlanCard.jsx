@@ -22,7 +22,9 @@ function useCountdown(targetIso) {
   return remaining;
 }
 
-function PriceRow({ label, price, pips, badge, badgeCls, pipsCls }) {
+function PriceRow({ label, price, pips, badge, badgeCls, pipsCls, decimals = 5 }) {
+  // Hide the row entirely when no price (e.g. WAIT state with no entry/SL/TP)
+  if (price == null) return null;
   return (
     <div className="flex items-center justify-between py-1.5 border-b border-[#1e2535] last:border-0">
       <div className="flex items-center gap-2">
@@ -30,10 +32,10 @@ function PriceRow({ label, price, pips, badge, badgeCls, pipsCls }) {
         <span className="text-xs text-gray-400">{label}</span>
       </div>
       <div className="flex items-center gap-3">
-        {pips !== undefined && (
+        {pips != null && (
           <span className={`text-xs font-mono ${pipsCls}`}>{pips > 0 ? '+' : ''}{pips} pips</span>
         )}
-        <span className="font-mono text-sm font-semibold text-white">{price.toFixed(5)}</span>
+        <span className="font-mono text-sm font-semibold text-white">{price.toFixed(decimals)}</span>
       </div>
     </div>
   );
@@ -45,6 +47,7 @@ export default function TradePlanCard({
   error           = null,
   isUsingFallback = false,
   tradePlan:      p = mockTradePlan,
+  decimals        = 5,
 }) {
   const countdown = useCountdown(p?.validity ?? mockTradePlan.validity);
 
@@ -65,34 +68,41 @@ export default function TradePlanCard({
         <SkeletonCard rows={8} />
       ) : (
         <div className="p-4 space-y-4">
-          {/* Entry / SL / TPs */}
+          {/* Entry / SL / TPs — rows auto-hide when price is null (WAIT state) */}
           <div className="bg-[#1e2535] rounded-lg p-3">
+            {p.entry == null && p.stopLoss == null && (
+              <p className="text-xs text-gray-500 py-2 text-center">
+                No active trade plan — signal is WAIT
+              </p>
+            )}
             <PriceRow
               label="Entry" price={p.entry}
               badge="ENTRY" badgeCls="bg-blue-500/20 text-blue-400 border border-blue-500/30"
+              decimals={decimals}
             />
             <PriceRow
-              label="Stop Loss" price={p.stopLoss} pips={-p.stopLossPips}
+              label="Stop Loss" price={p.stopLoss} pips={p.stopLossPips != null ? -p.stopLossPips : null}
               badge="SL" badgeCls="bg-red-500/20 text-red-400 border border-red-500/30"
-              pipsCls="text-red-400"
+              pipsCls="text-red-400" decimals={decimals}
             />
-            {p.targets.map(t => (
+            {(p.targets ?? []).map(t => (
               <PriceRow
                 key={t.label}
-                label={`${t.partial} close`} price={t.price} pips={t.pips}
+                label={`${t.partial}% close`} price={t.price} pips={t.pips}
                 badge={t.label} badgeCls="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-                pipsCls="text-emerald-400"
+                pipsCls="text-emerald-400" decimals={decimals}
               />
             ))}
           </div>
 
-          {/* Stats grid */}
+          {/* Stats grid — only shown when account management data is available */}
+          {p.riskPercent != null && (
           <div className="grid grid-cols-2 gap-2">
             {[
-              { label: 'Risk %',        value: `${p.riskPercent}%`,              icon: ShieldAlert, cls: 'text-amber-400' },
-              { label: 'Risk Amount',   value: `$${p.riskAmount}`,               icon: DollarSign,  cls: 'text-amber-400' },
-              { label: 'Position Size', value: `${p.positionSize} lots`,         icon: Target,      cls: 'text-blue-400'  },
-              { label: 'Account',       value: `$${p.accountSize.toLocaleString()}`, icon: DollarSign, cls: 'text-gray-400' },
+              { label: 'Risk %',        value: `${p.riskPercent}%`,                           icon: ShieldAlert, cls: 'text-amber-400' },
+              { label: 'Risk Amount',   value: `$${p.riskAmount}`,                            icon: DollarSign,  cls: 'text-amber-400' },
+              { label: 'Position Size', value: `${p.positionSize} lots`,                      icon: Target,      cls: 'text-blue-400'  },
+              { label: 'Account',       value: `$${(p.accountSize ?? 0).toLocaleString()}`,   icon: DollarSign,  cls: 'text-gray-400'  },
             ].map(item => {
               const Icon = item.icon;
               return (
@@ -106,8 +116,10 @@ export default function TradePlanCard({
               );
             })}
           </div>
+          )}
 
-          {/* R:R chips */}
+          {/* R:R chips — only when targets exist */}
+          {(p.targets ?? []).length > 0 && (
           <div>
             <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">Risk : Reward</div>
             <div className="flex gap-2">
@@ -119,6 +131,7 @@ export default function TradePlanCard({
               ))}
             </div>
           </div>
+          )}
 
           {/* Notes */}
           <div className="bg-[#1e2535] rounded-lg p-3">

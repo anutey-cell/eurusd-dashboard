@@ -24,11 +24,13 @@ export default function SignalCard({
   error           = null,
   isUsingFallback = false,
   currentSignal:  s = mockSignal,
+  pairLabel       = 'EUR/USD',
 }) {
   const cfg      = DIRECTION_CONFIG[s?.direction] ?? DIRECTION_CONFIG.NEUTRAL;
   const Icon     = cfg.icon;
   const timeStr  = s ? new Date(s.timestamp).toUTCString().slice(5, 22) + ' UTC' : '';
-  const avgScore = s ? Math.round(s.factors.reduce((a, f) => a + f.score, 0) / s.factors.length) : 0;
+  const factors  = s?.factors ?? [];
+  const avgScore = factors.length ? Math.round(factors.reduce((a, f) => a + f.score, 0) / factors.length) : 0;
 
   return (
     <div className="card flex flex-col">
@@ -52,7 +54,7 @@ export default function SignalCard({
               <Icon size={36} className={cfg.cls} />
               <div>
                 <div className={`text-2xl font-black tracking-wider ${cfg.cls}`}>{cfg.label}</div>
-                <div className="text-xs text-gray-500 mt-0.5">EUR/USD • {timeStr}</div>
+                <div className="text-xs text-gray-500 mt-0.5">{pairLabel} • {timeStr}</div>
               </div>
             </div>
             <div className="text-right">
@@ -83,7 +85,7 @@ export default function SignalCard({
           {/* Factors */}
           <div className="mx-4 mt-3 mb-4 space-y-1.5">
             <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">Factor Breakdown</div>
-            {s?.factors.map(f => (
+            {factors.map(f => (
               <div key={f.name} className="flex items-center justify-between gap-2">
                 <span className="text-xs text-gray-400 truncate flex-1">{f.name}</span>
                 <span className="text-[10px] text-gray-600 truncate max-w-[110px] text-right">{f.value}</span>

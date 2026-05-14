@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { RefreshCw, Clock, Shield } from 'lucide-react';
 
-import { getSignal, getMacroCalendar, getSignalHistory, getAnalytics } from '../services/api';
+import { getSignalForPair, getMacroCalendar, getSignalHistory, getAnalytics } from '../services/api';
 import {
   currentSignal  as mockSignal,
   tradePlan      as mockTradePlan,
@@ -29,7 +29,7 @@ import MT5Panel            from './MT5Panel';
 
 const PAIR_OPTIONS = [
   { code: 'eurusd', label: 'EUR/USD', symbol: 'FX:EURUSD',      decimals: 5 },
-  { code: 'xauusd', label: 'XAU/USD', symbol: 'OANDA:XAU_USD',  decimals: 2 },
+  { code: 'xauusd', label: 'XAU/USD', symbol: 'TVC:GOLD',       decimals: 2 },
 ];
 
 function PairSelector({ selected, onChange }) {
@@ -137,11 +137,22 @@ function useRefreshCountdown(ms) {
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
 export default function Dashboard({ selectedPair, onPairChange }) {
-  // Four API calls — signal + calendar auto-refresh every 60 s
-  const signal    = useDataSource(getSignal,        FALLBACKS.signal,    REFRESH_MS);
+  // Signal fetch is pair-aware — re-fires whenever selectedPair changes
+  const signal    = useDataSource(
+    () => getSignalForPair(selectedPair.code),
+    FALLBACKS.signal,
+    REFRESH_MS,
+  );
   const calendar  = useDataSource(getMacroCalendar, FALLBACKS.calendar,  REFRESH_MS);
   const history   = useDataSource(getSignalHistory, FALLBACKS.history,   null);
   const analytics = useDataSource(getAnalytics,     FALLBACKS.analytics, null);
+
+  // Re-fetch signal immediately when the active pair changes
+  // (useDataSource keeps fnRef current but won't auto-fire on prop change)
+  useEffect(() => {
+    signal.refetch();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPair.code]);
 
   // journalKey bumps each time a trade is confirmed → triggers PaperTradeJournal reload
   const [journalKey, setJournalKey] = useState(0);
@@ -214,19 +225,21 @@ export default function Dashboard({ selectedPair, onPairChange }) {
               error={signal.error}
               isUsingFallback={signal.isUsingFallback}
               currentSignal={signal.data?.currentSignal}
+              pairLabel={selectedPair.label}
             />
             <TradePlanCard
               loading={signal.loading}
               error={signal.error}
               isUsingFallback={signal.isUsingFallback}
               tradePlan={signal.data?.tradePlan}
+              decimals={selectedPair.decimals}
             />
           </div>
 
           {/* Center — chart stays frontend-only */}
           <div className="flex-1 min-w-0 flex flex-col gap-4">
             <div style={{ height: 540 }}>
-              <TradingViewWidget symbol={selectedPair.symbol} />
+              <TradingViewWidget key={selectedPair.symbol} symbol={selectedPair.symbol} />
             </div>
             <AnalyticsDashboard
               loading={analytics.loading}

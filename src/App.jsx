@@ -5,7 +5,7 @@ import Dashboard from './components/Dashboard';
 
 const PAIR_OPTIONS = [
   { code: 'eurusd', label: 'EUR/USD', symbol: 'FX:EURUSD',      decimals: 5 },
-  { code: 'xauusd', label: 'XAU/USD', symbol: 'OANDA:XAU_USD',  decimals: 2 },
+  { code: 'xauusd', label: 'XAU/USD', symbol: 'TVC:GOLD',       decimals: 2 },
 ];
 
 export default function App() {

@@ -66,6 +66,16 @@ export async function getSignal() {
   return adaptSignal(res);
 }
 
+/**
+ * Fetch live ICT engine output for a specific pair.
+ * Calls GET /signal/{pairCode} — pair-aware, returns live engine data
+ * shaped to match what SignalCard + TradePlanCard expect.
+ */
+export async function getSignalForPair(pairCode = 'eurusd') {
+  const res = await apiFetch(`/signal/${pairCode}`);
+  return adaptLiveSignal(res);
+}
+
 export async function getSignalHistory({ page = 1, pageSize = 20, direction, result } = {}) {
   const params = new URLSearchParams({ page, page_size: pageSize });
   if (direction) params.set('direction', direction);
@@ -253,6 +263,111 @@ function adaptAnalytics(res) {
   // Backend emits camelCase (alias_generator=to_camel) — pass through directly.
   // Unwrap the APIResponse envelope and return the data object as-is.
   return res.data;
+}
+
+/**
+ * Estimate individual component scores from the live engine model text.
+ * The GET /signal/{pair} response includes text descriptions but not raw scores,
+ * so we reconstruct approximate values for the SignalCard factor bars.
+ */
+function _estimateScores(model = {}, newsStatus = 'CLEAR') {
+  const m = model;
+
+  const htf = (!m.higherTimeframeBias || m.higherTimeframeBias.includes('Neutral')) ? 5
+    : (m.higherTimeframeBias.includes('HH/HL') || m.higherTimeframeBias.includes('LH/LL')) ? 15
+    : 8;
+
+  const liq = (!m.liquidity || m.liquidity.includes('No liquidity')) ? 0
+    : 20; // any confirmed sweep is full score (partial handled by engine gate)
+
+  const ms = m.structure?.includes('BOS confirmed') ? 20
+    : m.structure?.includes('CHoCH confirmed') ? 15
+    : 0;
+
+  const fvg = (!m.fvg || m.fvg.includes('No Fair Value')) ? 0
+    : m.fvg.includes('price in zone') ? 20
+    : m.fvg.includes('approaching')   ? 15
+    : 10; // detected but not retested
+
+  const news    = newsStatus === 'CLEAR' ? 15 : 0;
+
+  const session = (!m.session) ? 0
+    : (m.session.includes('kill zone') || m.session.includes('Overlap')) ? 10
+    : (m.session.includes('London') || m.session.includes('New York'))   ? 5
+    : 0;
+
+  return { htf, liq, ms, fvg, news, session };
+}
+
+/**
+ * Convert live ICT engine response (GET /signal/{pair}) into the shape
+ * expected by SignalCard (currentSignal) and TradePlanCard (tradePlan).
+ */
+function adaptLiveSignal(res) {
+  const d = res?.data ?? {};
+  const m = d.model ?? {};
+
+  const dirMap = { BUY: 'BUY', SELL: 'SELL', WAIT: 'NEUTRAL' };
+  const direction = dirMap[d.signal] ?? 'NEUTRAL';
+  const scores    = _estimateScores(m, d.newsStatus);
+
+  const factors = [
+    { name: 'HTF Bias',         value: m.higherTimeframeBias ?? '—', score: scores.htf,     positive: scores.htf >= 8  },
+    { name: 'Liquidity Sweep',  value: m.liquidity           ?? '—', score: scores.liq,     positive: scores.liq  > 0  },
+    { name: 'Market Structure', value: m.structure           ?? '—', score: scores.ms,      positive: scores.ms   > 0  },
+    { name: 'Fair Value Gap',   value: m.fvg                 ?? '—', score: scores.fvg,     positive: scores.fvg  > 0  },
+    { name: 'News Risk',        value: d.newsStatus          ?? '—', score: scores.news,    positive: scores.news > 0   },
+    { name: 'Session Timing',   value: m.session             ?? '—', score: scores.session, positive: scores.session > 0 },
+  ];
+
+  // Validity: 30 min from signal generation
+  const validity = d.generatedAt
+    ? new Date(new Date(d.generatedAt).getTime() + 30 * 60_000).toISOString()
+    : new Date(Date.now() + 30 * 60_000).toISOString();
+
+  const targets = d.takeProfit != null
+    ? [{ label: 'TP1', price: d.takeProfit, rr: d.rr ?? 0, pips: d.targetPips ?? 0, partial: 100 }]
+    : [];
+
+  const sessionLabel = m.session
+    ? m.session.replace(' session', '').replace(' kill zone', ' KZ')
+    : 'Unknown';
+
+  return {
+    currentSignal: {
+      direction,
+      strength:    d.qualityScore ?? 0,
+      confidence:  d.qualityScore ?? 0,
+      timestamp:   d.generatedAt ?? d.generated_at ?? new Date().toISOString(),
+      session:     sessionLabel,
+      timeframe:   'H4',
+      price:       d.entry   ?? null,
+      change:      null,
+      changePct:   null,
+      factors,
+      // pass-throughs used by other components
+      signal:      d.signal,
+      reason:      d.reason,
+      pair:        d.pair,
+      displayPair: d.displayPair,
+      newsStatus:  d.newsStatus,
+      alertStatus: d.alertStatus,
+    },
+    tradePlan: {
+      entry:        d.entry,
+      stopLoss:     d.stopLoss,
+      stopLossPips: d.riskPips,
+      targets,
+      riskPercent:  null,
+      positionSize: null,
+      accountSize:  null,
+      riskAmount:   null,
+      validity,
+      notes: d.signal === 'WAIT'
+        ? (d.reason ?? 'Waiting for signal conditions to align.')
+        : `${d.displayPair ?? ''} ${d.signal} — ${d.reason ?? 'All gates passed.'}`,
+    },
+  };
 }
 
 function adaptCalendar(res) {
