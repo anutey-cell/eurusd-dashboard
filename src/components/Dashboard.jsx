@@ -29,6 +29,7 @@ import InstitutionalScanPanel from './InstitutionalScanPanel';
 import ScanHistoryPanel       from './ScanHistoryPanel';
 import XauusdBacktestPanel    from './XauusdBacktestPanel';
 import PaperObservationPanel  from './PaperObservationPanel';
+import HighProbabilityPanel   from './HighProbabilityPanel';
 
 // ─── Instrument ───────────────────────────────────────────────────────────────
 // XAU/USD is the only supported instrument.
@@ -281,7 +282,10 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
           trades={history.data?.trades}
         />
 
-        {/* Row: paper observation tracker (PAPER_OBSERVATION_ONLY workflow) */}
+        {/* Row: High-Probability Predictor (decision support — manual execution) */}
+        <HighProbabilityPanel />
+
+        {/* Row: paper observation tracker (dual-engine swing + trend_pullback) */}
         <PaperObservationPanel />
 
         {/* Row: strict XAU/USD backtest (primary) */}

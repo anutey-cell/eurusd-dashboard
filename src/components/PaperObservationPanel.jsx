@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import {
   getPaperObservations, getPaperObservationStats, resolvePaperObservations,
+  compareEngines, runDualEngines,
 } from '../services/api';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -98,10 +99,13 @@ function ResultChip({ result }) {
 
 export default function PaperObservationPanel() {
   const [stats, setStats] = useState(null);
+  const [comparison, setComparison] = useState(null);
   const [list,  setList]  = useState([]);
   const [filter, setFilter] = useState('all');
+  const [engineFilter, setEngineFilter] = useState('all');
   const [loading, setLoading] = useState(false);
   const [resolving, setResolving] = useState(false);
+  const [running, setRunning] = useState(false);
   const [error,   setError]   = useState(null);
   const [showList, setShowList] = useState(false);
 
@@ -109,18 +113,23 @@ export default function PaperObservationPanel() {
     setLoading(true);
     setError(null);
     try {
-      const [s, lst] = await Promise.all([
+      const [s, cmp, lst] = await Promise.all([
         getPaperObservationStats(),
-        getPaperObservations({ limit: 50, resolved: filter }),
+        compareEngines('swing', 'trend_pullback'),
+        getPaperObservations({
+          limit: 50, resolved: filter,
+          ...(engineFilter !== 'all' ? { engine_id: engineFilter } : {}),
+        }),
       ]);
       setStats(s);
+      setComparison(cmp);
       setList(lst.observations ?? []);
     } catch (e) {
       setError(e.message ?? 'Failed to load observations');
     } finally {
       setLoading(false);
     }
-  }, [filter]);
+  }, [filter, engineFilter]);
 
   useEffect(() => {
     refresh();
@@ -138,6 +147,19 @@ export default function PaperObservationPanel() {
       setError(e.message ?? 'Resolve failed');
     } finally {
       setResolving(false);
+    }
+  }
+
+  async function handleRunDual() {
+    setRunning(true);
+    setError(null);
+    try {
+      await runDualEngines();
+      await refresh();
+    } catch (e) {
+      setError(e.message ?? 'Dual-engine run failed');
+    } finally {
+      setRunning(false);
     }
   }
 
@@ -160,6 +182,17 @@ export default function PaperObservationPanel() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={handleRunDual}
+            disabled={running}
+            className="text-[10px] bg-purple-700 hover:bg-purple-600 text-white rounded px-2 py-1 disabled:opacity-50 flex items-center gap-1"
+            title="Run BOTH swing + trend_pullback engines now, log qualifying signals"
+          >
+            {running
+              ? <><RefreshCw size={10} className="animate-spin" /> Running…</>
+              : <>Run dual engines</>
+            }
+          </button>
           <button
             onClick={handleResolve}
             disabled={resolving}
@@ -219,6 +252,76 @@ export default function PaperObservationPanel() {
           )}
         </div>
 
+        {/* Dual-engine comparison panel */}
+        {comparison && (
+          <div className="bg-[#131c27] border border-[#263044] rounded-xl p-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-medium text-slate-300 flex items-center gap-1.5">
+                <Trophy size={11} className="text-amber-400" /> Dual-Engine Comparison
+              </span>
+              {comparison.leader && (
+                <span className="text-[10px] text-emerald-400 font-mono">
+                  Leader: {comparison.leader}  (Δ {comparison.leaderMargin?.toFixed(2)}R)
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {['statsA', 'statsB'].map((key, idx) => {
+                const s = comparison[key] ?? {};
+                const eng = idx === 0 ? comparison.engineA : comparison.engineB;
+                const isLeader = comparison.leader === eng;
+                return (
+                  <div key={eng} className={`rounded-lg p-2 space-y-1 border ${
+                    isLeader ? 'border-emerald-700/40 bg-emerald-900/15'
+                              : 'border-[#1e2535] bg-[#0a0f17]'
+                  }`}>
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-300">
+                        {eng.replace('_', ' ')}
+                      </span>
+                      {isLeader && (
+                        <span className="text-[9px] text-emerald-400">★ leading</span>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-3 gap-1">
+                      <div>
+                        <div className="text-[9px] text-gray-500 uppercase">Resolved</div>
+                        <div className="font-mono text-xs">{s.resolved ?? 0}</div>
+                      </div>
+                      <div>
+                        <div className="text-[9px] text-gray-500 uppercase">WR</div>
+                        <div className={`font-mono text-xs ${(s.winRate ?? 0) >= 40 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                          {s.winRate ?? 0}%
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[9px] text-gray-500 uppercase">Exp R</div>
+                        <div className={`font-mono text-xs ${(s.expectancyR ?? 0) > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {(s.expectancyR ?? 0) > 0 ? '+' : ''}{s.expectancyR ?? 0}R
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[9px] text-gray-500 uppercase">PF</div>
+                        <div className="font-mono text-xs">
+                          {s.profitFactor != null ? s.profitFactor.toFixed(2) : 'N/A'}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[9px] text-gray-500 uppercase">Pending</div>
+                        <div className="font-mono text-xs text-amber-400">{s.pending ?? 0}</div>
+                      </div>
+                      <div>
+                        <div className="text-[9px] text-gray-500 uppercase">Progress</div>
+                        <div className="font-mono text-xs">{s.progressPercent ?? 0}%</div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Stats grid */}
         <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
           <Stat label="Logged"   value={stats?.total ?? 0} />
@@ -259,6 +362,18 @@ export default function PaperObservationPanel() {
                     {f}
                   </button>
                 ))}
+                <span className="text-gray-700 mx-1">|</span>
+                {['all', 'swing', 'trend_pullback'].map(e => (
+                  <button
+                    key={e}
+                    onClick={(ev) => { ev.stopPropagation(); setEngineFilter(e); }}
+                    className={`text-[9px] px-1.5 py-0.5 rounded ${
+                      engineFilter === e ? 'bg-purple-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {e === 'all' ? 'both' : e.replace('_', ' ')}
+                  </button>
+                ))}
               </div>
             </button>
 
@@ -267,7 +382,7 @@ export default function PaperObservationPanel() {
                 <table className="w-full text-[10px]">
                   <thead className="sticky top-0 bg-[#131c27]">
                     <tr className="text-gray-500 uppercase tracking-wider">
-                      {['#', 'Observed', 'Side', 'Entry', 'SL', 'TP', 'RR', 'Score', 'Setup', 'Session', 'Result', 'R', 'Pts'].map(h => (
+                      {['#', 'Engine', 'Observed', 'Side', 'Entry', 'SL', 'TP', 'RR', 'Score', 'Setup', 'Session', 'Result', 'R', 'Pts'].map(h => (
                         <th key={h} className="text-left py-1 px-1.5 border-b border-[#263044] whitespace-nowrap">{h}</th>
                       ))}
                     </tr>
@@ -276,6 +391,10 @@ export default function PaperObservationPanel() {
                     {list.map(o => (
                       <tr key={o.id} className="border-b border-[#1a2035] hover:bg-[#161b27]">
                         <td className="py-1 px-1.5 font-mono text-gray-600">{o.id}</td>
+                        <td className={`py-1 px-1.5 text-[9px] font-bold uppercase ${
+                          o.engineId === 'swing' ? 'text-blue-400' :
+                          o.engineId === 'trend_pullback' ? 'text-purple-400' : 'text-gray-500'
+                        }`}>{o.engineId || 'swing'}</td>
                         <td className="py-1 px-1.5 font-mono text-gray-400 whitespace-nowrap">
                           {o.observedAt?.slice(0, 16).replace('T', ' ')}
                         </td>

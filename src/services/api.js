@@ -285,6 +285,26 @@ export async function deletePaperObservation(id) {
   return res.data ?? res;
 }
 
+/** GET /observations/compare?engine_a=swing&engine_b=trend_pullback */
+export async function compareEngines(engineA = 'swing', engineB = 'trend_pullback') {
+  const res = await apiFetch(`/observations/compare?engine_a=${engineA}&engine_b=${engineB}`);
+  return res.data ?? res;
+}
+
+/** POST /observations/run-dual-engines — fire both engines, log qualifying signals */
+export async function runDualEngines() {
+  const res = await apiFetch('/observations/run-dual-engines', { method: 'POST' });
+  return res.data ?? res;
+}
+
+// ─── High-Probability Prediction API ───────────────────────────────────────────
+
+/** GET /prediction/xauusd — 5-layer confluence prediction with factor breakdown */
+export async function getHighProbabilityPrediction() {
+  const res = await apiFetch('/prediction/xauusd');
+  return res.data ?? res;
+}
+
 // ─── MT5 API ──────────────────────────────────────────────────────────────────
 
 export async function getMT5Status() {

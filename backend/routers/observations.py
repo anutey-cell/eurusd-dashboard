@@ -44,6 +44,7 @@ def list_observations(
     request: Request,
     limit:    int = Query(default=50, ge=1, le=500),
     resolved: str = Query(default="all", description="all | resolved | pending"),
+    engine_id: str | None = Query(default=None, description="Filter by engine: swing | trend_pullback"),
     db:       Session = Depends(get_db),
 ) -> APIResponse[dict]:
     q = db.query(PaperObservation).order_by(PaperObservation.observed_at.desc())
@@ -51,11 +52,14 @@ def list_observations(
         q = q.filter(PaperObservation.result.isnot(None))
     elif resolved == "pending":
         q = q.filter(PaperObservation.result.is_(None))
+    if engine_id:
+        q = q.filter(PaperObservation.engine_id == engine_id)
 
     rows = q.limit(limit).all()
     return APIResponse(data={
         "total":        len(rows),
         "filter":       resolved,
+        "engineId":     engine_id,
         "observations": [serialise_observation(r) for r in rows],
     })
 
@@ -68,9 +72,64 @@ def list_observations(
 @limiter.limit("30/minute")
 def observation_stats(
     request: Request,
+    engine_id: str | None = Query(default=None, description="Filter by engine: swing | trend_pullback"),
     db: Session = Depends(get_db),
 ) -> APIResponse[dict]:
-    return APIResponse(data=get_observation_stats(db))
+    return APIResponse(data=get_observation_stats(db, engine_id=engine_id))
+
+
+@router.get(
+    "/compare",
+    response_model=APIResponse[dict],
+    summary="Side-by-side comparison of two engines' paper observations",
+)
+@limiter.limit("30/minute")
+def compare_engines(
+    request: Request,
+    engine_a: str = Query(default="swing"),
+    engine_b: str = Query(default="trend_pullback"),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    stats_a = get_observation_stats(db, engine_id=engine_a)
+    stats_b = get_observation_stats(db, engine_id=engine_b)
+    # Determine which engine is currently ahead
+    leader = None
+    if stats_a["resolved"] >= 5 and stats_b["resolved"] >= 5:
+        if stats_a["expectancyR"] > stats_b["expectancyR"]:
+            leader = engine_a
+        elif stats_b["expectancyR"] > stats_a["expectancyR"]:
+            leader = engine_b
+    return APIResponse(data={
+        "engineA":      engine_a,
+        "engineB":      engine_b,
+        "statsA":       stats_a,
+        "statsB":       stats_b,
+        "leader":       leader,
+        "leaderMargin": abs(stats_a["expectancyR"] - stats_b["expectancyR"]),
+    })
+
+
+@router.post(
+    "/run-dual-engines",
+    response_model=APIResponse[dict],
+    summary="Trigger dual-engine paper observation logging (swing + trend_pullback)",
+    description=(
+        "Runs both the swing-H1 ICT scanner AND the trend-pullback H1 "
+        "strategy against current data. Logs any qualifying signals to "
+        "paper_observations tagged with their engine_id. Rate-limited to 6/min."
+    ),
+)
+@limiter.limit("6/minute")
+def run_dual_engines_endpoint(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from services.dual_engine_runner import run_dual_engines
+    try:
+        return APIResponse(data=run_dual_engines(db))
+    except Exception as exc:
+        log.exception("[observations] dual engine run failed")
+        raise HTTPException(status_code=502, detail=f"Dual engine error: {exc}") from exc
 
 
 @router.post(

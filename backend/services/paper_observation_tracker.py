@@ -51,7 +51,7 @@ MAX_RESOLUTION_BARS = 96     # 96 H4 bars = 16 days
 # Logging
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def log_observation(db: Session, scan_result: dict) -> Optional[int]:
+def log_observation(db: Session, scan_result: dict, engine_id: str = "swing") -> Optional[int]:
     """
     Persist a scanner SIGNAL_READY state as a paper observation.
     Returns the new row id, or None if duplicate / not applicable.
@@ -86,6 +86,7 @@ def log_observation(db: Session, scan_result: dict) -> Optional[int]:
     row = PaperObservation(
         instrument=scan_result.get("instrument", "XAU/USD"),
         timeframe="H4",
+        engine_id=engine_id,
         signal=signal,
         entry=float(plan["entry"]),
         stop_loss=float(plan["stopLoss"]),
@@ -262,15 +263,17 @@ def resolve_pending(db: Session, max_observations: int = 100) -> dict:
 CERTIFICATION_THRESHOLD = 30      # n required before re-validation can recommend READY
 
 
-def get_observation_stats(db: Session) -> dict:
+def get_observation_stats(db: Session, engine_id: str | None = None) -> dict:
     """
-    Aggregate stats across all paper observations.
+    Aggregate stats across all paper observations, optionally filtered
+    by engine_id (e.g. "swing" or "trend_pullback").
     Reports running WR, expectancy R, profit factor, and progress
     toward the n>=30 certification threshold.
     """
-    all_obs = db.query(PaperObservation).order_by(
-        PaperObservation.observed_at.desc()
-    ).all()
+    q = db.query(PaperObservation).order_by(PaperObservation.observed_at.desc())
+    if engine_id:
+        q = q.filter(PaperObservation.engine_id == engine_id)
+    all_obs = q.all()
 
     total = len(all_obs)
     resolved = [o for o in all_obs if o.result in ("WIN", "LOSS", "EXPIRED")]
@@ -361,6 +364,7 @@ def serialise_observation(obs: PaperObservation) -> dict:
         "observedAt":      obs.observed_at.isoformat() if obs.observed_at else None,
         "instrument":      obs.instrument,
         "timeframe":       obs.timeframe,
+        "engineId":        obs.engine_id,
         "signal":          obs.signal,
         "entry":           obs.entry,
         "stopLoss":        obs.stop_loss,

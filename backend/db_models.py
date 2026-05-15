@@ -243,6 +243,7 @@ class PaperObservation(Base):
     observed_at     = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
     instrument      = Column(String(16), nullable=False, default="XAU/USD")
     timeframe       = Column(String(8),  nullable=False, default="H4")
+    engine_id       = Column(String(32), nullable=False, default="swing", index=True)   # swing | trend_pullback | ...
 
     # Trade plan at the moment of observation
     signal          = Column(String(8),  nullable=False)   # BUY | SELL

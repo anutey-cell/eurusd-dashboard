@@ -18,7 +18,7 @@ import db_models  # registers ORM classes with Base.metadata
 from logging_config import setup_logging
 from middleware import RequestLoggingMiddleware, AuthMiddleware
 from rate_limit import limiter
-from routers import health, candles, calendar, signal, analytics, backtest, execution, mt5 as mt5_router, telegram as telegram_router, engine as engine_router, readiness as readiness_router, risk as risk_router, scan as scan_router, observations as observations_router
+from routers import health, candles, calendar, signal, analytics, backtest, execution, mt5 as mt5_router, telegram as telegram_router, engine as engine_router, readiness as readiness_router, risk as risk_router, scan as scan_router, observations as observations_router, prediction as prediction_router
 
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
@@ -29,6 +29,28 @@ async def lifespan(app: FastAPI):
     db_models.Base.metadata.create_all(bind=engine)
     import logging
     log = logging.getLogger(__name__)
+    # ── Inline SQLite migrations (idempotent) ─────────────────────────────────
+    try:
+        from sqlalchemy import text
+        with engine.begin() as _conn:
+            # paper_observations.engine_id (Phase 3 — dual-engine tagging)
+            try:
+                _conn.execute(text(
+                    'ALTER TABLE paper_observations '
+                    'ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT "swing"'
+                ))
+                log.info("Migration: added paper_observations.engine_id column")
+            except Exception:
+                pass    # already present
+            try:
+                _conn.execute(text(
+                    'CREATE INDEX IF NOT EXISTS ix_paper_observations_engine_id '
+                    'ON paper_observations(engine_id)'
+                ))
+            except Exception:
+                pass
+    except Exception as _mig_exc:
+        log.warning("Inline migrations skipped: %s", _mig_exc)
     log.info(
         "Server started data_mode=%s fx_provider=%s",
         settings.data_mode, settings.active_fx_provider,
@@ -153,6 +175,7 @@ app.include_router(readiness_router.router, prefix=prefix)
 app.include_router(risk_router.router,      prefix=prefix)
 app.include_router(scan_router.router,      prefix=prefix)
 app.include_router(observations_router.router, prefix=prefix)
+app.include_router(prediction_router.router,   prefix=prefix)
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────
