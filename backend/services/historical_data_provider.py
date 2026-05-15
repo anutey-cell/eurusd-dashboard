@@ -167,29 +167,47 @@ def import_csv(
             if len(errors) < 20:    # cap error list length
                 errors.append(f"Row {row_idx}: {e}")
 
-    # Bulk insert with per-record fallback on integrity errors (DB duplicates)
+    # Bulk insert — use INSERT OR IGNORE on SQLite to skip duplicates
+    # at the DB layer without per-row exception fallback (much faster).
     if new_records:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        from sqlalchemy import insert as generic_insert
+
+        dialect = db.bind.dialect.name if db.bind else "sqlite"
+
+        # Build dict rows for bulk insert
+        rows = [
+            {
+                "instrument":  r.instrument,
+                "timeframe":   r.timeframe,
+                "candle_time": r.candle_time,
+                "open": r.open, "high": r.high, "low": r.low, "close": r.close,
+                "volume": r.volume,
+                "source": r.source,
+            }
+            for r in new_records
+        ]
+
+        # Chunk to keep parameter-count below SQLite's compile limit
+        chunk_size = 500
         try:
-            db.bulk_save_objects(new_records)
+            for i in range(0, len(rows), chunk_size):
+                chunk = rows[i:i + chunk_size]
+                if dialect == "sqlite":
+                    stmt = sqlite_insert(HistoricalCandle).values(chunk).prefix_with("OR IGNORE")
+                else:
+                    stmt = generic_insert(HistoricalCandle).values(chunk)
+                result = db.execute(stmt)
+                # rowcount reflects rows actually inserted (excludes IGNOREd)
+                inserted_chunk = result.rowcount if result.rowcount is not None else len(chunk)
+                duplicates += (len(chunk) - max(0, inserted_chunk))
             db.commit()
-        except IntegrityError:
-            # Some rows already exist in DB — fall back to per-row insert
+            imported = max(0, len(rows) - duplicates)
+        except Exception as e:
             db.rollback()
+            invalid += len(rows)
+            errors.append(f"Bulk insert failed: {e}")
             imported = 0
-            duplicates = 0
-            for r in new_records:
-                try:
-                    db.add(r)
-                    db.commit()
-                    imported += 1
-                except IntegrityError:
-                    db.rollback()
-                    duplicates += 1
-                except Exception as e:
-                    db.rollback()
-                    invalid += 1
-                    if len(errors) < 20:
-                        errors.append(f"Insert error: {e}")
 
     log.info(
         "[hist] CSV import complete instrument=%s timeframe=%s imported=%d "

@@ -247,7 +247,17 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
     signal        = engine_result.signal        if engine_result else "WAIT"
     quality_score = engine_result.quality_score if engine_result else 0
     # Engine premium-gate descriptions (None when premium gates not run)
-    engine_model = getattr(engine_result, "model", {}) if engine_result else {}
+    # engine_result.model is a SignalModelDetail (Pydantic) — convert to dict
+    if engine_result and getattr(engine_result, "model", None) is not None:
+        em = engine_result.model
+        if hasattr(em, "model_dump"):
+            engine_model = em.model_dump(by_alias=True)
+        elif isinstance(em, dict):
+            engine_model = em
+        else:
+            engine_model = {}
+    else:
+        engine_model = {}
 
     # ── 8. Institutional bias (multi-TF majority vote) ───────────────────────
     inst_bias, bias_conf = _institutional_bias(d1_htf, h4_htf, h1_htf, h4_liq, h4_ms)
