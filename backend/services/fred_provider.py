@@ -31,11 +31,22 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-FRED_API_KEY = os.getenv("FRED_API_KEY", "").strip()
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 CACHE_TTL = 3600   # 1 hour — daily data, no need to hammer
 
 REQUEST_TIMEOUT = 10
+
+
+def _get_api_key() -> str:
+    """Read FRED_API_KEY at call time (not import time) so .env loads first."""
+    try:
+        from config import settings
+        key = getattr(settings, "fred_api_key", "") or ""
+        if key:
+            return key.strip()
+    except Exception:
+        pass
+    return os.getenv("FRED_API_KEY", "").strip()
 
 # Series IDs of interest
 SERIES = {
@@ -62,7 +73,8 @@ _cache: dict[str, _CacheEntry] = {}
 
 def _fetch_series(series_id: str, limit: int = 5) -> Optional[_CacheEntry]:
     """Pull recent observations for a FRED series and return cached entry."""
-    if not FRED_API_KEY:
+    api_key = _get_api_key()
+    if not api_key:
         return None
     now = time.time()
     cached = _cache.get(series_id)
@@ -72,7 +84,7 @@ def _fetch_series(series_id: str, limit: int = 5) -> Optional[_CacheEntry]:
     try:
         resp = httpx.get(BASE_URL, params={
             "series_id":          series_id,
-            "api_key":            FRED_API_KEY,
+            "api_key":            api_key,
             "file_type":          "json",
             "sort_order":         "desc",      # newest first
             "limit":              limit,
@@ -132,7 +144,7 @@ def get_yields_context() -> dict:
         "yieldsTrend":    "unknown",
         "goldImpact":     "neutral",
     }
-    if not FRED_API_KEY:
+    if not _get_api_key():
         out["error"] = "FRED_API_KEY not configured — set it in .env to enable real yields"
         return out
 
@@ -176,7 +188,7 @@ def get_yields_context() -> dict:
 def fred_status() -> dict:
     """Health check for the FRED integration."""
     return {
-        "enabled":      bool(FRED_API_KEY),
+        "enabled":      bool(_get_api_key()),
         "cachedSeries": list(_cache.keys()),
         "cacheAgeS":    {sid: round(time.time() - e.fetched_at) for sid, e in _cache.items()},
     }
