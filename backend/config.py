@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────────
     database_url: str = "sqlite:///./xauusd_signals.db"
 
+    # ── Macro data feeds (Tier 3 — fundamental confluence layers) ────────────
+    fred_api_key:        str = ""    # https://fred.stlouisfed.org/docs/api/api_key.html
+    myfxbook_enabled:    bool = False
+    myfxbook_email:      str = ""
+    myfxbook_password:   str = ""
+
     # ── Backtesting ───────────────────────────────────────────────────────────
     # Applied at entry to simulate real execution costs.
     backtest_spread_pips: float   = 1.0

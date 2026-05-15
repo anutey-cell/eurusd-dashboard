@@ -261,6 +261,47 @@ def backfill_from_backtest(
     })
 
 
+@router.get(
+    "/equity-curve",
+    response_model=APIResponse[dict],
+    summary="Compute paper equity curve for a given engine",
+    description=(
+        "Walks resolved paper observations chronologically and produces "
+        "the running equity curve with peak / drawdown at each point. "
+        "Used by the dashboard equity chart."
+    ),
+)
+@limiter.limit("30/minute")
+def equity_curve(
+    request: Request,
+    engine_id:     str   = Query(default="swing"),
+    initial_equity: float = Query(default=10000.0, gt=0),
+    risk_percent:  float = Query(default=0.25, gt=0, le=5),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from services.equity_tracker import compute_equity_curve
+    return APIResponse(data=compute_equity_curve(
+        db, engine_id=engine_id,
+        initial_equity=initial_equity,
+        risk_percent=risk_percent,
+    ))
+
+
+@router.post(
+    "/check-drawdown",
+    response_model=APIResponse[dict],
+    summary="Check drawdown for an engine and fire Telegram alert if breached",
+)
+@limiter.limit("10/minute")
+def check_drawdown(
+    request: Request,
+    engine_id: str = Query(default="swing"),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from services.equity_tracker import check_drawdown_alert
+    return APIResponse(data=check_drawdown_alert(db, engine_id=engine_id))
+
+
 @router.delete(
     "/{obs_id}",
     response_model=APIResponse[dict],

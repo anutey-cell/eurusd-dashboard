@@ -297,6 +297,20 @@ export async function runDualEngines() {
   return res.data ?? res;
 }
 
+/** GET /observations/equity-curve — paper equity curve for a given engine */
+export async function getEquityCurve(engineId = 'swing', initialEquity = 10000, riskPercent = 0.25) {
+  const res = await apiFetch(
+    `/observations/equity-curve?engine_id=${engineId}&initial_equity=${initialEquity}&risk_percent=${riskPercent}`
+  );
+  return res.data ?? res;
+}
+
+/** POST /observations/check-drawdown — fire Telegram alert if drawdown exceeded */
+export async function checkDrawdown(engineId = 'swing') {
+  const res = await apiFetch(`/observations/check-drawdown?engine_id=${engineId}`, { method: 'POST' });
+  return res.data ?? res;
+}
+
 // ─── High-Probability Prediction API ───────────────────────────────────────────
 
 /** GET /prediction/xauusd — 5-layer confluence prediction with factor breakdown */

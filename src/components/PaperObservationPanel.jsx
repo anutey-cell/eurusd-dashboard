@@ -14,13 +14,102 @@
  */
 import { useEffect, useState, useCallback } from 'react';
 import {
+  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  ReferenceLine, Line, ComposedChart,
+} from 'recharts';
+import {
   Eye, RefreshCw, CheckCircle, XCircle, Clock, Trophy,
   AlertTriangle, TrendingUp, TrendingDown, Minus, ChevronDown, ChevronUp,
+  TrendingUp as DollarUp,
 } from 'lucide-react';
 import {
   getPaperObservations, getPaperObservationStats, resolvePaperObservations,
-  compareEngines, runDualEngines,
+  compareEngines, runDualEngines, getEquityCurve, checkDrawdown,
 } from '../services/api';
+
+// ── Equity Curve Component ────────────────────────────────────────────────────
+
+function EquityCurveCard({ engineId, color = '#3b82f6' }) {
+  const [curve, setCurve] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await getEquityCurve(engineId, 10000, 0.25);
+      setCurve(data);
+    } catch { /* ignore */ }
+    setLoading(false);
+  }, [engineId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  if (!curve || curve.totalTrades === 0) {
+    return (
+      <div className="bg-[#0a0f17] border border-[#1e2535] rounded-lg p-3 text-center text-[10px] text-gray-600">
+        No resolved observations for <span className="font-mono">{engineId}</span> yet
+      </div>
+    );
+  }
+
+  const positive = curve.finalEquity >= curve.initialEquity;
+  const lineColor = positive ? '#10b981' : '#ef4444';
+
+  return (
+    <div className="bg-[#0a0f17] border border-[#1e2535] rounded-lg p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] uppercase tracking-widest font-semibold flex items-center gap-1.5"
+              style={{ color }}>
+          <DollarUp size={11} /> {engineId} Equity Curve
+        </span>
+        <span className={`text-[10px] font-mono ${positive ? 'text-emerald-400' : 'text-red-400'}`}>
+          ${curve.finalEquity.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+          {' '}({curve.netReturnPct > 0 ? '+' : ''}{curve.netReturnPct}%)
+        </span>
+      </div>
+      <ResponsiveContainer width="100%" height={140}>
+        <ComposedChart data={curve.points} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
+          <defs>
+            <linearGradient id={`eq-${engineId}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor={lineColor} stopOpacity={0.35} />
+              <stop offset="95%" stopColor={lineColor} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="#1e2535" />
+          <XAxis dataKey="observationId" tick={{ fill: '#6b7280', fontSize: 9 }} />
+          <YAxis yAxisId="eq" tick={{ fill: '#6b7280', fontSize: 9 }} />
+          <YAxis yAxisId="dd" orientation="right" tick={{ fill: '#9ca3af', fontSize: 9 }} unit="%" domain={[0, 'dataMax']} reversed />
+          <Tooltip contentStyle={{ background: '#1a2035', border: '1px solid #263044', fontSize: 11 }} />
+          <ReferenceLine yAxisId="eq" y={curve.initialEquity} stroke="#475569" strokeDasharray="4 2" />
+          <Area yAxisId="eq" type="monotone" dataKey="equity"
+                stroke={lineColor} fill={`url(#eq-${engineId})`} strokeWidth={1.5} dot={false} name="Equity" />
+          <Line yAxisId="dd" type="monotone" dataKey="drawdownPct"
+                stroke="#f59e0b" strokeWidth={1} dot={false} name="Drawdown %" />
+        </ComposedChart>
+      </ResponsiveContainer>
+      <div className="grid grid-cols-4 gap-1 text-[9px]">
+        <div>
+          <div className="text-gray-500 uppercase">Peak</div>
+          <div className="font-mono">${curve.peakEquity.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+        </div>
+        <div>
+          <div className="text-gray-500 uppercase">Max DD</div>
+          <div className={`font-mono ${curve.maxDrawdownPct > 10 ? 'text-red-400' : 'text-amber-400'}`}>
+            {curve.maxDrawdownPct}%
+          </div>
+        </div>
+        <div>
+          <div className="text-gray-500 uppercase">Current DD</div>
+          <div className="font-mono">{curve.currentDrawdownPct}%</div>
+        </div>
+        <div>
+          <div className="text-gray-500 uppercase">Trades</div>
+          <div className="font-mono">{curve.totalTrades}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -321,6 +410,12 @@ export default function PaperObservationPanel() {
             </div>
           </div>
         )}
+
+        {/* Equity curves — side by side */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+          <EquityCurveCard engineId="swing"          color="#3b82f6" />
+          <EquityCurveCard engineId="trend_pullback" color="#a78bfa" />
+        </div>
 
         {/* Stats grid */}
         <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">

@@ -35,11 +35,13 @@ log = logging.getLogger(__name__)
 
 # Layer weights (sum = 100)
 LAYER_WEIGHTS = {
-    "technical":   40,      # primary signal — biggest contributor
-    "fundamental": 20,      # macro backdrop
-    "news":        15,      # event risk avoidance
-    "volatility":  15,      # vol regime alignment
-    "sentiment":    10,     # contrarian retail positioning
+    "technical":   35,      # primary signal — biggest contributor
+    "fundamental": 15,      # DXY-based macro backdrop
+    "yields":      10,      # FRED real yields (strongest gold inverse)
+    "cot":          5,      # CFTC commercial/non-commercial positioning
+    "news":        12,      # event risk avoidance
+    "volatility":  13,      # vol regime alignment
+    "sentiment":   10,      # contrarian retail positioning
 }
 
 
@@ -173,6 +175,128 @@ def _eval_fundamental(scan_result: dict) -> LayerVerdict:
     return LayerVerdict("fundamental", score, direction, status, reasons)
 
 
+def _eval_yields(scan_result: dict) -> LayerVerdict:
+    """
+    Score 10Y real-yield trend from FRED. Falling real yields are the
+    single strongest gold-bullish macro signal in published research.
+    Inverse: rising real yields = bearish gold.
+    """
+    try:
+        from services.fred_provider import get_yields_context
+        yc = get_yields_context()
+    except Exception as e:
+        log.debug("[predictor] FRED fetch failed: %s", e)
+        yc = {"available": False}
+
+    if not yc.get("available"):
+        return LayerVerdict(
+            "yields", 50, "NEUTRAL", "YELLOW",
+            [yc.get("error", "FRED data unavailable — set FRED_API_KEY in .env"),
+             "Fundamental layer (DXY proxy) still provides macro context"],
+        )
+
+    real_y      = yc.get("realYield10y", 0)
+    real_delta  = yc.get("realYieldDelta", 0)
+    trend       = yc.get("yieldsTrend", "flat")
+    gold_impact = yc.get("goldImpact", "neutral")
+
+    direction = "NEUTRAL"
+    score = 60
+    status = "YELLOW"
+
+    if gold_impact == "bullish":
+        direction = "BUY"
+        score = 80
+        status = "GREEN"
+    elif gold_impact == "bearish":
+        direction = "SELL"
+        score = 80
+        status = "GREEN"
+
+    return LayerVerdict(
+        "yields", score, direction, status,
+        [
+            f"Real 10Y yield: {real_y:.2f}% (Δ {real_delta:+.2f})",
+            f"DGS10: {yc.get('dgs10')}%  T10YIE: {yc.get('t10yie')}%",
+            f"Trend: {trend} → {gold_impact} for gold",
+        ],
+    )
+
+
+def _eval_cot(scan_result: dict) -> LayerVerdict:
+    """
+    Score CFTC Commitments of Traders positioning for gold.
+    Contrarian indicator: extreme speculative long positioning often marks
+    tops; extreme short positioning marks bottoms. Commercial hedgers are
+    the smart money — their positioning is the inverse signal.
+    """
+    try:
+        from services.cot_provider import get_cot_data
+        cot = get_cot_data("XAU/USD")
+    except Exception as e:
+        log.debug("[predictor] COT fetch failed: %s", e)
+        return LayerVerdict(
+            "cot", 50, "NEUTRAL", "YELLOW",
+            ["COT data unavailable"],
+        )
+
+    bias    = cot.get("bias", "Neutral")
+    net     = cot.get("netPosition", 0)
+    change  = cot.get("change", 0)
+    longs   = cot.get("longContracts", 0)
+    shorts  = cot.get("shortContracts", 0)
+    as_of   = cot.get("asOf", "?")
+    source  = cot.get("source", "?")
+
+    # Long/short ratio for extremity check
+    if (longs + shorts) > 0:
+        long_pct = longs / (longs + shorts) * 100
+    else:
+        long_pct = 50
+
+    # Contrarian logic on EXTREMES only
+    direction = "NEUTRAL"
+    score = 55
+    status = "YELLOW"
+
+    if long_pct >= 75:                     # extreme spec long → potential top
+        direction = "SELL"
+        score = 70
+        status = "GREEN"
+        verdict = f"Specs {long_pct:.0f}% long — extreme positioning, contrarian SELL"
+    elif long_pct >= 65:
+        direction = "SELL"
+        score = 60
+        status = "YELLOW"
+        verdict = f"Specs {long_pct:.0f}% long — elevated, mild contrarian SELL"
+    elif long_pct <= 25:                   # extreme spec short → potential bottom
+        direction = "BUY"
+        score = 70
+        status = "GREEN"
+        verdict = f"Specs {100-long_pct:.0f}% short — extreme positioning, contrarian BUY"
+    elif long_pct <= 35:
+        direction = "BUY"
+        score = 60
+        status = "YELLOW"
+        verdict = f"Specs {100-long_pct:.0f}% short — elevated, mild contrarian BUY"
+    elif bias == "Bullish":
+        score = 60
+        verdict = f"Speculators net long ({net:,}) — trend-following"
+    elif bias == "Bearish":
+        score = 60
+        verdict = f"Speculators net short ({net:,}) — trend-following"
+    else:
+        verdict = f"Neutral positioning ({net:,} net)"
+
+    reasons = [
+        verdict,
+        f"Long {longs:,} / Short {shorts:,} (week change {change:+,})",
+        f"As of {as_of} ({source})",
+    ]
+
+    return LayerVerdict("cot", score, direction, status, reasons)
+
+
 def _eval_news(scan_result: dict) -> LayerVerdict:
     """Score the news-event proximity layer."""
     news = scan_result.get("news", {})
@@ -231,17 +355,32 @@ def _eval_volatility(scan_result: dict) -> LayerVerdict:
 
 
 def _eval_sentiment(scan_result: dict) -> LayerVerdict:
-    """Score retail sentiment as CONTRARIAN indicator."""
-    # Pull from the engine model's sentiment field (if MyFxBook integration is active)
-    em = scan_result.get("engineModel", {})
-    sentiment = em.get("sentiment") or {}
-    if not sentiment.get("available"):
-        return LayerVerdict("sentiment", 50, "NEUTRAL", "YELLOW",
-                             ["Sentiment data unavailable"])
+    """Score retail sentiment as CONTRARIAN indicator (via MyFxBook)."""
+    # Try multiple paths — engine model sentiment may live under different keys
+    em = scan_result.get("engineModel", {}) or {}
+    sentiment = (
+        em.get("sentiment")
+        or scan_result.get("sentiment")
+        or {}
+    )
 
-    long_pct = sentiment.get("longPct", 50)
+    # If nothing in scan, fetch directly from provider
+    if not sentiment or not (sentiment.get("available") or sentiment.get("longPct") is not None or sentiment.get("long_pct") is not None):
+        try:
+            from services.myfxbook_provider import get_sentiment_for_signal
+            sentiment = get_sentiment_for_signal("xauusd", scan_result.get("signal", "WAIT"))
+        except Exception as e:
+            log.debug("[predictor] direct sentiment fetch failed: %s", e)
+            sentiment = {}
+
+    if not sentiment or not sentiment.get("available"):
+        return LayerVerdict("sentiment", 50, "NEUTRAL", "YELLOW",
+                             ["Sentiment data unavailable — set MYFXBOOK_ENABLED=true"])
+
+    # Handle both snake_case (provider) and camelCase (alias) outputs
+    long_pct = sentiment.get("long_pct") or sentiment.get("longPct") or 50
+    short_pct = sentiment.get("short_pct") or sentiment.get("shortPct") or (100 - long_pct)
     interp   = sentiment.get("interpretation", "")
-    adj      = sentiment.get("adjusted_score", 0)
 
     # Contrarian: extreme long retail = SELL bias; extreme short retail = BUY bias
     direction = "NEUTRAL"
@@ -251,16 +390,24 @@ def _eval_sentiment(scan_result: dict) -> LayerVerdict:
     if long_pct >= 70:
         direction = "SELL"
         status = "GREEN"
-        score = 70
+        score = 75
+    elif long_pct >= 60:
+        direction = "SELL"
+        status = "YELLOW"
+        score = 60
     elif long_pct <= 30:
         direction = "BUY"
         status = "GREEN"
-        score = 70
+        score = 75
+    elif long_pct <= 40:
+        direction = "BUY"
+        status = "YELLOW"
+        score = 60
     elif 45 <= long_pct <= 55:
         status = "YELLOW"
 
     return LayerVerdict("sentiment", score, direction, status,
-                         [f"Retail long: {long_pct}%",
+                         [f"Retail: {long_pct}% long / {short_pct}% short",
                           interp or "Contrarian view applied"])
 
 
@@ -313,9 +460,11 @@ def predict_xauusd(db=None) -> HighProbabilityPrediction:
     layers = [
         _eval_technical(scan),
         _eval_fundamental(scan),
+        _eval_yields(scan),         # Tier 3.1: FRED real yields
+        _eval_cot(scan),            # Tier 3.3: CFTC positioning
         _eval_news(scan),
         _eval_volatility(scan),
-        _eval_sentiment(scan),
+        _eval_sentiment(scan),      # Tier 3.2: MyFxBook fix
     ]
 
     # Composite probability (weighted average of layer scores)
