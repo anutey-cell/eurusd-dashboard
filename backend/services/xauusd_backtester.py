@@ -148,6 +148,9 @@ def run_xauusd_backtest(
     classify_regimes:      bool           = True,
     analyze_skipped:       bool           = False,
     risk_sensitivity:      bool           = True,
+    engine_variant:        str            = "swing",        # "swing" | "intraday"
+    anti_cluster_hours:    float          = 0.0,            # 0 = disabled
+    target_pips_override:  Optional[int]  = None,           # override pair config target
 ) -> dict:
     """
     Run the strict XAU/USD backtest.
@@ -170,7 +173,7 @@ def run_xauusd_backtest(
     # ── Load pair config ────────────────────────────────────────────────────
     cfg              = get_pair_config("xauusd")
     pip_size         = cfg["pip_size"]            # 1.0 for XAU/USD
-    target_points    = cfg["target_pips"]         # 50 for XAU/USD
+    target_points    = target_pips_override if target_pips_override else cfg["target_pips"]
     sl_buffer_points = cfg["sl_buffer_pips"]      # 5 for XAU/USD
     fvg_min_points   = cfg["fvg_min_pips"]        # 5 for XAU/USD
     price_decimals   = cfg["price_decimals"]      # 2 for XAU/USD
@@ -269,6 +272,8 @@ def run_xauusd_backtest(
     # ── Walk-forward loop ───────────────────────────────────────────────────
     trades:  list[Trade]        = []
     skipped: list[SkippedTrade] = []
+    # Anti-clustering tracker: last entry time per (signal direction)
+    last_entry_per_direction: dict[str, datetime] = {}
     equity_curve: list[dict]    = [{
         "step":      0,
         "time":      bars[MIN_WARMUP_BARS - 1].time.isoformat(),
@@ -296,19 +301,41 @@ def run_xauusd_backtest(
         # NOTE: macro_events are pre-loaded from the historical macro_events table
         # and filtered by check_news_risk() at each candle timestamp.
         try:
-            result = analyze_signal(
-                pair="xauusd",
-                candles=window,
-                macro_events=macro_events,
-                at=candle_ts,
-                pip_size=pip_size,
-                target_pips=target_points,
-                sl_buffer_pips=sl_buffer_points,
-                min_rr=min_rr,
-                fvg_min_pips=fvg_min_points,
-                enable_premium_gates=enable_premium_gates,
-                historical_mode=True,         # skip live DXY fetch
-            )
+            if engine_variant == "intraday":
+                # Intraday engine: M15-tuned ICT + Asian range break-retest
+                from services.intraday_engine import analyze_intraday, INTRADAY_DEFAULTS
+                result = analyze_intraday(
+                    pair="xauusd",
+                    candles=window,
+                    macro_events=macro_events,
+                    at=candle_ts,
+                    pip_size=pip_size,
+                    target_pips=target_points,
+                    sl_buffer_pips=INTRADAY_DEFAULTS["sl_buffer_pips"],
+                    min_rr=min_rr if min_rr != 2.5 else INTRADAY_DEFAULTS["min_rr"],
+                    fvg_min_pips=INTRADAY_DEFAULTS["fvg_min_pips"],
+                    strong_wick_pips=INTRADAY_DEFAULTS["strong_wick_pips"],
+                    atr_min=INTRADAY_DEFAULTS["atr_min"],
+                    atr_max=INTRADAY_DEFAULTS["atr_max"],
+                    min_score=min_score if min_score != 80 else INTRADAY_DEFAULTS["min_score"],
+                    enable_killzone=True,
+                    enable_asian_range=True,
+                    enable_news_filter=include_news_filter,
+                )
+            else:
+                result = analyze_signal(
+                    pair="xauusd",
+                    candles=window,
+                    macro_events=macro_events,
+                    at=candle_ts,
+                    pip_size=pip_size,
+                    target_pips=target_points,
+                    sl_buffer_pips=sl_buffer_points,
+                    min_rr=min_rr,
+                    fvg_min_pips=fvg_min_points,
+                    enable_premium_gates=enable_premium_gates,
+                    historical_mode=True,         # skip live DXY fetch
+                )
         except Exception as e:
             log.debug("[backtest] Engine error at bar %d: %s", i, e)
             continue
@@ -391,6 +418,21 @@ def run_xauusd_backtest(
             ))
             continue
 
+        # ── Anti-clustering filter ──────────────────────────────────────────
+        # Prevents the engine from firing the same-direction setup multiple
+        # times in close succession (e.g. 5 BUY losses in 16h on 2026-01-06).
+        if anti_cluster_hours > 0:
+            last_t = last_entry_per_direction.get(result.signal)
+            if last_t is not None:
+                hours_since = (candle_ts - last_t).total_seconds() / 3600
+                if hours_since < anti_cluster_hours:
+                    skipped.append(SkippedTrade(
+                        time=candle_ts.isoformat(), signal=result.signal,
+                        score=result.quality_score, reason="ANTI_CLUSTER",
+                        detail=f"{hours_since:.1f}h since last {result.signal} < {anti_cluster_hours}h",
+                    ))
+                    continue
+
         # ── Trade is valid — simulate forward to find TP or SL ───────────────
         risk_amount = equity * (risk_percent / 100.0)
         exit_time, result_label, points_captured, r_mult, bars_held = _resolve_trade(
@@ -459,6 +501,8 @@ def run_xauusd_backtest(
                    "commission": commission_per_trade},
         )
         trades.append(trade)
+        # Update anti-clustering tracker on every accepted entry
+        last_entry_per_direction[result.signal] = candle_ts
 
         equity_curve.append({
             "step":        len(trades),
@@ -536,6 +580,8 @@ def run_xauusd_backtest(
         "barsAnalyzed":        len(candles),
         "macroEventsLoaded":   len(macro_events),
         "premiumGatesEnabled": enable_premium_gates,
+        "engineVariant":       engine_variant,
+        "antiClusterHours":    anti_cluster_hours,
     }
 
     return {

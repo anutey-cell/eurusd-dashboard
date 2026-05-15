@@ -45,6 +45,8 @@ const DEFAULTS = {
   include_news_filter:   true,
   allow_overlap:         false,
   enable_premium_gates:  true,
+  engine_variant:        'swing',
+  anti_cluster_hours:    0,
 };
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
@@ -853,6 +855,18 @@ export default function XauusdBacktestPanel() {
               <Select value={params.enable_premium_gates ? 'true' : 'false'}
                       onChange={v => set('enable_premium_gates', v === 'true')}
                       options={[{ value: 'true', label: 'Enforced (top-tier)' }, { value: 'false', label: 'Disabled (loose)' }]} />
+            </Field>
+            <Field label="Engine variant" hint="swing=H4, intraday=M15 Asian-range">
+              <Select value={params.engine_variant}
+                      onChange={v => set('engine_variant', v)}
+                      options={[
+                        { value: 'swing',    label: 'Swing (H4 ICT)' },
+                        { value: 'intraday', label: 'Intraday (M15 Asian-range)' },
+                      ]} />
+            </Field>
+            <Field label="Anti-cluster hrs" hint="0 = disabled, 4-8 typical">
+              <Input type="number" value={params.anti_cluster_hours} onChange={v => set('anti_cluster_hours', v)}
+                     min={0} max={72} step={1} />
             </Field>
           </div>
 
