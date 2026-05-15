@@ -303,14 +303,31 @@ function DataQualityPanel({ dq }) {
         </span>
         <span className="text-[10px] opacity-70 ml-auto">{dq.dataSource} / {dq.timeframe}</span>
       </div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-2">
-        <Stat label="Candles"    value={dq.totalCandles?.toLocaleString()} small />
-        <Stat label="Missing"    value={dq.missingCandles} color={dq.missingCandles > 0 ? 'text-amber-400' : 'text-emerald-400'} small />
-        <Stat label="Duplicates" value={dq.duplicateCandles} color={dq.duplicateCandles > 0 ? 'text-amber-400' : 'text-emerald-400'} small />
-        <Stat label="Invalid"    value={dq.invalidCandles} color={dq.invalidCandles > 0 ? 'text-red-400' : 'text-emerald-400'} small />
-        <Stat label="Flat"       value={dq.flatCandles}    small />
-        <Stat label="Abnormal"   value={dq.abnormalCandles} small />
+      <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-8 gap-2 mb-2">
+        <Stat label="Candles"      value={dq.totalCandles?.toLocaleString()} small />
+        <Stat label="Real missing" value={dq.missingCandles}
+              color={dq.missingCandles > 0 ? 'text-amber-400' : 'text-emerald-400'} small
+              sub="suspicious gaps" />
+        <Stat label="Holidays"     value={dq.holidayGaps ?? 0} color="text-gray-400" small
+              sub="expected closures" />
+        {dq.weekendGaps != null && (
+          <Stat label="Weekends"   value={dq.weekendGaps} color="text-gray-400" small sub="expected" />
+        )}
+        <Stat label="Duplicates"   value={dq.duplicateCandles}
+              color={dq.duplicateCandles > 0 ? 'text-amber-400' : 'text-emerald-400'} small />
+        <Stat label="Invalid"      value={dq.invalidCandles}
+              color={dq.invalidCandles > 0 ? 'text-red-400' : 'text-emerald-400'} small />
+        <Stat label="Flat"         value={dq.flatCandles} small />
+        <Stat label="Abnormal"     value={dq.abnormalCandles} small
+              sub="likely news moves" />
       </div>
+      {(dq.requestedStart || dq.actualStart) && (
+        <div className="text-[10px] bg-blue-900/30 border border-blue-800/40 text-blue-300 rounded px-2 py-1 mb-2">
+          <strong>Note:</strong> Date range clipped — requested {String(dq.requestedStart || '').slice(0,10)} →
+          actual data starts {String(dq.actualStart || dq.coverageStart || '').slice(0,10)}.
+          Use the TradingView fetch endpoint to import more history.
+        </div>
+      )}
       <p className="text-[10px] opacity-90">{dq.interpretation}</p>
       {dq.warnings?.length > 0 && (
         <ul className="mt-1 space-y-0.5">

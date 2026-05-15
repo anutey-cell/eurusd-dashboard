@@ -39,7 +39,7 @@ import os
 import random
 import statistics
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session
@@ -247,6 +247,22 @@ def run_xauusd_backtest(
 
     # ── Pre-flight data quality audit (Phase 2b) ─────────────────────────────
     data_quality_report = _audit_data_quality(bars, timeframe, source)
+
+    # If the user requested a date range wider than available data, surface that
+    if start_date and bars:
+        first_t = bars[0].time
+        if first_t.tzinfo is None: first_t = first_t.replace(tzinfo=timezone.utc)
+        sd_aware = start_date if start_date.tzinfo else start_date.replace(tzinfo=timezone.utc)
+        if first_t > sd_aware + timedelta(days=7):
+            data_quality_report.setdefault("warnings", []).insert(
+                0,
+                f"Requested start {sd_aware.date()} but data only goes back to "
+                f"{first_t.date()} — date range clipped to available history. "
+                f"Use POST /backtest/fetch-tradingview to import more.",
+            )
+            data_quality_report["requestedStart"] = sd_aware.isoformat()
+            data_quality_report["actualStart"]    = first_t.isoformat()
+
     if data_quality_report["status"] == "FAIL":
         log.warning("[backtest] Data quality FAIL — proceeding with reliability caveat")
 
@@ -1399,13 +1415,18 @@ def _simulate_skipped_outcomes(
 
 def _audit_data_quality(candles: list, timeframe: str, data_source: str) -> dict:
     """
-    Pre-backtest data quality audit. Detects:
-      - Missing candles (gaps in expected interval sequence)
-      - Duplicate candles (consecutive identical timestamps)
-      - Invalid candles (OHLC sanity violations)
-      - Flat candles (high == low — zero range)
-      - Abnormal candles (range > 5 stdev from mean)
-      - Coverage start/end
+    Pre-backtest data quality audit. Classifies each gap:
+      - Weekend gap        Fri close -> Mon/Sun open (expected, not counted)
+      - Holiday gap        Christmas/New Year/Thanksgiving/etc (expected)
+      - Suspicious gap     Mid-week, non-holiday — counted as missing
+      - Duplicate          Two candles at same timestamp
+      - Invalid OHLC       Sanity violation (counted as critical)
+      - Flat               high == low (low-volume bar)
+      - Abnormal range     > 5 stdev (likely real news spike, not error)
+
+    Real gold market data ALWAYS has ~6-12 H4 bars missing per holiday
+    closure. Over 3+ years of H4 data, 200-500 such bars is normal.
+    Only "suspicious" gaps reduce the reliability score.
     """
     if not candles:
         return {
@@ -1417,20 +1438,20 @@ def _audit_data_quality(candles: list, timeframe: str, data_source: str) -> dict
     n = len(candles)
     warnings: list[str] = []
 
-    # Expected interval in minutes
     interval_min_map = {"M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
     interval_min = interval_min_map.get(timeframe, 15)
     interval_sec = interval_min * 60
 
-    # Coverage
     first_t = candles[0].time
     last_t  = candles[-1].time
     if first_t.tzinfo is None: first_t = first_t.replace(tzinfo=timezone.utc)
     if last_t.tzinfo  is None: last_t  = last_t.replace(tzinfo=timezone.utc)
 
-    # Missing/duplicate detection — count adjacent intervals that aren't ~= expected
-    missing   = 0
-    duplicates = 0
+    # Gap classification
+    weekend_bars  = 0    # bars skipped over weekends (expected)
+    holiday_bars  = 0    # bars skipped over holiday closures (expected)
+    missing_bars  = 0    # actual data integrity issues (mid-week, no holiday)
+    duplicates    = 0
     prev = None
     for c in candles:
         t = c.time if c.time.tzinfo else c.time.replace(tzinfo=timezone.utc)
@@ -1439,13 +1460,16 @@ def _audit_data_quality(candles: list, timeframe: str, data_source: str) -> dict
             if diff_sec == 0:
                 duplicates += 1
             elif diff_sec > interval_sec * 3:
-                # Allow up to 3x gap (weekend/holiday)
-                # Count how many candles were skipped
-                if not _is_weekend_gap(prev, t):
-                    missing += int(diff_sec / interval_sec) - 1
+                gap_bars = int(diff_sec / interval_sec) - 1
+                if _is_weekend_gap(prev, t):
+                    weekend_bars += gap_bars
+                elif _is_holiday_gap(prev, t):
+                    holiday_bars += gap_bars
+                else:
+                    missing_bars += gap_bars
         prev = t
 
-    # Invalid OHLC + flat detection
+    # OHLC validity + flat detection
     invalid = 0
     flat = 0
     ranges = []
@@ -1460,7 +1484,9 @@ def _audit_data_quality(candles: list, timeframe: str, data_source: str) -> dict
             flat += 1
         ranges.append(c.high - c.low)
 
-    # Abnormal range detection (range > 5 stdev from mean)
+    # Abnormal range — note: large H4 ranges during news are NORMAL for gold
+    # (NFP/CPI can produce >5σ moves). Reported for transparency but
+    # NOT treated as a data integrity issue.
     abnormal = 0
     if len(ranges) >= 20:
         mean_r = sum(ranges) / len(ranges)
@@ -1469,33 +1495,53 @@ def _audit_data_quality(candles: list, timeframe: str, data_source: str) -> dict
         threshold = mean_r + 5 * std
         abnormal = sum(1 for r in ranges if r > threshold)
 
-    # Status determination
-    issues_pct = (missing + duplicates + invalid) / max(n, 1) * 100
-    if invalid > 0 or issues_pct > 5:
+    # Status determination — based ONLY on REAL data issues, not holidays
+    missing_pct = missing_bars / max(n, 1) * 100
+    if invalid > 0 or missing_pct > 5:
         status = "FAIL"
-    elif missing > n * 0.02 or flat > n * 0.05 or duplicates > 0:
+    elif missing_pct > 2 or flat > n * 0.05 or duplicates > 0:
         status = "WARN"
     else:
         status = "PASS"
 
-    if missing > 0:
-        warnings.append(f"Missing candles detected: {missing}")
+    # Honest warnings
+    if missing_bars > 0:
+        warnings.append(
+            f"Mid-week gaps (likely data feed issues): {missing_bars} bars "
+            f"({missing_pct:.2f}% of dataset)"
+        )
+    if holiday_bars > 0:
+        warnings.append(
+            f"Holiday closures: ~{holiday_bars} bars skipped "
+            f"(expected — Christmas/New Year/Thanksgiving/Good Friday etc.)"
+        )
+    if weekend_bars > 0 and n < 100:
+        # Only mention weekends for very small datasets
+        warnings.append(f"Weekend gaps: ~{weekend_bars} bars skipped (expected)")
     if duplicates > 0:
-        warnings.append(f"Duplicate timestamps: {duplicates}")
+        warnings.append(f"Duplicate timestamps detected: {duplicates}")
     if invalid > 0:
-        warnings.append(f"Invalid OHLC candles: {invalid}")
+        warnings.append(f"INVALID OHLC candles: {invalid} (critical)")
     if flat > n * 0.05:
         warnings.append(f"High flat-candle rate: {flat} ({flat / n * 100:.1f}%)")
-    if abnormal > n * 0.02:
-        warnings.append(f"High abnormal-range candle count: {abnormal}")
+    if abnormal > 0:
+        warnings.append(
+            f"Abnormal-range candles: {abnormal} "
+            f"(likely real news-driven moves, not errors)"
+        )
     if data_source == "synthetic":
-        warnings.append("Synthetic data — results are illustrative only. "
-                        "Import real candles for statistical validity.")
+        warnings.append(
+            "Synthetic data — results are illustrative only. "
+            "Import real candles for statistical validity."
+        )
 
     return {
         "status":          status,
         "totalCandles":    n,
-        "missingCandles":  missing,
+        # Backward-compat: "missingCandles" now reports ONLY suspicious gaps
+        "missingCandles":  missing_bars,
+        "weekendGaps":     weekend_bars,
+        "holidayGaps":     holiday_bars,
         "duplicateCandles": duplicates,
         "invalidCandles":  invalid,
         "flatCandles":     flat,
@@ -1506,20 +1552,80 @@ def _audit_data_quality(candles: list, timeframe: str, data_source: str) -> dict
         "dataSource":      data_source,
         "warnings":        warnings,
         "interpretation": (
-            "Data quality acceptable."          if status == "PASS" else
-            "Data quality reduced — backtest reliability impacted." if status == "WARN" else
-            "Critical data quality issues — backtest reliability significantly reduced."
+            "Data quality acceptable. Holiday closures are normal market behaviour, not data issues."
+                if status == "PASS" else
+            "Data quality reduced — some mid-week gaps detected. Backtest still runs but reliability slightly impacted."
+                if status == "WARN" else
+            "Critical data quality issues — significant mid-week gaps or invalid OHLC. Backtest reliability significantly reduced."
         ),
     }
 
 
 def _is_weekend_gap(prev: datetime, curr: datetime) -> bool:
     """True if the gap spans a weekend (Sat/Sun)."""
-    # Heuristic: gap > 24h and prev was Fri or curr is Mon
     delta = (curr - prev).total_seconds()
     if delta < 24 * 3600:
         return False
     return prev.weekday() == 4 or curr.weekday() == 0
+
+
+def _is_holiday_gap(prev: datetime, curr: datetime) -> bool:
+    """
+    True if the gap likely spans a recognised gold market holiday closure.
+
+    Detects:
+      - Christmas / New Year (Dec 23 -> Jan 3)
+      - US Thanksgiving (4th Thursday of November + Friday)
+      - US Independence Day (July 4)
+      - Memorial Day (last Monday of May)
+      - Labor Day (1st Monday of September)
+      - Good Friday (varies — uses date range Mar 20 - Apr 25 with weekday check)
+      - Easter Monday
+    """
+    delta = (curr - prev).total_seconds()
+    # Holiday gaps are typically 24h - 5d; longer is suspicious
+    if delta < 12 * 3600 or delta > 6 * 86400:
+        return False
+
+    # Check if any day in the gap window is a recognised holiday
+    cur_check = prev.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_check = curr.replace(hour=0, minute=0, second=0, microsecond=0)
+    days_to_check = []
+    while cur_check <= end_check and len(days_to_check) < 10:
+        days_to_check.append(cur_check)
+        cur_check = cur_check + timedelta(days=1)
+
+    for d in days_to_check:
+        m, day, wd = d.month, d.day, d.weekday()
+        # Christmas / New Year window (Dec 23 - Jan 3)
+        if (m == 12 and day >= 23) or (m == 1 and day <= 3):
+            return True
+        # US Independence Day
+        if m == 7 and day in (3, 4, 5):
+            return True
+        # Thanksgiving (4th Thursday of November) + Black Friday
+        if m == 11 and wd == 3 and 22 <= day <= 28:
+            return True
+        if m == 11 and wd == 4 and 23 <= day <= 29:  # Black Friday
+            return True
+        # Memorial Day (last Monday of May)
+        if m == 5 and wd == 0 and day >= 25:
+            return True
+        # Labor Day (1st Monday of September)
+        if m == 9 and wd == 0 and day <= 7:
+            return True
+        # Good Friday window (approximate — late March / April)
+        if m in (3, 4) and wd == 4 and 20 <= day <= 25:
+            return True
+        # Easter Monday (approximate)
+        if m in (3, 4) and wd == 0 and 22 <= day <= 27:
+            return True
+        # New Year's Eve / Day proper
+        if m == 1 and day == 1:
+            return True
+        if m == 12 and day == 31:
+            return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
