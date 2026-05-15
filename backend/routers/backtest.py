@@ -228,7 +228,7 @@ def xauusd_backtest(
     classify_regimes:      bool = Query(default=True, description="Phase 2a — classify each trade's market regime"),
     risk_sensitivity_flag: bool = Query(default=True, alias="risk_sensitivity", description="Phase 2a — project equity at 0.25/0.5/1.0 risk levels"),
     analyze_skipped:       bool = Query(default=True, description="Phase 2b — simulate hypothetical outcomes for skipped trades"),
-    engine_variant:        str  = Query(default="swing", description="Engine variant: swing (H4 default) | intraday (M15 with Asian range)"),
+    engine_variant:        str  = Query(default="swing", description="Engine variant: swing | intraday (ICT M15) | trend_pullback | bb_reversion | opening_range | asian_fade"),
     anti_cluster_hours:    float = Query(default=0.0, ge=0, le=72, description="Reject same-direction signals within N hours (0 = disabled)"),
     target_pips_override:  int | None = Query(default=None, ge=5, le=200, description="Override pair-config target_pips (default = 50 for XAU/USD)"),
     save:                bool = Query(default=True, description="Save run to backtest_runs table"),

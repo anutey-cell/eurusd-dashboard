@@ -302,7 +302,7 @@ def run_xauusd_backtest(
         # and filtered by check_news_risk() at each candle timestamp.
         try:
             if engine_variant == "intraday":
-                # Intraday engine: M15-tuned ICT + Asian range break-retest
+                # Intraday ICT engine (M15-tuned + Asian range break-retest)
                 from services.intraday_engine import analyze_intraday, INTRADAY_DEFAULTS
                 result = analyze_intraday(
                     pair="xauusd",
@@ -320,6 +320,20 @@ def run_xauusd_backtest(
                     min_score=min_score if min_score != 80 else INTRADAY_DEFAULTS["min_score"],
                     enable_killzone=True,
                     enable_asian_range=True,
+                    enable_news_filter=include_news_filter,
+                )
+            elif engine_variant in ("trend_pullback", "bb_reversion",
+                                     "opening_range", "asian_fade"):
+                # Non-ICT intraday strategies (Option C)
+                from services.intraday_strategies import analyze_non_ict_strategy
+                result = analyze_non_ict_strategy(
+                    variant=engine_variant,
+                    candles=window,
+                    at=candle_ts,
+                    macro_events=macro_events,
+                    pip_size=pip_size,
+                    target_pips=target_points,
+                    min_rr=min_rr,
                     enable_news_filter=include_news_filter,
                 )
             else:

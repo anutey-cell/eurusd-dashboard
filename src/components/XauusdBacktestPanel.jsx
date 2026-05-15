@@ -856,12 +856,16 @@ export default function XauusdBacktestPanel() {
                       onChange={v => set('enable_premium_gates', v === 'true')}
                       options={[{ value: 'true', label: 'Enforced (top-tier)' }, { value: 'false', label: 'Disabled (loose)' }]} />
             </Field>
-            <Field label="Engine variant" hint="swing=H4, intraday=M15 Asian-range">
+            <Field label="Engine variant" hint="ICT swing/intraday or non-ICT strategies">
               <Select value={params.engine_variant}
                       onChange={v => set('engine_variant', v)}
                       options={[
-                        { value: 'swing',    label: 'Swing (H4 ICT)' },
-                        { value: 'intraday', label: 'Intraday (M15 Asian-range)' },
+                        { value: 'swing',          label: 'Swing (H4 ICT)' },
+                        { value: 'intraday',       label: 'Intraday (M15 ICT)' },
+                        { value: 'trend_pullback', label: 'Trend Pullback (EMA21/50)' },
+                        { value: 'bb_reversion',   label: 'BB Mean Reversion' },
+                        { value: 'opening_range',  label: 'Opening Range Breakout' },
+                        { value: 'asian_fade',     label: 'Asian Range Fade' },
                       ]} />
             </Field>
             <Field label="Anti-cluster hrs" hint="0 = disabled, 4-8 typical">
