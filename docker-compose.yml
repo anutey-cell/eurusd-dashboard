@@ -10,7 +10,7 @@
       - path: ./backend/.env    # loads all secrets (TELEGRAM_*, MT5_*, API keys, etc.)
         required: false         # OK if .env not yet created — copy .env.example to start
     environment:
-      - DATA_MODE=demo
+      # DATA_MODE controlled by backend/.env now (live for 2-week test)
       - DATABASE_URL=sqlite:////app/storage/eurusd_signals.db
       # CORS default already includes localhost:5173 — override only needed for VPS
       # CORS_ORIGINS=["http://yourdomain.com"]

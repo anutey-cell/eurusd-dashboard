@@ -429,15 +429,15 @@ def _build_decision_text(direction: str, band: str, aligned: int,
     if band == "STRONG":
         confluence_note = " Trade plan ready — review and execute manually if you agree." if trade_plan \
                           else " Confluence is strong but scanner has no entry plan yet — wait for SIGNAL_READY."
-        return f"HIGH-PROBABILITY {direction}: {aligned}/5 evidence layers align.{confluence_note}"
+        return f"HIGH-PROBABILITY {direction}: {aligned}/7 evidence layers align.{confluence_note}"
     if band == "MODERATE":
         return (
-            f"MODERATE {direction}: {aligned}/5 layers align. "
+            f"MODERATE {direction}: {aligned}/7 layers align. "
             f"Consider half-size or wait for full confluence."
         )
     if band == "WEAK":
         return (
-            f"WEAK {direction}: only {aligned}/5 layers support. "
+            f"WEAK {direction}: only {aligned}/7 layers support. "
             f"Skip unless you have additional conviction outside the system."
         )
     return f"AVOID: probability too low ({aligned}/5 aligned). Stand aside."

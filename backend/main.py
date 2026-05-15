@@ -65,7 +65,19 @@ async def lifespan(app: FastAPI):
                 log.info("Startup archival: removed %d old scan records", deleted)
     except Exception as _arc_exc:
         log.debug("Startup archival skipped (non-fatal): %s", _arc_exc)
-    yield
+
+    # ── Phase Final: spawn background loops for autonomous live operation ────
+    try:
+        from services.background_scheduler import start_background_loops, stop_background_loops
+        await start_background_loops()
+        log.info("Background scheduler started — autonomous 2-week live testing mode")
+        try:
+            yield
+        finally:
+            await stop_background_loops()
+    except Exception as _sched_exc:
+        log.warning("Background scheduler failed to start: %s", _sched_exc)
+        yield
 
 
 # ── App ───────────────────────────────────────────────────────────────────────

@@ -67,16 +67,24 @@ def run_dual_engines(db: Session) -> dict:
     # ── Engine 2: Trend Pullback H1 ───────────────────────────────────────
     try:
         from services.intraday_strategies import analyze_trend_pullback
-        from services.historical_data_provider import get_historical_candles, load_historical_macro_events
+        from services.historical_data_provider import load_historical_macro_events
+        from data.candles import get_candles
         from services.paper_observation_tracker import _build_fingerprint, PaperObservation
         from datetime import timedelta
         import json as _json
 
-        # Pull recent H1 candles for trend pullback analysis
-        candles, _src = get_historical_candles(
-            db=db, timeframe="H1", lookback=500,
-            allow_synthetic_fallback=True,
-        )
+        # Pull recent H1 candles. In live mode this routes through TradingView
+        # for fresh data; in demo mode it returns synthetic candles.
+        try:
+            resp = get_candles(interval="H1", limit=500, pair="xauusd")
+            candles = resp.candles
+        except Exception as _e:
+            log.debug("[dual_runner] live candles unavailable (%s) — falling back to DB", _e)
+            from services.historical_data_provider import get_historical_candles
+            candles, _src = get_historical_candles(
+                db=db, timeframe="H1", lookback=500, allow_synthetic_fallback=True,
+            )
+
         if not candles or len(candles) < 60:
             results["trend_pullback"]["reason"] = "Insufficient H1 candles"
             return results
