@@ -469,6 +469,18 @@ function CsvImportBox({ onImported, timeframe }) {
       {busy && <p className="text-[10px] text-blue-400">Uploading…</p>}
       {msg && <p className="text-[10px] text-emerald-400">{msg}</p>}
       {err && <p className="text-[10px] text-red-400">{err}</p>}
+
+      <div className="mt-2 pt-2 border-t border-[#1e2535] text-[9px] text-gray-500 leading-tight">
+        <strong className="text-amber-400/80">Need years of history?</strong> Use the MT5
+        export script (Windows only — MT5 Python is Windows-locked):
+        <pre className="bg-[#0d1117] rounded mt-1 p-1.5 text-gray-400 overflow-x-auto">
+{`# In the repo root, on Windows with MT5 logged in:
+cd tools
+mt5_export.bat --timeframe ${timeframe} --years 5
+# Produces: xauusd_${timeframe}_YYYY-MM-DD_YYYY-MM-DD.csv
+# Then drag-drop it into the file picker above.`}
+        </pre>
+      </div>
     </div>
   );
 }
