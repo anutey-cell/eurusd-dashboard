@@ -42,7 +42,8 @@ def candles(
         raise HTTPException(status_code=exc.http_code, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Candle data error: {exc}") from exc
-    return APIResponse(data=data)
+    # Propagate the actual provider (tradingview | mt5 | synthetic | demo)
+    return APIResponse(data=data, source=getattr(data, "source", "synthetic"))
 
 
 @router.get(

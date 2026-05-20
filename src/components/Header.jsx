@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Activity, Wifi, WifiOff, Clock, TrendingUp, TrendingDown, AlertTriangle, Database } from 'lucide-react';
-import { currentSignal } from '../data/mockData';
-import { getDataStatus } from '../services/api';
+import { getDataStatus, getCandles } from '../services/api';
+import { formatKenyaTime, nowKenyaHour, KENYA_LABEL } from '../utils/time';
+import { usePollInterval } from '../hooks/usePollInterval';
 
 const SESSION_SCHEDULE = [
   { name: 'Tokyo',  start: 0,  end: 9  },
@@ -15,22 +16,98 @@ function getCurrentSession() {
   return active.length ? active.map(s => s.name).join(' + ') : 'Off-Hours';
 }
 
-function useSimulatedPrice(basePrice) {
-  const [price, setPrice] = useState(basePrice ?? 3285.00);
-  const [tick, setTick] = useState(null);
+/**
+ * Live-price ticker:
+ *   1. Polls GET /candles?pair=xauusd&interval=M15&limit=96 (24h window) every
+ *      15s. Pins anchor to last close; computes 24h change from first→last.
+ *   2. Between polls, jitters ±$0.30 around the anchor so the UI feels alive.
+ *   3. Until the first poll lands we show "—" — never a stale demo seed.
+ *
+ * Returns { price, tick, change, changePct } — all live.
+ */
+// Provider sources we ACCEPT as real prices. Anything else (synthetic/demo)
+// is rejected — the dashboard shows "—" with a warning chip rather than
+// flashing a misleading synthetic price near the BASE_PRICE_XAUUSD seed.
+const LIVE_SOURCES = new Set(['tradingview', 'mt5', 'tradingview-cached', 'mt5-cached']);
+
+function useLivePrice() {
+  const [price, setPrice]       = useState(null);
+  const [tick, setTick]         = useState(null);
+  const [change, setChange]     = useState(null);
+  const [changePct, setChangePct] = useState(null);
+  const [source, setSource]     = useState(null);   // "tradingview" | "synthetic" | …
+  const anchorRef               = useRef(null);     // last confirmed real close
+
+  // Pull 24h of M15 candles, compute live close + 24h change
+  useEffect(() => {
+    let cancelled = false;
+
+    async function pull() {
+      try {
+        const res = await getCandles({ pair: 'xauusd', interval: 'M15', limit: 96 });
+        const candles  = res?.candles ?? res?.data?.candles ?? [];
+        // `source` lives in the APIResponse envelope; the api.js helper returns
+        // the parsed envelope, so it's res.source directly.
+        const provider = res?.source ?? res?.data?.source ?? 'unknown';
+
+        if (cancelled) return;
+        setSource(provider);
+
+        // Refuse to surface synthetic / demo numbers — clear all state so
+        // the UI shows "—" and the warning chip surfaces.
+        if (!LIVE_SOURCES.has(provider)) {
+          anchorRef.current = null;
+          setPrice(null);
+          setChange(null);
+          setChangePct(null);
+          setTick(null);
+          return;
+        }
+
+        if (candles.length < 2) return;
+        const first = candles[0];
+        const last  = candles[candles.length - 1];
+        const close = last?.close;
+        const ref   = first?.close;
+        if (typeof close !== 'number' || !Number.isFinite(close)) return;
+
+        anchorRef.current = close;
+        setPrice(prev => {
+          if (prev != null) setTick(close >= prev ? 'up' : 'down');
+          return close;
+        });
+        if (typeof ref === 'number' && Number.isFinite(ref) && ref > 0) {
+          const delta = close - ref;
+          setChange(delta);
+          setChangePct((delta / ref) * 100);
+        }
+      } catch {
+        // silent — keep the previous price; jitter below still animates the UI
+      }
+    }
+
+    pull();
+    const id = setInterval(pull, 15_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  // Tiny jitter between real-price pulls so the ticker doesn't look frozen.
+  // Only runs once we have a valid live anchor — never animates synthetic data.
   useEffect(() => {
     const id = setInterval(() => {
-      // XAU/USD moves in dollars — simulate ±$0.30 per tick
-      const delta = (Math.random() - 0.5) * 0.60;
+      if (anchorRef.current == null) return;
+      const jitter = (Math.random() - 0.5) * 0.60; // ±$0.30
       setPrice(prev => {
-        const next = Math.round((prev + delta) * 100) / 100;
-        setTick(delta >= 0 ? 'up' : 'down');
+        const base = prev ?? anchorRef.current;
+        const next = Math.round((base + jitter) * 100) / 100;
+        setTick(jitter >= 0 ? 'up' : 'down');
         return next;
       });
     }, 1800);
     return () => clearInterval(id);
   }, []);
-  return { price, tick };
+
+  return { price, tick, change, changePct, source, isLive: LIVE_SOURCES.has(source) };
 }
 
 function useDataStatus() {
@@ -50,7 +127,10 @@ function useDataStatus() {
 
 export default function Header({ instrument }) {
   const [now, setNow] = useState(new Date());
-  const { price, tick } = useSimulatedPrice(currentSignal.price);
+  // All values are pulled live from /candles every 15s — never a demo seed.
+  // First poll lands ~1s after mount; before that we show "—".
+  // `isLive` is false when the backend returned synthetic/demo data (provider down).
+  const { price, tick, changePct, source, isLive: priceIsLive } = useLivePrice();
   const { status, error: statusError } = useDataStatus();
   const pairLabel = instrument?.label ?? 'XAU/USD';
   const decimals  = instrument?.decimals ?? 2;
@@ -60,14 +140,17 @@ export default function Header({ instrument }) {
     return () => clearInterval(id);
   }, []);
 
-  const utcTime = now.toUTCString().slice(17, 25);
-  const session = getCurrentSession();
-  const isUp = currentSignal.changePct >= 0;
+  // Wall clock shown in East Africa Time (UTC+3). Session detection still
+  // uses UTC since ICT killzones are defined in UTC.
+  const localTime = formatKenyaTime(now);
+  const session   = getCurrentSession();
+  // Up/down derives from the LIVE 24h change percentage, not the mock fallback.
+  const isUp = (changePct ?? 0) >= 0;
 
   const isLive    = status?.dataMode === 'live';
   const provider  = status?.fxProvider ?? null;
   const lastSeen  = status?.timestamp
-    ? new Date(status.timestamp).toLocaleTimeString()
+    ? formatKenyaTime(status.timestamp)
     : null;
 
   return (
@@ -93,12 +176,31 @@ export default function Header({ instrument }) {
             tick === 'up' ? 'text-emerald-400' : tick === 'down' ? 'text-red-400' : 'text-white'
           }`}
         >
-          {price.toFixed(decimals)}
+          {price != null ? price.toFixed(decimals) : '—'}
         </span>
         <div className={`flex items-center gap-0.5 text-xs font-mono ${isUp ? 'text-emerald-400' : 'text-red-400'}`}>
           {isUp ? <TrendingUp size={12} /> : <TrendingDown size={12} />}
-          {isUp ? '+' : ''}{currentSignal.changePct.toFixed(2)}%
+          {changePct != null
+            ? `${isUp ? '+' : ''}${changePct.toFixed(2)}% 24h`
+            : '—'}
         </div>
+        {/* Source chip — green for live providers, red when backend served synthetic */}
+        {source && (
+          <span
+            className={`text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border ${
+              priceIsLive
+                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                : 'border-red-500/50 bg-red-500/10 text-red-300'
+            }`}
+            title={priceIsLive
+              ? `Live feed: ${source}`
+              : `Provider down — backend returned ${source}. Refusing to display synthetic prices.`}
+          >
+            {priceIsLive
+              ? (source.replace('-cached', '') + (source.endsWith('-cached') ? ' ⟲' : ''))
+              : 'NO LIVE FEED'}
+          </span>
+        )}
       </div>
 
       {/* Status Bar */}
@@ -110,10 +212,10 @@ export default function Header({ instrument }) {
           <span className="text-gray-300">{session}</span>
         </div>
 
-        {/* UTC Clock */}
+        {/* EAT Clock (Africa/Nairobi, UTC+3) */}
         <div className="flex items-center gap-1.5 hidden sm:flex">
           <Clock size={12} />
-          <span className="font-mono">{utcTime} UTC</span>
+          <span className="font-mono">{localTime} {KENYA_LABEL}</span>
         </div>
 
         {/* Data Mode badge */}

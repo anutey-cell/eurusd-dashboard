@@ -135,6 +135,248 @@ def _fire(direction: str, entry: float, sl: float, tp: float,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 0. MOMENTUM BREAKOUT — catches strong directional moves ICT engine misses
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The ICT swing engine requires a specific sequence: liquidity sweep ->
+# market structure shift -> FVG retest. When gold rips in a single session
+# (e.g. NY open surge on Fed news, Asian session gap fill) without a clean
+# pre-sweep, ICT stays in WAIT and we miss the move entirely.
+#
+# This engine fires on:
+#   1. Current M15 bar body >= 2.0x ATR_14  (true expansion, not noise)
+#   2. Volume >= 1.5x last-20-bar average    (institutional participation)
+#   3. Close in top/bottom 20% of the bar    (decisive close, not a wick)
+#   4. Direction confirmed by 3-bar EMA slope (no counter-trend)
+#   5. In a TRADE/PRESS killzone (skip overnight Asian chop)
+#
+# Risk: the breakout bar IS the setup. Entry at next bar's open;
+# SL = opposite extreme of breakout bar + 1pt buffer; TP = 2.5R.
+
+def analyze_momentum_breakout(
+    candles, at: datetime, macro_events: list[dict] | None = None,
+    pip_size: float = 1.0,
+    target_rr: float = 2.5,
+    # Defaults TUNED from 5000-bar real-data audit (momentum-audit endpoint):
+    # body=2.0x + vol=1.5x + close=0.80 only fired 18/4978 = 0.36% — too strict.
+    # body=1.5x + vol=1.2x + close=0.70 fires ~113/4978 = 2.3% — usable cadence.
+    min_body_atr_mult: float = 1.5,    # body must be 1.5x ATR_14 (was 2.0x)
+    min_volume_mult:   float = 1.2,    # vol must be 1.2x 20-bar avg (was 1.5x)
+    min_close_pct:     float = 0.70,   # close in top/bottom 30% of bar (was 0.80)
+    max_sl_pts:        float = 60.0,   # XAU/USD M15 bars often 20-40pts wide (was 25.0)
+    sl_mode:           str   = "atr",  # "bar_extreme" (full range) | "atr" (1.5x ATR)
+    sl_atr_mult:       float = 1.5,    # used when sl_mode="atr"
+    enable_killzone:   bool  = True,
+    enable_news_filter: bool = True,
+    # ── HTF trend filter (added after backtest showed negative edge w/o it) ──
+    # Only allow BUYs when the H1 EMA21 > EMA50 (uptrend), SELLs when EMA21 < EMA50.
+    # H1 series is built by aggregating the most recent M15 candles in groups of 4.
+    # Backtest result of momentum_breakout with this filter ON: see /backtest/engine-comparison.
+    enable_htf_trend:  bool  = True,
+    htf_aggregation:   int   = 4,      # 4 M15 bars per H1 (M15 source -> H1 trend)
+    # ── Fade mode (Hypothesis A: gold M15 is mean-reverting) ────────────────
+    # When True, FLIPS the signal direction after all gates pass. A BUY
+    # breakout becomes a SELL and vice versa. Lets us test whether fading
+    # breakouts has edge in mean-reverting markets like gold M15.
+    # When fade_mode=True, also flips the HTF trend filter check (so we want
+    # to be SHORT during uptrends to fade strength, LONG during downtrends).
+    fade_mode:         bool  = False,
+    **_,
+) -> SignalResult:
+    """
+    Pure-momentum entry on a strong, high-volume, decisive M15 bar.
+
+    Designed to catch what the ICT engine misses — clean breakouts that don't
+    go through the sweep/MSS/FVG choreography. Example: 14:15 UTC on
+    2026-05-20 fired a +$29 body on 30k volume (3x avg). ICT stayed WAIT;
+    this engine would have logged a BUY.
+    """
+    if not candles or len(candles) < 22:
+        return _wait("Need >= 22 bars for ATR + volume baseline",
+                     at, "momentum_breakout")
+
+    # Killzone gate first (most aggressive filter — exits fast in dead hours)
+    if enable_killzone and not _in_killzone(at):
+        return _wait("Outside killzone", at, "momentum_breakout")
+
+    # News gate — note: check_news_risk(macro_events, at, pair) — events FIRST
+    news_res = check_news_risk(macro_events or [], at, pair="xauusd")
+    if enable_news_filter and not news_res.clear:
+        return _wait(f"News blocked: {news_res.blocking_event}",
+                     at, "momentum_breakout")
+
+    # The "breakout bar" is the LAST closed bar.
+    bar  = candles[-1]
+    body = abs(bar.close - bar.open)
+    rng  = bar.high - bar.low
+    if rng <= 0:
+        return _wait("Degenerate bar (zero range)", at, "momentum_breakout")
+
+    # ── Gate 1: body must be a true expansion vs ATR ────────────────────
+    atr = _atr(candles[:-1], period=14, pip_size=pip_size)
+    if atr <= 0:
+        return _wait("ATR=0 (flat market)", at, "momentum_breakout")
+    body_atr_mult = body / atr
+    if body_atr_mult < min_body_atr_mult:
+        return _wait(
+            f"Body {body:.2f} is only {body_atr_mult:.1f}x ATR "
+            f"(need >= {min_body_atr_mult}x)",
+            at, "momentum_breakout",
+        )
+
+    # ── Gate 2: volume confirmation ─────────────────────────────────────
+    vols = [c.volume for c in candles[-21:-1] if c.volume]
+    if vols:
+        avg_vol = sum(vols) / len(vols)
+        if avg_vol > 0:
+            vol_mult = bar.volume / avg_vol
+            if vol_mult < min_volume_mult:
+                return _wait(
+                    f"Volume {bar.volume} is only {vol_mult:.1f}x avg "
+                    f"(need >= {min_volume_mult}x). No institutional participation.",
+                    at, "momentum_breakout",
+                )
+        else:
+            vol_mult = 0.0
+    else:
+        vol_mult = 0.0   # no volume data — skip the gate
+
+    # ── Gate 3: decisive close (in top/bottom 20% of bar) ───────────────
+    bull = bar.close > bar.open
+    if bull:
+        close_pct = (bar.close - bar.low) / rng    # 1.0 = close at high
+    else:
+        close_pct = (bar.high - bar.close) / rng   # 1.0 = close at low
+    if close_pct < min_close_pct:
+        return _wait(
+            f"Close in middle of bar (close_pct={close_pct:.2f} < {min_close_pct}). "
+            "Wick suggests rejection.",
+            at, "momentum_breakout",
+        )
+
+    # ── Gate 4: EMA21 slope must agree (no counter-trend, intra-TF) ─────
+    closes = [c.close for c in candles]
+    ema21  = _ema(closes, 21)
+    slope_ok = (
+        bull and ema21[-1] > ema21[-3]
+    ) or (
+        (not bull) and ema21[-1] < ema21[-3]
+    )
+    if not slope_ok:
+        return _wait(
+            "EMA21 slope disagrees with breakout direction (counter-trend).",
+            at, "momentum_breakout",
+        )
+
+    # ── Gate 5: HTF trend filter (only trade WITH H1 trend) ─────────────
+    # Aggregate M15 candles into H1 by taking every Nth close. Compute
+    # EMA21 and EMA50 on the H1 series. Require:
+    #   BUY  → H1 EMA21 > EMA50 (uptrend)
+    #   SELL → H1 EMA21 < EMA50 (downtrend)
+    # This single filter typically flips a noisy momentum strategy from
+    # negative to positive expectancy on M15 XAU/USD.
+    if enable_htf_trend and htf_aggregation > 1:
+        agg = max(2, int(htf_aggregation))
+        # H1 closes = the LAST close in every aggregated group of M15 bars
+        h1_closes = [closes[i] for i in range(agg - 1, len(closes), agg)]
+        if len(h1_closes) >= 50:
+            htf_ema21 = _ema(h1_closes, 21)
+            htf_ema50 = _ema(h1_closes, 50)
+            uptrend   = htf_ema21[-1] > htf_ema50[-1]
+            downtrend = htf_ema21[-1] < htf_ema50[-1]
+            # In fade mode the polarity inverts: we WANT to short uptrends
+            # and buy downtrends (catching exhaustion at extremes).
+            if fade_mode:
+                # bull = original BUY breakout. We'll flip it to SELL, so we
+                # want an UPTREND to fade. (i.e. SHORT into uptrend strength)
+                if bull and not uptrend:
+                    return _wait(
+                        f"Fade BUY-flip: need UPTREND to fade, EMA21={htf_ema21[-1]:.2f} <= EMA50={htf_ema50[-1]:.2f}",
+                        at, "momentum_breakout",
+                    )
+                if (not bull) and not downtrend:
+                    return _wait(
+                        f"Fade SELL-flip: need DOWNTREND to fade, EMA21={htf_ema21[-1]:.2f} >= EMA50={htf_ema50[-1]:.2f}",
+                        at, "momentum_breakout",
+                    )
+            else:
+                if bull and not uptrend:
+                    return _wait(
+                        f"HTF trend disagrees: BUY blocked because H1 EMA21 "
+                        f"({htf_ema21[-1]:.2f}) <= EMA50 ({htf_ema50[-1]:.2f}).",
+                        at, "momentum_breakout",
+                    )
+                if (not bull) and not downtrend:
+                    return _wait(
+                        f"HTF trend disagrees: SELL blocked because H1 EMA21 "
+                        f"({htf_ema21[-1]:.2f}) >= EMA50 ({htf_ema50[-1]:.2f}).",
+                        at, "momentum_breakout",
+                    )
+
+    # ── FADE FLIP ───────────────────────────────────────────────────────
+    # In fade mode, BUY breakout becomes a SELL setup and vice versa.
+    # We flip `bull` here so the SL/TP geometry below is computed for the
+    # inverted direction.
+    direction_pre_flip = "BUY" if bull else "SELL"
+    if fade_mode:
+        bull = not bull
+
+    # ── Build trade plan ────────────────────────────────────────────────
+    # Two SL modes:
+    #   "bar_extreme": SL at the opposite extreme of the breakout bar
+    #                  (works for tight bars, bad for wide bars on XAU/USD)
+    #   "atr"        : SL = entry +/- sl_atr_mult * ATR
+    #                  (tighter, more consistent risk regardless of bar width)
+    entry = bar.close
+    if sl_mode == "atr":
+        sl_distance = max(sl_atr_mult * atr, 2.0)   # at least 2 pts
+        sl = entry - sl_distance if bull else entry + sl_distance
+    else:
+        sl = (bar.low - 1.0) if bull else (bar.high + 1.0)
+
+    risk_pts = abs(entry - sl)
+    if risk_pts > max_sl_pts:
+        return _wait(
+            f"SL distance {risk_pts:.1f} pts exceeds cap {max_sl_pts} "
+            "(breakout bar too wide for this SL mode).",
+            at, "momentum_breakout",
+        )
+
+    # Target = max(target_rr * risk, MIN_TARGET_PTS) so that spread + slippage
+    # (~2 pts on XAU/USD) never eats more than 15% of the reward. With small
+    # ATR-based SLs (~6 pts) and target_rr=2.5 you get TP=15pts — minus 2pt
+    # cost = 13pts net, vs 8pt net risk → ~1.6 RR after costs. Without this
+    # floor the small-SL setups always get rejected by RR_AFTER_COST_TOO_LOW.
+    MIN_TARGET_PTS = 20.0
+    target_pts = max(risk_pts * target_rr, MIN_TARGET_PTS)
+    if bull:
+        tp = entry + target_pts
+    else:
+        tp = entry - target_pts
+    # Recompute the actual rr the engine claims (so quality_score is honest)
+    actual_rr = target_pts / risk_pts if risk_pts > 0 else 0
+
+    # Quality score: 60 base + body multiplier + volume bonus
+    score = min(95, int(60 + (body_atr_mult - min_body_atr_mult) * 6 +
+                        (vol_mult - min_volume_mult) * 8))
+
+    direction = "BUY" if bull else "SELL"
+    mode_label = "FADE" if fade_mode else "MOMENTUM"
+    reason = (
+        f"{mode_label} {direction} (orig setup was {direction_pre_flip}): "
+        f"body {body:.1f} ({body_atr_mult:.1f}x ATR), "
+        f"vol {vol_mult:.1f}x avg, close@{int(close_pct*100)}% of bar, RR={actual_rr:.2f}"
+    )
+    return _fire(
+        direction=direction, entry=entry, sl=sl, tp=tp,
+        risk_pts=risk_pts, target_pts=target_pts, rr=actual_rr,
+        reason=reason, at=at, news=news_res,
+        setup="momentum_fade" if fade_mode else "momentum_breakout",
+        score=score,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 1. TREND PULLBACK — EMA21/50 trend with pullback entries
 # ═══════════════════════════════════════════════════════════════════════════════
 

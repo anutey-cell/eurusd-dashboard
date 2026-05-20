@@ -29,6 +29,7 @@ import {
   getTelegramStatus,
   sendTelegramTest,
 } from '../services/api';
+import { formatKenyaTime, formatKenyaDateTime, KENYA_LABEL } from '../utils/time';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -40,7 +41,7 @@ function fmt(value, decimals = 5) {
 function fmtTime(isoStr) {
   if (!isoStr) return '—';
   try {
-    return new Date(isoStr).toLocaleTimeString();
+    return `${formatKenyaTime(isoStr)} ${KENYA_LABEL}`;
   } catch {
     return isoStr;
   }
@@ -49,8 +50,7 @@ function fmtTime(isoStr) {
 function fmtDateTime(isoStr) {
   if (!isoStr) return '—';
   try {
-    const d = new Date(isoStr);
-    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+    return `${formatKenyaDateTime(isoStr)} ${KENYA_LABEL}`;
   } catch {
     return isoStr;
   }

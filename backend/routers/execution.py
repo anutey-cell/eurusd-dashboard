@@ -183,3 +183,45 @@ def kill_switch() -> KillSwitchResponse:
     result = trigger_kill_switch()
     logger.critical("KILL SWITCH activated via API")
     return KillSwitchResponse(**result)
+
+
+# ─── Autonomous learning-mode executor ────────────────────────────────────────
+
+@router.get(
+    "/autonomous/status",
+    summary="Auto-executor config + today's count + last attempt outcome",
+)
+@limiter.limit("60/minute")
+def autonomous_status(request: Request) -> dict:
+    """
+    Returns the current auto-executor state:
+      - config (enabled flags, lot cap, daily cap)
+      - master switch (ok or blocking_reason)
+      - daily count (trades_today / limit / remaining)
+      - thresholds (scanner/predictor/killzone minimums)
+      - last_attempt (most recent ExecutionAttempt snapshot from the loop)
+    """
+    from database import SessionLocal
+    from services.auto_executor import get_status
+    from services.background_scheduler import get_last_auto_attempt
+    with SessionLocal() as db:
+        status = get_status(db)
+    status["last_attempt"] = get_last_auto_attempt()
+    return {"ok": True, "data": status}
+
+
+@router.post(
+    "/autonomous/preview",
+    summary="Dry-run: evaluate gates WITHOUT firing an order",
+)
+@limiter.limit("12/minute")
+def autonomous_preview(request: Request) -> dict:
+    """
+    Runs the full 3-layer confirmation pipeline and returns whether an
+    order would fire right now. Never actually submits anything.
+    """
+    from database import SessionLocal
+    from services.auto_executor import preview_attempt
+    with SessionLocal() as db:
+        result = preview_attempt(db)
+    return {"ok": True, "data": result}

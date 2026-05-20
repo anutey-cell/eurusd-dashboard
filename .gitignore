@@ -6,6 +6,12 @@ backend/**/*.pyc
 backend/**/*.pyo
 backend/.pytest_cache/
 
+# Catch-all for any __pycache__/*.pyc/*.pyo anywhere in the tree
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
 # ── Database (local only — never commit real signal data) ─────────────────────
 backend/*.db
 backend/*.db-shm
@@ -21,6 +27,22 @@ backend/.env
 backend/*.env
 backend/.env.*
 !backend/.env.example
+
+# Deploy kit: keep the *.example templates, ignore the real ones
+deploy/.env.prod
+deploy/.env.bridge
+!deploy/.env.prod.example
+!deploy/.env.bridge.example
+
+# Log captures from local debugging (committed by mistake otherwise)
+*.log
+backend_last_*.log
+frontend_last_*.log
+
+# Bulk historical-candle CSV exports — can be regenerated via
+# POST /api/v1/backtest/fetch-tradingview. Keep the repo lean.
+tools/*.csv
+tools/xauusd_*.csv
 
 # ── Node / Frontend ───────────────────────────────────────────────────────────
 node_modules/

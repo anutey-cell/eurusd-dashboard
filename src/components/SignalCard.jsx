@@ -2,6 +2,7 @@ import { ArrowUpCircle, ArrowDownCircle, MinusCircle } from 'lucide-react';
 import { currentSignal as mockSignal } from '../data/mockData';
 import { SkeletonCard } from './Skeleton';
 import { FallbackChip } from './BackendBanner';
+import { formatKenyaDateTime, KENYA_LABEL } from '../utils/time';
 
 const DIRECTION_CONFIG = {
   BUY:     { icon: ArrowUpCircle,   cls: 'text-emerald-400', bg: 'bg-emerald-500/10', border: 'border-emerald-500/30', label: 'LONG / BUY'   },
@@ -28,7 +29,7 @@ export default function SignalCard({
 }) {
   const cfg      = DIRECTION_CONFIG[s?.direction] ?? DIRECTION_CONFIG.NEUTRAL;
   const Icon     = cfg.icon;
-  const timeStr  = s ? new Date(s.timestamp).toUTCString().slice(5, 22) + ' UTC' : '';
+  const timeStr  = s ? `${formatKenyaDateTime(s.timestamp)} ${KENYA_LABEL}` : '';
   const factors  = s?.factors ?? [];
   const avgScore = factors.length ? Math.round(factors.reduce((a, f) => a + f.score, 0) / factors.length) : 0;
 

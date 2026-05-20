@@ -173,6 +173,58 @@ def _run_scanner_iteration():
                   result.get("trend_pullback", {}).get("signal"))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Autonomous Executor loop — only fires when ALL gates pass
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Latest attempt snapshot exposed via /execution/autonomous/status
+_last_auto_attempt: dict | None = None
+
+
+def get_last_auto_attempt() -> dict | None:
+    """Return the most recent ExecutionAttempt snapshot (None if none yet)."""
+    return _last_auto_attempt
+
+
+async def _auto_executor_loop():
+    """
+    Calls auto_executor.evaluate_and_execute() every settings.auto_execution_interval_sec.
+
+    The function is a no-op unless settings.auto_execution_enabled is True AND
+    all 3 confirmation layers + 13 MT5 gates pass. Daily ceiling and lot cap
+    are enforced inside the executor itself.
+    """
+    from config import settings
+    interval = getattr(settings, "auto_execution_interval_sec", 60)
+    log.info("[scheduler] auto-executor loop started (every %ds, enabled=%s)",
+             interval, settings.auto_execution_enabled)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(_run_auto_executor_iteration)
+        except asyncio.CancelledError:
+            log.info("[scheduler] auto-executor loop cancelled")
+            raise
+        except Exception as exc:
+            log.warning("[scheduler] auto-executor loop error: %s", exc)
+
+
+def _run_auto_executor_iteration():
+    """Single auto-executor iteration (runs in thread)."""
+    global _last_auto_attempt
+    from database import SessionLocal
+    from services.auto_executor import evaluate_and_execute
+    with SessionLocal() as db:
+        att = evaluate_and_execute(db)
+        _last_auto_attempt = att.to_dict()
+        if att.fired:
+            log.info("[auto_exec] order placed ticket=%s lot=%.2f signal=%s",
+                     att.ticket, att.lot_size, att.signal)
+        elif att.blocking_reason:
+            log.debug("[auto_exec] blocked at %s: %s",
+                      att.blocking_layer, att.blocking_reason)
+
+
 async def _prediction_alert_loop():
     """Periodically check the high-probability predictor and alert on STRONG."""
     log.info("[scheduler] prediction alert loop started (every %ds)",
@@ -312,6 +364,7 @@ async def start_background_loops():
         asyncio.create_task(_prediction_alert_loop(),  name="prediction_alert_loop"),
         asyncio.create_task(_drawdown_loop(),          name="drawdown_loop"),
         asyncio.create_task(_daily_summary_loop(),     name="daily_summary_loop"),
+        asyncio.create_task(_auto_executor_loop(),     name="auto_executor_loop"),
     ]
     log.info("[scheduler] %d background loops started", len(_tasks))
 

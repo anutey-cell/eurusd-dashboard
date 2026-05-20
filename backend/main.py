@@ -18,7 +18,7 @@ import db_models  # registers ORM classes with Base.metadata
 from logging_config import setup_logging
 from middleware import RequestLoggingMiddleware, AuthMiddleware
 from rate_limit import limiter
-from routers import health, candles, calendar, signal, analytics, backtest, execution, mt5 as mt5_router, telegram as telegram_router, engine as engine_router, readiness as readiness_router, risk as risk_router, scan as scan_router, observations as observations_router, prediction as prediction_router
+from routers import health, candles, calendar, signal, analytics, backtest, execution, mt5 as mt5_router, telegram as telegram_router, engine as engine_router, readiness as readiness_router, risk as risk_router, scan as scan_router, observations as observations_router, prediction as prediction_router, killzones as killzones_router, institutional as institutional_router, bridge as bridge_router, diagnostics as diagnostics_router
 
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
@@ -29,15 +29,18 @@ async def lifespan(app: FastAPI):
     db_models.Base.metadata.create_all(bind=engine)
     import logging
     log = logging.getLogger(__name__)
-    # ── Inline SQLite migrations (idempotent) ─────────────────────────────────
+    # ── Inline migrations (idempotent, DB-agnostic) ──────────────────────────
+    # Single quotes for string defaults so the same SQL runs on both SQLite
+    # (dev) and Postgres (Supabase prod). Each statement is in its own try
+    # block so a "column already exists" failure doesn't abort later ones.
     try:
         from sqlalchemy import text
         with engine.begin() as _conn:
             # paper_observations.engine_id (Phase 3 — dual-engine tagging)
             try:
                 _conn.execute(text(
-                    'ALTER TABLE paper_observations '
-                    'ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT "swing"'
+                    "ALTER TABLE paper_observations "
+                    "ADD COLUMN engine_id VARCHAR(32) NOT NULL DEFAULT 'swing'"
                 ))
                 log.info("Migration: added paper_observations.engine_id column")
             except Exception:
@@ -46,6 +49,15 @@ async def lifespan(app: FastAPI):
                 _conn.execute(text(
                     'CREATE INDEX IF NOT EXISTS ix_paper_observations_engine_id '
                     'ON paper_observations(engine_id)'
+                ))
+            except Exception:
+                pass
+            # pending_executions table for the MT5 bridge (VPS ↔ laptop daemon).
+            # create_all above handles new installs; this ensures upgrades pick it up too.
+            try:
+                _conn.execute(text(
+                    'CREATE INDEX IF NOT EXISTS ix_pending_executions_status_created '
+                    'ON pending_executions(status, created_at)'
                 ))
             except Exception:
                 pass
@@ -188,6 +200,10 @@ app.include_router(risk_router.router,      prefix=prefix)
 app.include_router(scan_router.router,      prefix=prefix)
 app.include_router(observations_router.router, prefix=prefix)
 app.include_router(prediction_router.router,   prefix=prefix)
+app.include_router(killzones_router.router,    prefix=prefix)
+app.include_router(institutional_router.router, prefix=prefix)
+app.include_router(bridge_router.router,         prefix=prefix)
+app.include_router(diagnostics_router.router,    prefix=prefix)
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────

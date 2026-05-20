@@ -1,23 +1,183 @@
-import { Building2, Layers, Zap, BarChart } from 'lucide-react';
-import { institutionalData } from '../data/mockData';
+/**
+ * InstitutionalPanel — LIVE flow for XAU/USD.
+ *
+ * Source: GET /api/v1/institutional (replaces the old mockData.institutionalData
+ * which had stale EUR/USD-era prices like 1.09000, 1.08780).
+ *
+ * Shows:
+ *   - CFTC COT positioning (commercials vs large specs, weekly change, bias)
+ *   - Live key price levels (swing highs/lows, recent FVG, daily range)
+ *   - MyFxBook retail sentiment when configured
+ *
+ * Anything without a real data source is OMITTED, not faked.
+ */
+import { useState, useEffect, useCallback } from 'react';
+import {
+  Building2, TrendingUp, TrendingDown, RefreshCw, AlertTriangle,
+  Layers, BarChart, Target, Calendar, Eye,
+} from 'lucide-react';
+import { getInstitutional } from '../services/api';
+import { formatKenyaDateTime, KENYA_LABEL } from '../utils/time';
+import { usePollInterval } from '../hooks/usePollInterval';
 
-function SentimentGauge({ ratio, label }) {
+const POLL_MS = 5 * 60_000;   // 5 min — COT only updates weekly anyway
+
+// ── Sub: COT card ──────────────────────────────────────────────────────────
+function CotCard({ cot }) {
+  if (!cot || cot.source === 'unavailable' || cot.source === 'demo_fallback') {
+    return (
+      <Block title="CFTC COT (weekly)" icon={Calendar}>
+        <Unavailable
+          msg={cot?.error || 'CFTC fetch failed — provider returned no data this week'}
+        />
+      </Block>
+    );
+  }
+  const bias = cot.bias || 'Neutral';
+  const biasCls = bias === 'Bullish' ? 'text-emerald-400'
+                : bias === 'Bearish' ? 'text-red-400'
+                : 'text-gray-400';
+  const change = cot.change ?? 0;
+  return (
+    <Block title="CFTC COT (weekly)" icon={Calendar} subtitle={`Source: ${cot.source}`}>
+      <Row label="As of"            value={cot.asOf || '—'} />
+      <Row label="Net position"     value={cot.netPosition?.toLocaleString() ?? '—'} valueCls={cot.netPosition >= 0 ? 'text-emerald-400' : 'text-red-400'} />
+      <Row label="Long contracts"   value={cot.longContracts?.toLocaleString() ?? '—'} valueCls="text-emerald-300" />
+      <Row label="Short contracts"  value={cot.shortContracts?.toLocaleString() ?? '—'} valueCls="text-red-300" />
+      <Row
+        label="Weekly change"
+        value={`${change >= 0 ? '+' : ''}${change.toLocaleString()}`}
+        valueCls={change >= 0 ? 'text-emerald-400' : 'text-red-400'}
+      />
+      <Row label="Bias" value={bias} valueCls={biasCls + ' font-bold'} />
+    </Block>
+  );
+}
+
+// ── Sub: Key price levels card ─────────────────────────────────────────────
+function LevelsCard({ levels }) {
+  const liveSources = new Set(['tradingview', 'mt5', 'tradingview-cached', 'mt5-cached']);
+  const src = levels?.data_source;
+  if (!levels || !liveSources.has(src)) {
+    return (
+      <Block title="Institutional Price Levels" icon={Target}>
+        <Unavailable
+          msg={levels?.error || `Refusing to display levels from ${src ?? 'unknown'} source — live feed required.`}
+        />
+      </Block>
+    );
+  }
+  const cur = levels.current_price;
+  return (
+    <Block title="Institutional Price Levels" icon={Target} subtitle={`Computed from ${src} H4 candles`}>
+      {cur != null && <Row label="Current price"     value={`$${cur.toFixed(2)}`} valueCls="text-white font-bold" />}
+      {levels.daily_open      != null && <Row label="Daily open"        value={`$${levels.daily_open.toFixed(2)}`} />}
+      {levels.daily_high      != null && <Row label="Today's high"      value={`$${levels.daily_high.toFixed(2)}`} valueCls="text-emerald-300" />}
+      {levels.daily_low       != null && <Row label="Today's low"       value={`$${levels.daily_low.toFixed(2)}`} valueCls="text-red-300" />}
+      {levels.prev_daily_high != null && <Row label="Prev daily high"   value={`$${levels.prev_daily_high.toFixed(2)} (liquidity above)`} valueCls="text-emerald-300" />}
+      {levels.prev_daily_low  != null && <Row label="Prev daily low"    value={`$${levels.prev_daily_low.toFixed(2)} (liquidity below)`} valueCls="text-red-300" />}
+    </Block>
+  );
+}
+
+// ── Sub: FVG card ──────────────────────────────────────────────────────────
+function FvgCard({ levels }) {
+  if (!levels?.last_fvg_bull && !levels?.last_fvg_bear) return null;
+  return (
+    <Block title="Recent Fair Value Gaps" icon={Layers} subtitle="Imbalances institutions may rebalance">
+      {levels.last_fvg_bull && (
+        <div className="rounded border border-emerald-500/30 bg-emerald-500/5 p-2 mb-2">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[10px] uppercase tracking-widest text-emerald-300 font-bold">Bullish FVG</span>
+            <span className="text-[10px] text-gray-500">
+              {levels.last_fvg_bull.filled ? 'FILLED' : 'unfilled'}
+            </span>
+          </div>
+          <Row label="Zone"    value={`$${levels.last_fvg_bull.lower.toFixed(2)} - $${levels.last_fvg_bull.upper.toFixed(2)}`} />
+          <Row label="Mid"     value={`$${levels.last_fvg_bull.mid.toFixed(2)}`} />
+        </div>
+      )}
+      {levels.last_fvg_bear && (
+        <div className="rounded border border-red-500/30 bg-red-500/5 p-2">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[10px] uppercase tracking-widest text-red-300 font-bold">Bearish FVG</span>
+            <span className="text-[10px] text-gray-500">
+              {levels.last_fvg_bear.filled ? 'FILLED' : 'unfilled'}
+            </span>
+          </div>
+          <Row label="Zone" value={`$${levels.last_fvg_bear.lower.toFixed(2)} - $${levels.last_fvg_bear.upper.toFixed(2)}`} />
+          <Row label="Mid"  value={`$${levels.last_fvg_bear.mid.toFixed(2)}`} />
+        </div>
+      )}
+    </Block>
+  );
+}
+
+// ── Sub: Swing pivots card (institutional liquidity pools) ─────────────────
+function SwingsCard({ levels }) {
+  const highs = levels?.swing_highs || [];
+  const lows  = levels?.swing_lows  || [];
+  if (!highs.length && !lows.length) return null;
+  return (
+    <Block title="Recent Swing Pivots" icon={BarChart} subtitle="Liquidity pools — stops parked here">
+      {highs.length > 0 && (
+        <div className="mb-2">
+          <div className="text-[10px] uppercase tracking-widest text-emerald-300 mb-1">Swing highs</div>
+          {highs.map((h, i) => (
+            <Row key={`h${i}`} label={new Date(h.time).toLocaleDateString()} value={`$${h.price.toFixed(2)}`} valueCls="text-emerald-300" />
+          ))}
+        </div>
+      )}
+      {lows.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-widest text-red-300 mb-1">Swing lows</div>
+          {lows.map((l, i) => (
+            <Row key={`l${i}`} label={new Date(l.time).toLocaleDateString()} value={`$${l.price.toFixed(2)}`} valueCls="text-red-300" />
+          ))}
+        </div>
+      )}
+    </Block>
+  );
+}
+
+// ── Sub: Sentiment card (MyFxBook) ─────────────────────────────────────────
+function SentimentCard({ sentiment }) {
+  if (!sentiment) return null;
+  const ratio = sentiment.longPct ?? sentiment.long_percent ?? sentiment.longPercent;
+  if (ratio == null) return null;
   const sellRatio = 100 - ratio;
   return (
-    <div>
+    <Block title="MyFxBook Retail Sentiment" icon={Eye}>
       <div className="flex justify-between text-[10px] mb-1">
-        <span className="text-emerald-400 font-medium">Buy {ratio}%</span>
-        <span className="text-red-400 font-medium">Sell {sellRatio}%</span>
+        <span className="text-emerald-400 font-medium">Long {ratio}%</span>
+        <span className="text-red-400 font-medium">Short {sellRatio}%</span>
       </div>
       <div className="flex h-2 rounded-full overflow-hidden">
-        <div className="bg-emerald-500 transition-all" style={{ width: `${ratio}%` }} />
+        <div className="bg-emerald-500" style={{ width: `${ratio}%` }} />
         <div className="bg-red-500 flex-1" />
       </div>
+      <div className="text-[9px] text-gray-500 mt-1.5">
+        Retail crowd. Engine treats extremes (&gt;70/&lt;30) as contrarian.
+      </div>
+    </Block>
+  );
+}
+
+// ── Layout helpers ─────────────────────────────────────────────────────────
+function Block({ title, icon: Icon, subtitle, children }) {
+  return (
+    <div className="bg-[#161b27] border border-[#263044] rounded-lg p-3 flex-1 min-w-[240px]">
+      <div className="flex items-center gap-1.5 mb-2">
+        {Icon && <Icon size={11} className="text-purple-400" />}
+        <span className="text-[10px] uppercase tracking-widest text-gray-300 font-bold">{title}</span>
+      </div>
+      {subtitle && <div className="text-[9px] text-gray-600 mb-2">{subtitle}</div>}
+      <div className="space-y-0">{children}</div>
     </div>
   );
 }
 
-function StatRow({ label, value, valueCls = 'text-white' }) {
+function Row({ label, value, valueCls = 'text-white' }) {
   return (
     <div className="flex justify-between items-center py-1 border-b border-[#1e2535] last:border-0">
       <span className="text-xs text-gray-500">{label}</span>
@@ -26,104 +186,81 @@ function StatRow({ label, value, valueCls = 'text-white' }) {
   );
 }
 
-export default function InstitutionalPanel() {
-  const { cotData, orderFlow, darkPoolActivity, bankLevels } = institutionalData;
+function Unavailable({ msg }) {
+  return (
+    <div className="flex items-start gap-2 text-[10px] text-amber-300 leading-tight py-2">
+      <AlertTriangle size={11} className="shrink-0 mt-0.5" />
+      <span>{msg}</span>
+    </div>
+  );
+}
 
-  const cotChange = cotData.weeklyChange >= 0 ? `+${cotData.weeklyChange.toLocaleString()}` : cotData.weeklyChange.toLocaleString();
-  const flowDelta = orderFlow.delta >= 0 ? `+${(orderFlow.delta / 1e6).toFixed(2)}M` : `${(orderFlow.delta / 1e6).toFixed(2)}M`;
+// ── Main panel ─────────────────────────────────────────────────────────────
+export default function InstitutionalPanel() {
+  const [data, setData]       = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      const d = await getInstitutional();
+      setData(d);
+      setError(null);
+    } catch (e) {
+      setError(e?.message ?? 'Institutional fetch failed');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  usePollInterval(load, POLL_MS);
 
   return (
     <div className="card flex flex-col gap-0">
       <div className="card-header">
         <div className="flex items-center gap-2">
           <Building2 size={13} className="text-purple-400" />
-          <span className="card-title">Institutional Flow</span>
+          <span className="card-title">Institutional Flow · XAU/USD</span>
+          {data?.providers && (
+            <span className="text-[9px] text-gray-600">
+              COT={data.providers.cot} · levels={data.providers.levels}
+              {data.providers.sentiment !== 'unavailable' && ` · sent=${data.providers.sentiment}`}
+            </span>
+          )}
         </div>
-        <span className="text-[10px] text-gray-600">COT: {cotData.reportDate}</span>
+        <button
+          onClick={load}
+          disabled={loading}
+          className="flex items-center gap-1 text-[10px] text-gray-500 hover:text-gray-300"
+        >
+          <RefreshCw size={10} className={loading ? 'animate-spin' : ''} />
+          Refresh
+        </button>
       </div>
 
-      <div className="p-4 space-y-4">
-        {/* COT Data */}
-        <div>
-          <div className="flex items-center gap-1.5 mb-2">
-            <BarChart size={11} className="text-purple-400" />
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">CFTC COT Positions</span>
+      <div className="card-body">
+        {error && (
+          <div className="bg-red-500/10 border border-red-500/30 rounded p-2 text-[10px] text-red-300 flex items-center gap-1 mb-3">
+            <AlertTriangle size={10} />
+            {error}
           </div>
-          <div className="bg-[#1e2535] rounded-lg p-3 space-y-0">
-            <div className="flex items-end gap-2 mb-2">
-              <span className={`text-2xl font-black font-mono ${cotData.netPositions >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                {cotData.netPositions >= 0 ? '+' : ''}{cotData.netPositions.toLocaleString()}
-              </span>
-              <span className="text-xs text-gray-500 mb-1">net contracts</span>
-            </div>
-            <StatRow label="Weekly Change"    value={cotChange}                      valueCls={cotData.weeklyChange >= 0 ? 'text-emerald-400' : 'text-red-400'} />
-            <StatRow label="Large Speculators" value={`+${cotData.largeSpreaders.toLocaleString()}`} valueCls="text-emerald-400" />
-            <StatRow label="Commercials"      value={cotData.commercials.toLocaleString()} valueCls="text-red-400" />
-            <StatRow label="Small Specs"      value={cotData.smallSpeculators.toLocaleString()} valueCls="text-red-400" />
-            <div className={`mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold ${
-              cotData.sentiment === 'Bullish' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'
-            }`}>
-              {cotData.sentiment} Bias
-            </div>
-          </div>
-        </div>
+        )}
 
-        {/* Order Flow */}
-        <div>
-          <div className="flex items-center gap-1.5 mb-2">
-            <Zap size={11} className="text-yellow-400" />
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">Order Flow</span>
+        {data && (
+          <div className="flex flex-wrap gap-3">
+            <CotCard      cot={data.cot} />
+            <LevelsCard   levels={data.levels} />
+            <FvgCard      levels={data.levels} />
+            <SwingsCard   levels={data.levels} />
+            <SentimentCard sentiment={data.sentiment} />
           </div>
-          <div className="bg-[#1e2535] rounded-lg p-3 space-y-2">
-            <SentimentGauge ratio={orderFlow.buyRatio} />
-            <StatRow label="Cumulative Delta" value={flowDelta}            valueCls={orderFlow.delta >= 0 ? 'text-emerald-400' : 'text-red-400'} />
-            <StatRow label="Absorption"        value={orderFlow.absorption} valueCls="text-blue-400" />
-            <StatRow label="POC"               value={orderFlow.poc.toFixed(5)} />
-            <StatRow label="VAH / VAL"         value={`${orderFlow.vah.toFixed(5)} / ${orderFlow.val.toFixed(5)}`} valueCls="text-gray-400" />
-          </div>
-        </div>
+        )}
 
-        {/* Dark Pool */}
-        <div>
-          <div className="flex items-center gap-1.5 mb-2">
-            <Layers size={11} className="text-blue-400" />
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">Dark Pool Activity</span>
+        {data?.generated_at && (
+          <div className="text-[10px] text-gray-600 text-right mt-2">
+            Updated {formatKenyaDateTime(data.generated_at)} {KENYA_LABEL}
           </div>
-          <div className="bg-[#1e2535] rounded-lg p-3">
-            <StatRow label="Activity Level"  value={darkPoolActivity.level}                         valueCls="text-amber-400" />
-            <StatRow label="Block Prints"    value={`${darkPoolActivity.prints} today`}              />
-            <StatRow label="Avg Print Size"  value={`$${(darkPoolActivity.avgSize / 1e6).toFixed(1)}M`} valueCls="text-purple-400" />
-            <StatRow label="Trend"           value={darkPoolActivity.trend}                          valueCls="text-emerald-400" />
-            <StatRow label="Last Print"      value={darkPoolActivity.lastPrint}                      valueCls="text-gray-400" />
-          </div>
-        </div>
-
-        {/* Bank Levels */}
-        <div>
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 mb-2">Bank Reference Levels</div>
-          <div className="bg-[#1e2535] rounded-lg overflow-hidden">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-[#263044]">
-                  <th className="text-left py-1.5 px-3 text-[10px] text-gray-600">Bank</th>
-                  <th className="text-right py-1.5 px-3 text-[10px] text-gray-600">Level</th>
-                  <th className="text-right py-1.5 px-3 text-[10px] text-gray-600">Type</th>
-                </tr>
-              </thead>
-              <tbody>
-                {bankLevels.map((b, i) => (
-                  <tr key={i} className="border-b border-[#263044]/50 last:border-0">
-                    <td className="py-1.5 px-3 text-gray-400 truncate max-w-[90px]">{b.bank}</td>
-                    <td className="py-1.5 px-3 font-mono text-right text-white">{b.level.toFixed(5)}</td>
-                    <td className={`py-1.5 px-3 text-right font-medium ${b.type === 'Offer' ? 'text-red-400' : 'text-emerald-400'}`}>
-                      {b.type}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );

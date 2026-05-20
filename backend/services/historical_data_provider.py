@@ -237,19 +237,33 @@ def get_historical_candles(
     end_date:   datetime | None = None,
     lookback:   int             = 5000,
     instrument: str             = "XAU/USD",
-    allow_synthetic_fallback: bool = True,
+    allow_synthetic_fallback: bool = False,    # was True — caused silent synthetic poisoning of the learning engine
 ) -> tuple[list[Candle], str]:
     """
     Fetch historical candles in ascending time order.
 
     Returns (candles, source) where source is:
-      - "database"  : rows from historical_candles
-      - "synthetic" : generated fallback (only when allow_synthetic_fallback=True)
-      - "none"      : no data and fallback disabled
+      - "database"        : rows from historical_candles (real OR seeded — check `database_real` below)
+      - "database_real"   : rows whose source is "tradingview" / "mt5" / "csv" — safe for learning
+      - "database_synth"  : rows whose source is "synthetic" / "synthetic_seed" — POISONED, refused by default
+      - "synthetic"       : generated fallback (only when allow_synthetic_fallback=True)
+      - "none"            : no data and fallback disabled
+
+    SAFETY: `allow_synthetic_fallback` defaults to FALSE since 2026-05.
+    Any code path that needs real-only data (paper observations, adaptive
+    weights, backtests that feed learning) gets "none" instead of synthetic.
+    Callers that explicitly want synthetic for unit tests must opt-in.
 
     Lookback caps the result count to keep API responses bounded.
     """
     tf = normalise_timeframe(timeframe)
+
+    # Sources we consider "real" and safe to feed into the learning engine.
+    # csv = user-uploaded broker export. tradingview / mt5 = live providers.
+    # provider/sync = legacy real-provider tags. Anything else (synthetic,
+    # synthetic_seed, generated, seed) is poison for paper-observation
+    # resolution + backtest learning.
+    REAL_SOURCES = {"csv", "tradingview", "mt5", "provider", "sync", "broker"}
 
     q = db.query(HistoricalCandle).filter(
         HistoricalCandle.instrument == instrument,
@@ -264,6 +278,11 @@ def get_historical_candles(
             end_date = end_date.replace(tzinfo=timezone.utc)
         q = q.filter(HistoricalCandle.candle_time <= end_date)
 
+    # When synthetic fallback is disabled (default), filter at the SQL level
+    # so we never even pull synthetic rows from the DB.
+    if not allow_synthetic_fallback:
+        q = q.filter(HistoricalCandle.source.in_(REAL_SOURCES))
+
     rows = (
         q.order_by(HistoricalCandle.candle_time.asc())
          .limit(max(50, min(lookback, 50_000)))
@@ -271,6 +290,14 @@ def get_historical_candles(
     )
 
     if rows:
+        # Determine if the returned rows are real, mixed, or synthetic
+        sources = {r.source for r in rows}
+        if sources.issubset(REAL_SOURCES):
+            src_tag = "database_real"
+        elif sources.isdisjoint(REAL_SOURCES):
+            src_tag = "database_synth"
+        else:
+            src_tag = "database_mixed"
         return (
             [
                 Candle(
@@ -280,13 +307,15 @@ def get_historical_candles(
                 )
                 for r in rows
             ],
-            "database",
+            src_tag,
         )
 
     if not allow_synthetic_fallback:
         return [], "none"
 
-    # Synthetic fallback — use the deterministic generator
+    # Synthetic fallback — use the deterministic generator. Only hit when the
+    # caller explicitly opted in (allow_synthetic_fallback=True). Tagged
+    # clearly so downstream code can refuse.
     from data.candles import get_candles
     try:
         resp = get_candles(interval=tf, limit=max(200, min(lookback, 5000)), pair="xauusd")
@@ -662,7 +691,9 @@ def seed_historical_data(
     first_time = candles[0]["time"]
     last_time  = candles[-1]["time"]
 
-    # Bulk insert candles
+    # Bulk insert candles. Tag explicitly as "synthetic_seed" so the
+    # historical_data_provider (with allow_synthetic_fallback=False, now the
+    # default) refuses to return these for learning/backtest purposes.
     candle_records = [
         HistoricalCandle(
             instrument=instrument,
@@ -670,7 +701,7 @@ def seed_historical_data(
             candle_time=c["time"],
             open=c["open"], high=c["high"], low=c["low"], close=c["close"],
             volume=c["volume"],
-            source="seed",
+            source="synthetic_seed",
         )
         for c in candles
     ]

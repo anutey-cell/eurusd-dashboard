@@ -30,7 +30,7 @@ export default function TradingViewWidget({ symbol = 'OANDA:XAUUSD' }) {
         autosize: true,
         symbol: symbol,
         interval,
-        timezone: 'Etc/UTC',
+        timezone: 'Africa/Nairobi',
         theme: 'dark',
         style: '1',
         locale: 'en',

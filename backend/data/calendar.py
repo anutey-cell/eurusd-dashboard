@@ -108,14 +108,39 @@ _NEWS: list[NewsItem] = [
 ]
 
 
-def get_calendar(date: str | None = None) -> CalendarResponse:
+def get_calendar(
+    date: str | None = None,
+    *,
+    high_impact_only: bool = False,
+    force_refresh:    bool = False,
+) -> CalendarResponse:
+    """
+    Fetch macro calendar events.
+
+    Parameters
+    ----------
+    date              ISO date YYYY-MM-DD. Defaults to today.
+    high_impact_only  When True, returns only impact="high" events (CPI, NFP, FOMC, etc.)
+    force_refresh     When True, bypasses any provider-side cache for fresh data.
+    """
     from config import settings
+
     if settings.data_mode == "live":
         from services.calendar_provider import get_macro_calendar
-        live_events_raw = get_macro_calendar(date)
+        # The provider may accept force_refresh kw; pass it best-effort.
+        try:
+            live_events_raw = get_macro_calendar(date, force_refresh=force_refresh)
+        except TypeError:
+            live_events_raw = get_macro_calendar(date)
         live_events = [CalendarEvent(**e) for e in live_events_raw]
+        if high_impact_only:
+            live_events = [e for e in live_events if (e.impact or "").lower() == "high"]
         target = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         return CalendarResponse(date=target, events=live_events, news=[])
 
+    # Demo mode: serve mock — but still honour the high_impact_only filter
+    events = _EVENTS
+    if high_impact_only:
+        events = [e for e in events if (e.impact or "").lower() == "high"]
     target = date or "2026-05-13"
-    return CalendarResponse(date=target, events=_EVENTS, news=_NEWS)
+    return CalendarResponse(date=target, events=events, news=_NEWS)

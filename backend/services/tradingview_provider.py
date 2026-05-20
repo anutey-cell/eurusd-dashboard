@@ -49,6 +49,14 @@ PROBE_TTL   = 600       # re-test connectivity every 10 min
 # TVC:GOLD / TVC:XAUUSD returns empty for XAUUSD — do not use TVC for this symbol.
 _TV_SYMBOLS: dict[str, tuple[str, str]] = {
     "xauusd": ("XAUUSD", "OANDA"),
+    # Intermarket pairs for correlation engine + fundamental context.
+    # All free, no subscription needed; TradingView exposes them publicly.
+    "dxy":    ("DXY",    "TVC"),       # US Dollar Index
+    "us10y":  ("US10Y",  "TVC"),       # US 10-year Treasury yield (proxy)
+    "wti":    ("USOIL",  "TVC"),       # WTI crude oil
+    "vix":    ("VIX",    "CBOE"),      # CBOE Volatility Index (fear gauge)
+    "xagusd": ("XAGUSD", "OANDA"),     # Silver — useful for gold/silver ratio
+    "spx":    ("SPX",    "SP"),        # S&P 500 — risk-on/off context
 }
 
 # Map timeframe strings to tvDatafeed Interval enum values

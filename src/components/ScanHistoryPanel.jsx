@@ -13,6 +13,7 @@ import {
   AlertTriangle, Clock,
 } from 'lucide-react';
 import { getScanHistory } from '../services/api';
+import { formatKenyaDateTime, KENYA_LABEL } from '../utils/time';
 
 // ── State colour map ──────────────────────────────────────────────────────────
 
@@ -137,10 +138,7 @@ function ScanRow({ scan }) {
   const stateCls = STATE_CLS[state] ?? STATE_CLS.NO_TRADE;
 
   const ts = scan.createdAt
-    ? new Date(scan.createdAt).toLocaleString(undefined, {
-        month: 'short', day: 'numeric',
-        hour: '2-digit', minute: '2-digit',
-      })
+    ? `${formatKenyaDateTime(scan.createdAt)} ${KENYA_LABEL}`
     : '—';
 
   const modeLabel = scan.scanMode === 'manual' ? 'Forced' : 'Auto';

@@ -1,0 +1,79 @@
+# ============================================================================
+# Caddy reverse proxy for XAU/USD Signal Dashboard
+# ============================================================================
+# Copy this file to /etc/caddy/Caddyfile on the VPS, replacing the default
+# Caddyfile. Then: sudo systemctl reload caddy
+#
+# Caddy auto-provisions a Let's Encrypt cert using the FQDN. DuckDNS must
+# already point to your VPS public IP for this to succeed.
+# ============================================================================
+
+# Replace this with your FQDN — read from /opt/xauusd/.fqdn during deployment
+# Example: xauusd-anwar.duckdns.org
+{$FQDN} {
+
+    # ── HTTPS encoding + security headers ───────────────────────────────────
+    encode gzip zstd
+
+    header {
+        # HTTPS hardening
+        Strict-Transport-Security    "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options       "nosniff"
+        X-Frame-Options              "DENY"
+        Referrer-Policy              "strict-origin-when-cross-origin"
+        # Tell browsers we know what we're doing
+        Permissions-Policy           "geolocation=(), microphone=(), camera=()"
+        # Caddy already strips Server header by default
+        -Server
+    }
+
+    # ── API routes → backend container ──────────────────────────────────────
+    handle /api/* {
+        reverse_proxy backend:8000 {
+            # Backend healthcheck so Caddy can fail fast
+            health_uri      /api/v1/health
+            health_interval 30s
+            health_timeout  5s
+
+            # Headers for upstream
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-For   {remote_host}
+            header_up Host              {host}
+        }
+    }
+
+    # OpenAPI / Swagger docs served by FastAPI
+    handle /docs* {
+        reverse_proxy backend:8000
+    }
+    handle /redoc* {
+        reverse_proxy backend:8000
+    }
+    handle /openapi.json {
+        reverse_proxy backend:8000
+    }
+
+    # ── Everything else → frontend (Vite dev server) ────────────────────────
+    handle {
+        reverse_proxy frontend:5173 {
+            header_up Host              {host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # ── Logging ─────────────────────────────────────────────────────────────
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size  10mb
+            roll_keep  5
+            roll_keep_for 720h    # ~30 days
+        }
+        format console
+    }
+}
+
+# ── HTTP → HTTPS redirect ──────────────────────────────────────────────────
+# (Caddy does this automatically when an HTTPS site exists, but being explicit)
+http://{$FQDN} {
+    redir https://{host}{uri} permanent
+}

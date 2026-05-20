@@ -52,6 +52,7 @@ from services.signal_engine import (
 )
 from services.historical_data_provider import (
     get_historical_candles, load_historical_macro_events, seed_historical_data,
+    fetch_tradingview_history,
 )
 
 log = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ def run_xauusd_backtest(
     classify_regimes:      bool           = True,
     analyze_skipped:       bool           = False,
     risk_sensitivity:      bool           = True,
-    engine_variant:        str            = "swing",        # "swing" | "intraday"
+    engine_variant:        str            = "swing",        # "swing" | "intraday" | "momentum_breakout" | "trend_pullback" | ...
     anti_cluster_hours:    float          = 0.0,            # 0 = disabled
     target_pips_override:  Optional[int]  = None,           # override pair config target
 ) -> dict:
@@ -181,48 +182,66 @@ def run_xauusd_backtest(
     # ── Resolve overlap setting ──────────────────────────────────────────────
     overlap_enabled = ALLOW_OVERLAP if allow_overlap is None else bool(allow_overlap)
 
-    # ── Load historical candles ─────────────────────────────────────────────
+    # ── Load historical candles (REAL ONLY by default) ──────────────────────
     candles, source = get_historical_candles(
         db=db,
         timeframe=timeframe,
         start_date=start_date,
         end_date=end_date,
         lookback=lookback,
-        allow_synthetic_fallback=False,    # try DB first; we control fallback
+        allow_synthetic_fallback=False,    # default — never silently feed synthetic to the learning engine
     )
 
-    # Auto-seed a year of historical data on first backtest if DB is empty
+    # Auto-fetch real TradingView history on first backtest if DB has no real data.
+    # NEW: we prefer pulling REAL bars from TradingView over generating a synthetic
+    # seed. Only falls back to synthetic if TradingView is unavailable AND the
+    # caller explicitly allowed it.
     if (not candles or len(candles) < MIN_WARMUP_BARS) and auto_seed:
-        log.info("[backtest] Auto-seeding 365 days of historical data for %s", timeframe)
-        seed_result = seed_historical_data(
+        log.info(
+            "[backtest] No real %s history in DB — attempting TradingView backfill (%d bars)",
+            timeframe, max(5000, lookback),
+        )
+        try:
+            tv_result = fetch_tradingview_history(
+                db=db, timeframe=timeframe,
+                n_bars=max(5000, lookback), instrument="XAU/USD", force=False,
+            )
+            if tv_result.get("success") and tv_result.get("candlesInserted", 0) > 0:
+                log.info("[backtest] TradingView backfill inserted %d real %s bars",
+                         tv_result["candlesInserted"], timeframe)
+                # Reload — should now have real data
+                candles, source = get_historical_candles(
+                    db=db, timeframe=timeframe,
+                    start_date=start_date, end_date=end_date, lookback=lookback,
+                    allow_synthetic_fallback=False,
+                )
+        except Exception as tv_exc:
+            log.warning("[backtest] TradingView backfill failed: %s", tv_exc)
+
+    # Synthetic fallback ONLY when caller explicitly opted in. The default
+    # (allow_synthetic_fallback=False) means we'd rather refuse to backtest
+    # than fabricate results.
+    if (not candles or len(candles) < MIN_WARMUP_BARS) and allow_synthetic_fallback:
+        log.warning(
+            "[backtest] Falling back to SYNTHETIC seed data — results are NOT a true edge measurement"
+        )
+        # Re-create the seed as a one-off and reload
+        seed_historical_data(
             db=db, days=365, timeframe=timeframe, instrument="XAU/USD", seed=42,
         )
-        log.info(
-            "[backtest] Seed complete: %d candles, %d macro events",
-            seed_result.get("candlesInserted", 0),
-            seed_result.get("eventsInserted", 0),
-        )
-        # Reload
         candles, source = get_historical_candles(
             db=db, timeframe=timeframe,
             start_date=start_date, end_date=end_date, lookback=lookback,
-            allow_synthetic_fallback=False,
-        )
-
-    # Synthetic fallback only if explicitly allowed and DB still empty
-    if (not candles or len(candles) < MIN_WARMUP_BARS) and allow_synthetic_fallback:
-        candles, source = get_historical_candles(
-            db=db, timeframe=timeframe,
-            start_date=start_date, end_date=end_date, lookback=lookback,
-            allow_synthetic_fallback=True,
+            allow_synthetic_fallback=True,    # explicit opt-in path
         )
 
     if not candles or len(candles) < MIN_WARMUP_BARS:
         raise RuntimeError(
-            f"Historical XAU/USD candle data unavailable "
+            f"Real XAU/USD historical candle data unavailable "
             f"(got {len(candles)} bars, need >= {MIN_WARMUP_BARS}). "
-            f"Import candles via POST /api/v1/backtest/import-csv or call "
-            f"POST /api/v1/backtest/seed-historical."
+            f"Run POST /api/v1/backtest/fetch-tradingview to pull real "
+            f"history, or pass allow_synthetic_fallback=true to use seeded "
+            f"synthetic data (results will be unreliable)."
         )
 
     # ── Load historical macro events for the candle range ────────────────────
@@ -335,6 +354,21 @@ def run_xauusd_backtest(
                     target_pips=target_points,
                     min_rr=min_rr,
                     enable_news_filter=include_news_filter,
+                )
+            elif engine_variant in ("momentum_breakout", "momentum_fade"):
+                # 3rd engine added 2026-05 — catches strong M15 breakouts the
+                # ICT swing/intraday engines miss. "momentum_fade" tests the
+                # mean-reversion hypothesis: flip the signal direction.
+                from services.intraday_strategies import analyze_momentum_breakout
+                result = analyze_momentum_breakout(
+                    candles=window,
+                    at=candle_ts,
+                    macro_events=macro_events,
+                    pip_size=pip_size,
+                    target_rr=min_rr,
+                    enable_killzone=True,
+                    enable_news_filter=include_news_filter,
+                    fade_mode=(engine_variant == "momentum_fade"),
                 )
             else:
                 result = analyze_signal(
@@ -598,8 +632,27 @@ def run_xauusd_backtest(
         "antiClusterHours":    anti_cluster_hours,
     }
 
+    # Compute strict synthetic detection.
+    # database_real  → real-provider rows only (TradingView/MT5/CSV)  → SAFE
+    # database_synth → only synthetic_seed/generated rows              → POISON
+    # database_mixed → both                                             → POISON
+    # synthetic      → live synthetic fallback                          → POISON
+    is_synthetic = source not in ("database_real", "csv", "tradingview", "mt5")
+    data_warning = None
+    if is_synthetic:
+        data_warning = (
+            f"WARNING: Backtest ran on '{source}' data. Results are NOT a real-market "
+            "edge measurement. Run POST /api/v1/backtest/purge-synthetic then "
+            "POST /api/v1/backtest/fetch-tradingview to switch to real history."
+        )
+
     return {
         "instrument": "XAU/USD",
+        # Surface data source prominently at top level so the dashboard can
+        # warn the user when results are based on synthetic data.
+        "dataSource":    source,
+        "isSynthetic":   is_synthetic,
+        "dataWarning":   data_warning,
         "period": {
             "start": bars[MIN_WARMUP_BARS - 1].time.isoformat() if bars else None,
             "end":   bars[-1].time.isoformat() if bars else None,
@@ -936,6 +989,13 @@ def _walk_forward_analysis(trades: list[Trade], segments: int = 4) -> dict:
     Detects overfitting: if only one segment is profitable, all others weak.
     """
     n = len(trades)
+    # Guard against segments=0 (callers can pass 0 to skip walk-forward).
+    if segments <= 0:
+        return {
+            "segments":       [],
+            "interpretation": "skipped",
+            "note": "walk-forward disabled by caller (segments=0)",
+        }
     if n < segments or n < 8:
         return {
             "segments":       [],

@@ -6,12 +6,31 @@ In live mode (DATA_MODE=live), delegates to candle_provider which routes to
 the configured FX_DATA_PROVIDER (twelvedata | alpha_vantage | oanda | polygon | fmp).
 
 Only XAU/USD (xauusd) is supported. Requests for any other instrument raise ValueError.
+
+LIVE MODE PROVIDER FAILOVER
+---------------------------
+When DATA_MODE=live we ALWAYS prefer a real provider price. If TradingView and
+MT5 both fail momentarily, we serve the last known live response from an
+in-memory cache (tagged source="tradingview-cached" or "mt5-cached") rather
+than silently falling back to synthetic ~$3285 prices, which would mislead
+the dashboard. Only when no live response has ever been cached do we fall
+through to synthetic, and that response is explicitly tagged source="synthetic"
+so the frontend can refuse to display it.
 """
+import logging
 import random
 import time
 from datetime import datetime, timedelta, timezone
 
 from models.candle import Candle, CandleResponse
+
+logger = logging.getLogger(__name__)
+
+# In-memory cache of the last successful LIVE response, keyed by interval.
+# Survives transient TradingView outages so the dashboard never sees synthetic.
+_LIVE_CACHE: dict[str, tuple[float, CandleResponse]] = {}
+# Cap how stale a cached response can be before we admit defeat (12h).
+_LIVE_CACHE_MAX_AGE_SEC = 12 * 60 * 60
 
 # Interval durations in minutes — used by the mock generator and for validation
 INTERVAL_MINUTES: dict[str, int] = {
@@ -154,7 +173,15 @@ def get_candles(interval: str = "H4", limit: int = 200, pair: str = "xauusd") ->
 
     from config import settings
 
-    # Live mode: try TradingView → MT5 bridge → fall through to mock
+    # Live-mode override: by default, refuse synthetic fallback in live mode so
+    # that the engine, scanner, and paper-observation logger never see fake
+    # prices. Callers that explicitly need a synthetic seed for testing can
+    # pass `_allow_synthetic_in_live=True` via a config flag.
+    allow_synthetic_in_live = bool(
+        getattr(settings, "allow_synthetic_candles_in_live", False)
+    )
+
+    # Live mode: try TradingView → MT5 → cached live → only then synthetic
     if settings.data_mode == "live":
         # Try TradingView first (real OHLCV)
         try:
@@ -172,19 +199,56 @@ def get_candles(interval: str = "H4", limit: int = 200, pair: str = "xauusd") ->
                     )
                     for b in tv_bars
                 ]
-                return CandleResponse(symbol="XAU/USD", interval=interval,
-                                      count=len(candles), candles=candles)
-        except Exception:
-            pass
+                resp = CandleResponse(symbol="XAU/USD", interval=interval,
+                                      count=len(candles), candles=candles,
+                                      source="tradingview")
+                _LIVE_CACHE[interval] = (time.time(), resp)
+                return resp
+        except Exception as exc:
+            logger.debug("TradingView fetch failed for %s: %s", interval, exc)
 
         # Try MT5 candle bridge
         try:
             from services.candle_provider import get_eurusd_candles
-            return get_eurusd_candles(timeframe=interval, lookback=limit, pair="XAU/USD")
-        except Exception:
-            pass
+            resp = get_eurusd_candles(timeframe=interval, lookback=limit, pair="XAU/USD")
+            # Tag source if the provider didn't (older shape)
+            if not getattr(resp, "source", None) or resp.source == "synthetic":
+                resp.source = "mt5"
+            _LIVE_CACHE[interval] = (time.time(), resp)
+            return resp
+        except Exception as exc:
+            logger.debug("MT5 fetch failed for %s: %s", interval, exc)
 
-    # Demo mode (or live with no provider): return realistic mock candles
+        # Live providers all failed — serve cached live response if fresh enough.
+        # This prevents the dashboard from ever flashing $3285 synthetic gold.
+        cached = _LIVE_CACHE.get(interval)
+        if cached is not None:
+            cached_at, cached_resp = cached
+            age = time.time() - cached_at
+            if age <= _LIVE_CACHE_MAX_AGE_SEC:
+                logger.warning(
+                    "Live providers down for %s — serving cached response (age %.0fs)",
+                    interval, age,
+                )
+                cached_resp.source = (
+                    "tradingview-cached" if cached_resp.source == "tradingview"
+                    else f"{cached_resp.source}-cached"
+                )
+                return cached_resp
+
+    # Live-mode + no provider + no cache + no override:
+    # Return a flagged synthetic response (callers may refuse it) — but log
+    # a loud warning so the operator notices the provider outage.
+    if settings.data_mode == "live" and not allow_synthetic_in_live:
+        logger.warning(
+            "Live mode: no live provider available and no cache for %s. "
+            "Returning source='synthetic' response — downstream consumers "
+            "should refuse this.", interval,
+        )
+
+    # Demo mode, OR live mode with no providers AND no cache: synthetic.
+    # This response is explicitly tagged so the frontend can refuse to display it.
     candles = _generate_xauusd_candles(interval, limit)
     return CandleResponse(symbol="XAU/USD", interval=interval,
-                          count=len(candles), candles=candles)
+                          count=len(candles), candles=candles,
+                          source="demo" if settings.data_mode == "demo" else "synthetic")

@@ -310,6 +310,84 @@ def xauusd_backtest(
     return APIResponse(data=result)
 
 
+# ─── Probability sweep ────────────────────────────────────────────────────────
+
+@router.get(
+    "/probability-sweep",
+    response_model=APIResponse[dict],
+    summary="Backtest sweep across multiple (min_score x min_rr) thresholds",
+    description=(
+        "Runs ONE backtest at the loosest gate (min_score=lowest, min_rr=lowest), "
+        "then post-filters the trade list to evaluate every combination on the "
+        "grid. Returns a ranked table of {minScore, minRR, winRate, expectancyR, "
+        "profitFactor, ...} so you can spot which threshold combo produces the "
+        "best edge. Massively faster than running N separate backtests. "
+        "Rate-limited to 3 requests/minute."
+    ),
+)
+@limiter.limit("3/minute")
+def probability_sweep(
+    request: Request,
+    timeframe:       str   = Query(default="M15", description="M5 | M15 | M30 | H1 | H4"),
+    lookback:        int   = Query(default=5000,  ge=200, le=20000),
+    engine_variant:  str   = Query(default="swing", description="swing | intraday"),
+    risk_percent:    float = Query(default=0.25,  gt=0, le=5),
+    spread_points:   float = Query(default=1.5,   ge=0, le=20),
+    slippage_points: float = Query(default=0.5,   ge=0, le=20),
+    min_scores:      str | None = Query(
+        default=None,
+        description="Comma-separated score floors, e.g. '65,70,75,80,85,90'. "
+                    "Defaults to 65,70,75,80,85,90.",
+    ),
+    min_rrs:         str | None = Query(
+        default=None,
+        description="Comma-separated RR floors, e.g. '1.5,2.0,2.5,3.0'. "
+                    "Defaults to 1.5,2.0,2.5,3.0.",
+    ),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from services.backtest_sweep import run_probability_sweep
+
+    score_list = None
+    if min_scores:
+        try:
+            score_list = [int(x) for x in min_scores.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(status_code=422, detail="min_scores must be comma-separated ints")
+
+    rr_list = None
+    if min_rrs:
+        try:
+            rr_list = [float(x) for x in min_rrs.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(status_code=422, detail="min_rrs must be comma-separated floats")
+
+    try:
+        result = run_probability_sweep(
+            db=db,
+            timeframe=timeframe,
+            lookback=lookback,
+            min_scores=score_list,
+            min_rrs=rr_list,
+            engine_variant=engine_variant,
+            risk_percent=risk_percent,
+            spread_points=spread_points,
+            slippage_points=slippage_points,
+        )
+    except Exception as exc:
+        logger.exception("[backtest] probability sweep failed")
+        raise HTTPException(status_code=500, detail=f"Sweep failed: {exc}") from exc
+
+    logger.info(
+        "[backtest] sweep complete combos=%d best=%s timing=%ss (speedup %sx)",
+        result["grid"]["total_combinations"],
+        result.get("best_combo", {}).get("minScore") if result.get("best_combo") else None,
+        result["timing"]["total_sec"],
+        result["timing"]["speedup"],
+    )
+    return APIResponse(data=result, source="backtest_sweep")
+
+
 @router.post(
     "/import-csv",
     response_model=APIResponse[dict],
@@ -389,6 +467,94 @@ def seed_historical(
     except Exception as exc:
         logger.exception("[backtest] Seed failed")
         raise HTTPException(status_code=502, detail=f"Seed error: {exc}") from exc
+
+
+@router.get(
+    "/engine-comparison",
+    response_model=APIResponse[dict],
+    summary="Run swing + intraday + momentum_breakout on same data, return side-by-side stats",
+    description=(
+        "Runs the SAME historical window through every requested engine variant "
+        "and returns a ranked comparison: which engine actually has edge, which "
+        "ones never fire, which one produces the most trades, etc. Default "
+        "thresholds are intentionally LOOSE (min_score=65, min_rr=1.5) to "
+        "measure raw engine output rather than how well a single threshold "
+        "config performs. Rate-limited to 1/minute (expensive — runs N backtests)."
+    ),
+)
+@limiter.limit("1/minute")
+def engine_comparison(
+    request: Request,
+    timeframe:    str   = Query(default="M15"),
+    lookback:     int   = Query(default=5000,  ge=200, le=20000),
+    variants:     str | None = Query(default=None,
+                                     description="Comma-separated engine names, e.g. "
+                                                 "'swing,intraday,momentum_breakout'. "
+                                                 "Default: all three."),
+    min_score:    int   = Query(default=65,    ge=50, le=100),
+    min_rr:       float = Query(default=1.5,   ge=0.5, le=10),
+    risk_percent: float = Query(default=0.25,  gt=0,  le=5),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from services.engine_comparison import run_engine_comparison, DEFAULT_VARIANTS
+    variant_list = (
+        [v.strip() for v in variants.split(",") if v.strip()]
+        if variants else list(DEFAULT_VARIANTS)
+    )
+    try:
+        result = run_engine_comparison(
+            db=db,
+            timeframe=timeframe,
+            lookback=lookback,
+            variants=variant_list,
+            min_score=min_score,
+            min_rr=min_rr,
+            risk_percent=risk_percent,
+        )
+    except Exception as exc:
+        logger.exception("[backtest] engine-comparison failed")
+        raise HTTPException(status_code=500, detail=f"Comparison failed: {exc}") from exc
+    return APIResponse(data=result, source="engine_comparison")
+
+
+@router.post(
+    "/purge-synthetic",
+    response_model=APIResponse[dict],
+    summary="Delete all synthetic / seeded rows from historical_candles",
+    description=(
+        "Removes any rows in historical_candles whose source is one of "
+        "{'synthetic', 'synthetic_seed', 'seed', 'generated'} — i.e. data "
+        "produced by the deterministic mock generator. Use this once to "
+        "clean up after the old auto_seed default left synthetic rows in "
+        "the DB. After running, re-run /backtest/fetch-tradingview to pull "
+        "real history. Rate-limited to 2/minute."
+    ),
+)
+@limiter.limit("2/minute")
+def purge_synthetic(
+    request: Request,
+    timeframe: str | None = Query(default=None,
+                                  description="Restrict to a single TF (M5/M15/H1/H4). Omit = all."),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    synth_sources = ["synthetic", "synthetic_seed", "seed", "generated"]
+    from db_models import HistoricalCandle
+    q = db.query(HistoricalCandle).filter(HistoricalCandle.source.in_(synth_sources))
+    if timeframe:
+        q = q.filter(HistoricalCandle.timeframe == timeframe.upper())
+    deleted = q.delete(synchronize_session=False)
+    db.commit()
+    logger.warning("[backtest] purge-synthetic deleted %d rows (timeframe=%s)",
+                   deleted, timeframe or "all")
+    return APIResponse(data={
+        "deleted":   deleted,
+        "timeframe": timeframe or "all",
+        "sources":   synth_sources,
+        "message":   (
+            f"Removed {deleted} synthetic rows. Now run "
+            "POST /backtest/fetch-tradingview to backfill real history."
+        ),
+    })
 
 
 @router.post(

@@ -25,6 +25,7 @@ import {
   GitBranch, Gauge, Flame,
 } from 'lucide-react';
 import { getScan, forceScan } from '../services/api';
+import { formatKenyaTime, KENYA_LABEL } from '../utils/time';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -235,7 +236,7 @@ export default function InstitutionalScanPanel({ onScanComplete }) {
         <div className="flex items-center gap-2">
           {lastAt && (
             <span className="text-[10px] text-gray-600 font-mono hidden sm:block">
-              Updated {lastAt.toLocaleTimeString()} · next in {countdown}s
+              Updated {formatKenyaTime(lastAt)} {KENYA_LABEL} · next in {countdown}s
             </span>
           )}
           <span className="text-[9px] text-slate-600 bg-slate-800/60 px-2 py-0.5 rounded-full border border-slate-700">

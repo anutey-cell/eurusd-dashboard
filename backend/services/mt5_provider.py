@@ -488,11 +488,19 @@ def validate_demo_order(signal: dict) -> tuple[bool, list[str]]:
         reasons.append("Cannot read MT5 account info.")
         return False, reasons
 
-    # Gate 9 — demo account only
-    if getattr(account, "trade_mode", -1) != 0:
+    # Gate 9 — account mode check
+    # By default we hard-block live accounts (demo-only). When the operator
+    # explicitly opts in via LIVE_TRADING_AUTHORIZED=true, live accounts pass
+    # this gate — but every other gate (sizing, spread, daily-loss, duplicates,
+    # max-open-trades) still applies and the autonomous executor adds:
+    #   - 3-layer confirmation requirement
+    #   - per-day trade ceiling (default 3)
+    #   - 0.05 lot hard cap
+    trade_mode = getattr(account, "trade_mode", -1)
+    if trade_mode != 0 and not settings.live_trading_authorized:
         reasons.append(
-            "Live account detected. Execution is blocked. "
-            "This system only allows demo account orders."
+            "Live account detected and LIVE_TRADING_AUTHORIZED=false. "
+            "Set LIVE_TRADING_AUTHORIZED=true in .env to allow live execution."
         )
 
     # Gate 10 — max open trades
@@ -621,6 +629,21 @@ def place_demo_market_order(signal: dict) -> dict:
         sizing      = calculate_position_size(pair, balance, risk_pct, risk_pips)
         lot_size    = sizing["lot_size"]
         risk_amount = sizing["risk_amount"]
+        # Optional hard lot cap from caller (autonomous executor sets this to
+        # settings.auto_execution_max_lot). Never larger than the calculated size.
+        cap = signal.get("max_lot")
+        if cap is not None and float(cap) > 0:
+            cap = float(cap)
+            if lot_size > cap:
+                logger.info(
+                    "Lot cap applied: calc=%.2f cap=%.2f → using cap", lot_size, cap,
+                )
+                lot_size = cap
+                # Re-scale risk_amount proportionally for accurate logging
+                if sizing["raw_lot_size"] > 0:
+                    risk_amount = round(
+                        risk_amount * (cap / sizing["raw_lot_size"]), 2
+                    )
     except ValueError as exc:
         _log_trade(
             mode="demo", pair=pair, broker_symbol=broker_symbol,

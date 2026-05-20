@@ -48,9 +48,24 @@ _INVERT_PAIRS: set[str] = {"USD/JPY"}
 # Net position threshold for neutral zone (contracts)
 _NEUTRAL_THRESHOLD = 10_000
 
-# Report URLs
+# Legacy text-file URLs (often 404 since CFTC website restructure)
 _FIN_FUT_URL  = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
 _COMM_FUT_URL = "https://www.cftc.gov/dea/newcot/c_year.txt"
+
+# Modern CFTC Public Reporting Environment (Socrata API) — most reliable source.
+# Dataset IDs:
+#   jun7-fc8e  → Commitments of Traders - Futures Only Reports (Legacy)
+#   72hh-3qpy  → Commitments of Traders - Disaggregated Reports
+# Filter by commodity_subgroup_name + most recent report_date_as_yyyy_mm_dd
+_CFTC_API_BASE = "https://publicreporting.cftc.gov/resource/jun7-fc8e.json"
+
+# CFTC commodity codes for our pairs (used as a fallback filter)
+_CFTC_CODES: dict[str, str] = {
+    "XAU/USD": "088691",  # Gold (COMEX)
+    "EUR/USD": "099741",  # Euro FX
+    "GBP/USD": "096742",  # British Pound
+    "USD/JPY": "097741",  # Japanese Yen
+}
 
 
 # ── Demo data ─────────────────────────────────────────────────────────────────
@@ -109,6 +124,62 @@ def _fetch_text(url: str) -> str:
     resp = httpx.get(url, timeout=20.0, follow_redirects=True)
     resp.raise_for_status()
     return resp.text
+
+
+def _fetch_via_socrata_api(pair: str) -> dict | None:
+    """
+    Pull the most-recent COT row for `pair` from CFTC's public Socrata API.
+
+    More reliable than the legacy text-file URLs which have started 404'ing
+    after the cftc.gov restructure. Returns the parsed dict or None on
+    any error (caller falls back to legacy URLs then to mock).
+    """
+    code = _CFTC_CODES.get(pair)
+    if not code:
+        return None
+
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    # Sort by most recent report; limit 1; filter by CFTC commodity code.
+    # Socrata SoQL: $where, $order, $limit, $select
+    params = {
+        "$where":  f"cftc_contract_market_code='{code}'",
+        "$order":  "report_date_as_yyyy_mm_dd DESC",
+        "$limit":  "5",   # take a few in case the very latest is being staged
+    }
+    try:
+        resp = httpx.get(_CFTC_API_BASE, params=params, timeout=15.0,
+                         follow_redirects=True,
+                         headers={"User-Agent": "xauusd-dashboard/1.0"})
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception as exc:
+        logger.debug("[COT] Socrata API fetch failed: %s", exc)
+        return None
+
+    if not rows:
+        return None
+    row = rows[0]
+    try:
+        long_nc  = int(float(row.get("noncomm_positions_long_all",  0)))
+        short_nc = int(float(row.get("noncomm_positions_short_all", 0)))
+        change_long  = int(float(row.get("change_in_noncomm_long_all",  0)))
+        change_short = int(float(row.get("change_in_noncomm_short_all", 0)))
+        as_of = row.get("report_date_as_yyyy_mm_dd", "")[:10]
+    except (ValueError, TypeError) as exc:
+        logger.debug("[COT] Socrata parse failed: %s", exc)
+        return None
+
+    return {
+        "longContracts":  long_nc,
+        "shortContracts": short_nc,
+        "netPosition":    long_nc - short_nc,
+        "change":         change_long - change_short,
+        "asOf":           as_of,
+    }
 
 
 def _parse_cftc_csv(text: str, market_name: str) -> dict | None:
@@ -188,18 +259,28 @@ def get_cot_data(pair: str) -> dict:
         }
 
     market_name = _CFTC_NAMES[pair]
-    # Gold is in commodity futures; others in financial futures
-    url = _COMM_FUT_URL if pair == "XAU/USD" else _FIN_FUT_URL
+    parsed = None
+    fetch_source = None
 
-    try:
-        text   = _fetch_text(url)
-        parsed = _parse_cftc_csv(text, market_name)
-    except Exception as exc:
-        logger.warning("COT fetch failed for %s: %s — falling back to mock", pair, exc)
-        return {**(mock or {}), "source": "demo_fallback", "error": str(exc)}
+    # Attempt 1: CFTC Socrata API (modern, most reliable)
+    parsed = _fetch_via_socrata_api(pair)
+    if parsed is not None:
+        fetch_source = "cftc_api"
+        logger.info("[COT] %s fetched via Socrata API as of %s", pair, parsed["asOf"])
+
+    # Attempt 2: legacy text file (often 404 now but try it as a backup)
+    if parsed is None:
+        url = _COMM_FUT_URL if pair == "XAU/USD" else _FIN_FUT_URL
+        try:
+            text   = _fetch_text(url)
+            parsed = _parse_cftc_csv(text, market_name)
+            if parsed is not None:
+                fetch_source = "cftc_legacy"
+        except Exception as exc:
+            logger.debug("[COT] legacy text-file fetch failed for %s: %s", pair, exc)
 
     if parsed is None:
-        logger.warning("COT parse returned no match for '%s'", market_name)
+        logger.warning("[COT] All providers failed for %s — falling back to mock", pair)
         return {**(mock or {}), "source": "demo_fallback"}
 
     net    = parsed["netPosition"]
@@ -218,7 +299,7 @@ def get_cot_data(pair: str) -> dict:
         "shortContracts": parsed["shortContracts"],
         "change":         parsed["change"],
         "bias":           bias,
-        "source":         "cftc",
+        "source":         fetch_source or "cftc",
     }
 
 

@@ -67,6 +67,36 @@ class Settings(BaseSettings):
     max_open_trades:          int   = 1
     max_spread_xauusd_points: float = 5.0   # XAU/USD spread gate in points
 
+    # ── Autonomous live execution (learning-mode trading) ─────────────────────
+    # Master switch. When True AND data_mode=="live" AND live_trading_authorized,
+    # the background executor will fire orders that pass the 3-layer confirmation
+    # gate (scanner SIGNAL_READY + predictor STRONG/MODERATE + killzone TRADE/PRESS).
+    auto_execution_enabled:           bool  = False
+    # Hard cap. Even if risk-percent math says larger, the executor never
+    # submits more than this lot size. Set explicitly per user policy.
+    auto_execution_max_lot:           float = 0.05
+    # Daily trade ceiling — counted from accepted MT5TradeLog rows since 00:00 UTC.
+    auto_execution_max_trades_per_day:int   = 3
+    # MUST be set true to allow execution on a live MT5 account.
+    # Gate 9 (demo-only) remains hard-blocked unless this is explicitly true.
+    live_trading_authorized:          bool  = False
+    # Auto-executor poll interval (seconds). Default 60s = once per minute,
+    # synced with scanner cadence.
+    auto_execution_interval_sec:      int   = 60
+
+    # ── MT5 Bridge (Linux VPS ↔ Windows laptop) ──────────────────────────────
+    # When True, the auto-executor pushes orders into the pending-executions
+    # queue (instead of calling MT5 directly). A daemon on the Windows laptop
+    # polls /api/v1/bridge/pending-orders and executes them via MetaTrader5,
+    # then POSTs the result back to /api/v1/bridge/result/{id}.
+    #
+    # Use this in production deployments where the dashboard runs on Linux
+    # (Oracle Cloud VPS) but MT5 execution must happen on Windows.
+    mt5_bridge_enabled:           bool = False
+    # Shared secret protecting the bridge endpoints. Generate with:
+    #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+    mt5_bridge_shared_secret:     str  = ""
+
     # ── CORS ──────────────────────────────────────────────────────────────────
     # Accepts a comma-separated string from .env or a JSON array
     cors_origins: list[str] = [

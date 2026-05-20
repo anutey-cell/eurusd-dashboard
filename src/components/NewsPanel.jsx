@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
-import { Newspaper, Clock, TrendingUp, TrendingDown, Minus, RefreshCw } from 'lucide-react';
+import { Newspaper, Clock, TrendingUp, TrendingDown, Minus, RefreshCw, AlertTriangle, Filter } from 'lucide-react';
 import { newsItems as mockNewsItems, recentNews as mockRecentNews } from '../data/mockData';
+import { formatKenyaHM, KENYA_LABEL } from '../utils/time';
 import { SkeletonCard } from './Skeleton';
 import { FallbackChip } from './BackendBanner';
 
@@ -47,27 +48,63 @@ export default function NewsPanel({
   refetch         = null,
   newsItems       = mockNewsItems,
   recentNews      = mockRecentNews,
+  provider        = null,    // backend provider name (fmp | trading_economics | eodhd | demo)
 }) {
   const [tab, setTab] = useState('calendar');
-  const countdown = useNextEventCountdown(newsItems ?? mockNewsItems);
+  const [highImpactOnly, setHighImpactOnly] = useState(false);
 
-  const formatTime = iso => new Date(iso).toUTCString().slice(17, 22);
+  const formatTime = iso => formatKenyaHM(iso);
 
-  const items = newsItems ?? mockNewsItems;
-  const news  = recentNews ?? mockRecentNews;
+  const rawItems = newsItems ?? mockNewsItems;
+  const items    = highImpactOnly
+    ? rawItems.filter(e => (e.impact || '').toLowerCase() === 'high')
+    : rawItems;
+  const news     = recentNews ?? mockRecentNews;
+  const highCount = rawItems.filter(e => (e.impact || '').toLowerCase() === 'high').length;
+  const countdown = useNextEventCountdown(items);
 
   return (
     <div className="card flex flex-col">
       <div className="card-header">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <Newspaper size={13} className="text-blue-400" />
           <span className="card-title">News &amp; Calendar</span>
           <FallbackChip isUsingFallback={isUsingFallback} error={error} />
+          {provider && (
+            <span className={`text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border ${
+              provider === 'demo'
+                ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+            }`} title={`Calendar provider: ${provider}`}>
+              {provider === 'demo' ? 'DEMO' : provider}
+            </span>
+          )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* High-impact-only filter */}
+          {tab === 'calendar' && highCount > 0 && (
+            <button
+              onClick={() => setHighImpactOnly(v => !v)}
+              className={`flex items-center gap-1 text-[10px] px-2 py-0.5 rounded border transition-colors ${
+                highImpactOnly
+                  ? 'border-red-500/50 bg-red-500/10 text-red-300'
+                  : 'border-[#263044] bg-[#0d1117] text-gray-500 hover:text-gray-300'
+              }`}
+              title="Show only HIGH-impact events (CPI, NFP, FOMC, etc.)"
+            >
+              <AlertTriangle size={10} />
+              High impact only
+              <span className="opacity-70">({highCount})</span>
+            </button>
+          )}
           {refetch && (
-            <button onClick={refetch} title="Refresh" className="text-gray-600 hover:text-gray-400 transition-colors">
-              <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+            <button
+              onClick={refetch}
+              title="Force refresh from provider"
+              className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded border border-[#263044] bg-[#0d1117] text-gray-500 hover:text-gray-300"
+            >
+              <RefreshCw size={10} className={loading ? 'animate-spin' : ''} />
+              Refresh
             </button>
           )}
           <div className="flex bg-[#0d1117] rounded-lg border border-[#263044] p-0.5">
@@ -94,6 +131,13 @@ export default function NewsPanel({
             <Clock size={11} className="text-amber-400 flex-shrink-0" />
             <span className="text-[11px] text-amber-300 font-medium">{countdown}</span>
           </div>
+          {items.length === 0 && (
+            <div className="text-[11px] text-gray-500 italic py-4 text-center border border-dashed border-[#263044] rounded">
+              {highImpactOnly
+                ? 'No HIGH-impact events today. Toggle the filter off to see all events.'
+                : 'No events for this date.'}
+            </div>
+          )}
           <div className="space-y-2">
             {items.map(ev => {
               const cfg = IMPACT_CONFIG[ev.impact] ?? IMPACT_CONFIG.low;
@@ -102,7 +146,7 @@ export default function NewsPanel({
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1.5 mb-0.5">
-                        <span className="text-[10px] font-bold text-gray-500">{formatTime(ev.time)} UTC</span>
+                        <span className="text-[10px] font-bold text-gray-500">{formatTime(ev.time)} {KENYA_LABEL}</span>
                         <span className={`text-[9px] font-bold px-1 rounded ${cfg.text}`}>{cfg.label}</span>
                         <span className="text-[10px] font-bold text-blue-400">{ev.currency}</span>
                         {ev.pending && <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />}

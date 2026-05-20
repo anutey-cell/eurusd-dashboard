@@ -1,0 +1,94 @@
+# ============================================================================
+# XAU/USD Signal Dashboard — Production Compose (Oracle Cloud VPS)
+# ============================================================================
+# Deploy at /opt/xauusd/ on the VPS. Run with:
+#   cd /opt/xauusd
+#   docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.prod up -d --build
+#
+# Differences from the dev docker-compose.yml at repo root:
+#   - Backend + frontend ports are NOT published to host (only Caddy is public)
+#   - Networks are private; Caddy on host:443 reverse-proxies via Docker network
+#   - Caddy runs on host (installed by bootstrap-vm.sh) — NOT containerised here,
+#     so cert renewal etc. survives stack restarts
+#   - Backend and frontend built from source on the VPS (ARM64-native) — no
+#     image registry push needed
+#   - SQLite database mounted from /opt/xauusd/data (host volume) for easy backup
+#   - .env loaded explicitly via --env-file flag (NOT baked into image)
+#   - Healthchecks + restart policies hardened for unattended operation
+# ============================================================================
+
+services:
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: xauusd-backend
+    restart: unless-stopped
+    expose:
+      - "8000"          # internal-only; Caddy proxies on host:443
+    env_file:
+      - ./.env.prod
+    environment:
+      - DATABASE_URL=sqlite:////app/storage/eurusd_signals.db
+      - DATA_MODE=live
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - /opt/xauusd/data:/app/storage          # SQLite DB lives on host
+      - /opt/xauusd/logs:/app/logs             # Logs accessible from host
+    networks:
+      - xauusd-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: frontend.Dockerfile
+    container_name: xauusd-frontend
+    restart: unless-stopped
+    expose:
+      - "5173"          # internal-only; Caddy proxies on host:443
+    environment:
+      # Frontend doesn't talk to backend directly from the browser — Caddy
+      # routes /api/* to backend internally. So VITE_API_BASE_URL is just
+      # the public origin (Caddy's HTTPS endpoint).
+      - VITE_API_BASE_URL=https://${FQDN}
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - xauusd-net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  xauusd-net:
+    driver: bridge
+    name: xauusd-net

@@ -55,10 +55,14 @@ export async function getCandles({ pair = 'xauusd', interval = 'H4', limit = 200
   return apiFetch(`/candles?${params}`);
 }
 
-export async function getMacroCalendar({ date } = {}) {
-  const q = date ? `?date=${encodeURIComponent(date)}` : '';
-  const res = await apiFetch(`/calendar${q}`);
-  return adaptCalendar(res);
+export async function getMacroCalendar({ date, highImpact = false, refresh = false } = {}) {
+  const params = new URLSearchParams();
+  if (date)        params.set('date', date);
+  if (highImpact)  params.set('high_impact', 'true');
+  if (refresh)     params.set('refresh', 'true');
+  const qs = params.toString();
+  const res = await apiFetch(`/calendar${qs ? '?' + qs : ''}`);
+  return { ...adaptCalendar(res), source: res.source };
 }
 
 export async function getSignal() {
@@ -214,6 +218,76 @@ export async function runXauusdBacktest(params = {}) {
   return res.data ?? res;
 }
 
+/**
+ * POST /backtest/purge-synthetic — delete all synthetic/seed rows from
+ * historical_candles. Optionally restrict to a single timeframe.
+ */
+export async function purgeSyntheticHistory({ timeframe } = {}) {
+  const qs = timeframe ? `?timeframe=${encodeURIComponent(timeframe)}` : '';
+  const res = await apiFetch(`/backtest/purge-synthetic${qs}`, { method: 'POST' });
+  return res.data ?? res;
+}
+
+/**
+ * POST /backtest/fetch-tradingview — bulk import real OHLCV from TradingView
+ * into historical_candles so backtests / probability sweeps run on real data.
+ */
+export async function backfillTradingViewHistory({ timeframe = 'M15', nBars = 5000, force = false } = {}) {
+  const q = new URLSearchParams({ timeframe, n_bars: nBars, force });
+  const res = await apiFetch(`/backtest/fetch-tradingview?${q}`, { method: 'POST' });
+  return res.data ?? res;
+}
+
+/**
+ * GET /backtest/engine-comparison — runs swing + intraday + momentum_breakout
+ * on the SAME historical window and returns side-by-side metrics. Slow (runs
+ * N full backtests). Use to identify which engine actually has edge.
+ */
+export async function runEngineComparison({
+  timeframe = 'M15',
+  lookback  = 5000,
+  variants  = ['swing', 'intraday', 'momentum_breakout'],
+  minScore  = 65,
+  minRr     = 1.5,
+  riskPercent = 0.25,
+} = {}) {
+  const q = new URLSearchParams({
+    timeframe, lookback,
+    min_score: minScore, min_rr: minRr, risk_percent: riskPercent,
+  });
+  if (variants?.length) q.set('variants', variants.join(','));
+  const res = await apiFetch(`/backtest/engine-comparison?${q}`);
+  return res.data ?? res;
+}
+
+/**
+ * GET /backtest/probability-sweep — runs the backtest once at the loosest gates,
+ * then evaluates every (minScore × minRR) combination via post-filter. Returns
+ * a ranked table of edge metrics per threshold combo.
+ */
+export async function runProbabilitySweep({
+  timeframe      = 'M15',
+  lookback       = 5000,
+  engineVariant  = 'swing',
+  riskPercent    = 0.25,
+  spreadPoints   = 1.5,
+  slippagePoints = 0.5,
+  minScores,        // optional array of ints
+  minRrs,           // optional array of floats
+} = {}) {
+  const q = new URLSearchParams({
+    timeframe, lookback,
+    engine_variant: engineVariant,
+    risk_percent:   riskPercent,
+    spread_points:  spreadPoints,
+    slippage_points: slippagePoints,
+  });
+  if (minScores?.length) q.set('min_scores', minScores.join(','));
+  if (minRrs?.length)    q.set('min_rrs',    minRrs.join(','));
+  const res = await apiFetch(`/backtest/probability-sweep?${q}`);
+  return res.data ?? res;
+}
+
 /** Upload a historical XAU/USD candle CSV. file = File, timeframe = "M15" etc. */
 export async function importBacktestCsv(file, timeframe = 'M15') {
   const fd = new FormData();
@@ -316,6 +390,90 @@ export async function checkDrawdown(engineId = 'swing') {
 /** GET /prediction/xauusd — 5-layer confluence prediction with factor breakdown */
 export async function getHighProbabilityPrediction() {
   const res = await apiFetch('/prediction/xauusd');
+  return res.data ?? res;
+}
+
+// ─── Institutional Flow API ───────────────────────────────────────────────────
+
+/** GET /institutional — live COT + computed price levels + sentiment */
+export async function getInstitutional({ levelsLimit = 200 } = {}) {
+  const res = await apiFetch(`/institutional?levels_limit=${levelsLimit}`);
+  return res.data ?? res;
+}
+
+// ─── Killzone Edge API ────────────────────────────────────────────────────────
+
+/** GET /killzones/edge — per-killzone observation + price-action edge ranking */
+export async function getKillzoneEdge({ lookbackDays = 60, engineId } = {}) {
+  const q = new URLSearchParams({ lookback_days: lookbackDays });
+  if (engineId) q.set('engine_id', engineId);
+  const res = await apiFetch(`/killzones/edge?${q}`);
+  return res.data ?? res;
+}
+
+/** GET /killzones/current — active killzone + posture (polled by dashboard banner) */
+export async function getCurrentKillzone({ lookbackDays = 60 } = {}) {
+  const res = await apiFetch(`/killzones/current?lookback_days=${lookbackDays}`);
+  return res.data ?? res;
+}
+
+/** GET /killzones/heatmap — 24-cell UTC-hour edge heatmap */
+export async function getKillzoneHeatmap({ lookbackDays = 60 } = {}) {
+  const res = await apiFetch(`/killzones/heatmap?lookback_days=${lookbackDays}`);
+  return res.data ?? res;
+}
+
+// ─── Autonomous executor API ──────────────────────────────────────────────────
+
+/** GET /execution/autonomous/status — auto-executor config + today's trades + last attempt */
+export async function getAutonomousStatus() {
+  const res = await apiFetch('/execution/autonomous/status');
+  return res.data ?? res;
+}
+
+/** POST /execution/autonomous/preview — dry-run gate evaluation, never fires */
+export async function previewAutonomous() {
+  const res = await apiFetch('/execution/autonomous/preview', { method: 'POST' });
+  return res.data ?? res;
+}
+
+// ─── Engine diagnostics ───────────────────────────────────────────────────────
+
+/**
+ * GET /diagnostics/engine-state — answers "why no signal right now?"
+ * Returns data-freshness across timeframes, per-engine gate state, and the
+ * biggest M15 move in last 24h so you can sanity-check what was missed.
+ */
+export async function getEngineState() {
+  const res = await apiFetch('/diagnostics/engine-state');
+  return res.data ?? res;
+}
+
+/**
+ * GET /diagnostics/trader-mindset — 10-dimension scorecard rating whether the
+ * engine currently has the mindset of a profitable trader.
+ */
+export async function getTraderMindset() {
+  const res = await apiFetch('/diagnostics/trader-mindset');
+  return res.data ?? res;
+}
+
+/**
+ * GET /diagnostics/trader-development — 20-principle curriculum from canonical
+ * trading-psychology books with self-evaluation per principle.
+ */
+export async function getTraderDevelopment() {
+  const res = await apiFetch('/diagnostics/trader-development');
+  return res.data ?? res;
+}
+
+/**
+ * GET /diagnostics/intermarket-correlations — live correlations of XAU/USD vs
+ * DXY, US10Y, Oil, VIX, Silver, SPX. Detects regime shifts.
+ */
+export async function getIntermarketCorrelations({ timeframe = 'H1', nBars = 200 } = {}) {
+  const q = new URLSearchParams({ timeframe, n_bars: nBars });
+  const res = await apiFetch(`/diagnostics/intermarket-correlations?${q}`);
   return res.data ?? res;
 }
 

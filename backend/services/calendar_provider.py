@@ -304,14 +304,22 @@ def _to_float(s: str | None, default: float) -> float:
 
 # ── Public router ─────────────────────────────────────────────────────────────
 
-def get_macro_calendar(date: str | None = None, pair: str = "eurusd") -> list[dict]:
+def get_macro_calendar(
+    date: str | None = None,
+    pair: str = "xauusd",
+    *,
+    force_refresh: bool = False,
+) -> list[dict]:
     """
     Single entry point for all callers.
-    pair  — pair code, used to filter relevant currencies
+    pair          — pair code, used to filter relevant currencies
+    force_refresh — bypass provider-side cache (currently honoured by ForexFactory)
 
     Demo mode  → static mock events, no network.
-    Live mode  → routes to CALENDAR_PROVIDER; requires CALENDAR_API_KEY
-                 (or TE_CLIENT + TE_SECRET for trading_economics).
+    Live mode  → routes to CALENDAR_PROVIDER:
+                   fmp / eodhd / broker  — require CALENDAR_API_KEY
+                   trading_economics     — requires CALENDAR_TE_CLIENT + SECRET
+                   forexfactory          — FREE, no key required
     """
     from pair_config import get_pair_config
     try:
@@ -329,10 +337,14 @@ def get_macro_calendar(date: str | None = None, pair: str = "eurusd") -> list[di
 
     key_required = provider in ("fmp", "eodhd", "broker")
     if key_required and not settings.calendar_api_key:
-        raise ValueError(
-            f"DATA_MODE=live with CALENDAR_PROVIDER={provider} requires "
-            "CALENDAR_API_KEY in .env."
+        # Graceful auto-fallback: rather than 502 the dashboard, fall through
+        # to the free ForexFactory provider so the user always sees a live
+        # calendar. We log a warning so the operator knows to set the key.
+        logger.warning(
+            "CALENDAR_PROVIDER=%s requires CALENDAR_API_KEY which is missing. "
+            "Falling back to free ForexFactory feed.", provider,
         )
+        provider = "forexfactory"
 
     if provider == "fmp":
         events = get_fmp_calendar(date)
@@ -346,8 +358,96 @@ def get_macro_calendar(date: str | None = None, pair: str = "eurusd") -> list[di
     if provider == "broker":
         events = get_broker_calendar(date)
         return [e for e in events if e.get("currency", "").upper() in relevant_currencies]
+    if provider == "forexfactory":
+        events = get_forexfactory_calendar(date, force_refresh=force_refresh)
+        return [e for e in events if e.get("currency", "").upper() in relevant_currencies]
 
     raise ValueError(
         f"Unsupported CALENDAR_PROVIDER='{settings.calendar_provider}'. "
-        f"Valid options: fmp | trading_economics | eodhd | broker"
+        f"Valid options: fmp | trading_economics | eodhd | broker | forexfactory"
     )
+
+
+# ── ForexFactory free calendar (no API key required) ──────────────────────────
+
+_FF_THISWEEK_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+# Cache results for 5 minutes to avoid hammering the free endpoint
+_FF_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_FF_CACHE_TTL_SEC = 5 * 60
+
+
+def get_forexfactory_calendar(date: str | None = None, *, force_refresh: bool = False) -> list[dict]:
+    """
+    Free public economic calendar from faireconomy.media (ForexFactory mirror).
+    NO API KEY required — uses the same JSON feed many trading platforms ship with.
+    Refresh-cached for 5 minutes.
+    """
+    import time as _time
+    cache_key = "thisweek"
+    if not force_refresh:
+        cached = _FF_CACHE.get(cache_key)
+        if cached and (_time.time() - cached[0]) < _FF_CACHE_TTL_SEC:
+            return _filter_ff_by_date(cached[1], date)
+
+    raw = _http_get(_FF_THISWEEK_URL, provider="forexfactory")
+    if not isinstance(raw, list):
+        raise ValueError("ForexFactory returned non-list payload")
+
+    events: list[dict] = []
+    next_id = 1
+    for item in raw:
+        try:
+            ts_str = item.get("date") or item.get("dateline")
+            if not ts_str:
+                continue
+            # FF uses ISO-8601 with offset, e.g. "2026-05-20T08:30:00-04:00"
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            ts_utc = ts.astimezone(timezone.utc)
+
+            impact_raw = (item.get("impact") or "").lower()
+            impact = "high" if impact_raw == "high" else ("medium" if impact_raw == "medium" else "low")
+
+            currency = (item.get("country") or "").upper()
+            actual   = item.get("actual")
+            forecast = item.get("forecast")
+            previous = item.get("previous")
+
+            pending = actual in (None, "", "null")
+            beat = None
+            if not pending and forecast not in (None, "", "null"):
+                try:
+                    beat = _to_float(actual, 0) > _to_float(forecast, 0)
+                except Exception:
+                    beat = None
+
+            events.append({
+                "id":       next_id,
+                "time":     ts_utc,
+                "currency": currency,
+                "event":    item.get("title") or item.get("event") or "—",
+                "impact":   impact,
+                "forecast": forecast if forecast not in ("", None, "null") else None,
+                "previous": previous if previous not in ("", None, "null") else None,
+                "actual":   actual   if actual   not in ("", None, "null") else None,
+                "pending":  pending,
+                "beat":     beat,
+            })
+            next_id += 1
+        except Exception as exc:
+            logger.debug("FF parse skip: %s (%s)", exc, item)
+            continue
+
+    _FF_CACHE[cache_key] = (_time.time(), events)
+    return _filter_ff_by_date(events, date)
+
+
+def _filter_ff_by_date(events: list[dict], date: str | None) -> list[dict]:
+    """Filter the weekly events to a single UTC date (default: today)."""
+    target = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return [
+        e for e in events
+        if e["time"].strftime("%Y-%m-%d") == target
+    ]

@@ -17,6 +17,8 @@ import {
   XCircle, AlertTriangle, Award, Layers, Globe, Newspaper, Activity, Users,
 } from 'lucide-react';
 import { getHighProbabilityPrediction } from '../services/api';
+import { formatKenyaTime, KENYA_LABEL } from '../utils/time';
+import { usePollInterval } from '../hooks/usePollInterval';
 
 const POLL_MS = 60_000;
 
@@ -109,11 +111,7 @@ export default function HighProbabilityPanel() {
     }
   }, []);
 
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, POLL_MS);
-    return () => clearInterval(id);
-  }, [refresh]);
+  usePollInterval(refresh, POLL_MS);
 
   if (!pred && !loading && !error) {
     return null;
@@ -143,7 +141,7 @@ export default function HighProbabilityPanel() {
         <div className="flex items-center gap-2">
           {lastAt && (
             <span className="text-[10px] text-gray-600 font-mono">
-              {lastAt.toLocaleTimeString()}
+              {formatKenyaTime(lastAt)} {KENYA_LABEL}
             </span>
           )}
           <button onClick={refresh} disabled={loading} className="text-gray-500 hover:text-gray-300">

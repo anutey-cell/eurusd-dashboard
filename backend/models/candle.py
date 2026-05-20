@@ -19,6 +19,9 @@ class CandleResponse(BaseModel):
     interval: str
     count: int
     candles: list[Candle]
+    # Provider that supplied this data. Set by get_candles().
+    # One of: "tradingview", "mt5", "synthetic", "demo".
+    source: str = "synthetic"
 
 
 IntervalLiteral = Literal["M5", "M15", "M30", "H1", "H4", "D1", "W1"]

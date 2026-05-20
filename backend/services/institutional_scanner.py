@@ -75,10 +75,24 @@ def scan_xauusd_market(force_refresh: bool = False, db=None) -> dict:
     force_refresh=True  → bypass cache, run fresh analysis.
     db                  → optional SQLAlchemy session for adaptive weights
                           and scan history persistence.
+
+    Cache invariants:
+      - Only positive-state results (SIGNAL_READY, NO_TRADE, SETUP_FORMING,
+        WATCHLIST) are cached. Fault states (DATA_STALE, SPREAD_TOO_WIDE)
+        bypass the cache so the very next caller can re-attempt with
+        potentially fresh data. This prevents the engine from staying blind
+        for a full TTL window after a transient data hiccup.
     """
     if not force_refresh and _cache_fresh():
-        log.debug("[scanner] Serving cached scan result")
-        return _cache["result"]
+        cached = _cache["result"] or {}
+        # Auto-bust on fault states — they should NEVER persist in cache.
+        if cached.get("marketState") not in ("DATA_STALE", "SPREAD_TOO_WIDE"):
+            log.debug("[scanner] Serving cached scan result")
+            return cached
+        log.info(
+            "[scanner] Cached state is %s — bypassing cache to re-attempt",
+            cached.get("marketState"),
+        )
 
     log.info("[scanner] Running fresh XAU/USD scan  force=%s", force_refresh)
     scan_mode = "manual" if force_refresh else "auto"
@@ -89,8 +103,16 @@ def scan_xauusd_market(force_refresh: bool = False, db=None) -> dict:
         log.exception("[scanner] Scan failed: %s", exc)
         result = _error_result(str(exc))
 
-    _cache["result"] = result
-    _cache["cached_at"] = datetime.now(timezone.utc)
+    # Only cache "settled" states. Fault states bypass cache so next call
+    # immediately re-runs — required for fast recovery once the data feed
+    # refreshes.
+    if result.get("marketState") not in ("DATA_STALE", "SPREAD_TOO_WIDE"):
+        _cache["result"] = result
+        _cache["cached_at"] = datetime.now(timezone.utc)
+    else:
+        # Still update the result reference (so /scan/status reflects the fault),
+        # but don't update cached_at — keeps the cache "stale" for next call.
+        _cache["result"] = result
 
     # Persist to DB (best-effort, never blocks response)
     if db is not None:
@@ -174,15 +196,32 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
     timestamp = now.isoformat()
 
     # ── 1. Fetch multi-timeframe candles ─────────────────────────────────────
+    # In live mode, reject synthetic candles outright — feeding fake data into
+    # the scanner would pollute paper observations and the learning dataset.
+    from config import settings as _cfg
+    LIVE_SOURCES = {"tradingview", "mt5", "tradingview-cached", "mt5-cached"}
     tf_limits = {"D1": 100, "H4": 200, "H1": 200, "M15": 200, "M5": 100}
     candles_by_tf: dict[str, list] = {}
+    synthetic_seen: list[str] = []
     for tf, limit in tf_limits.items():
         try:
             resp = get_candles(interval=tf, limit=limit, pair="xauusd")
-            candles_by_tf[tf] = resp.candles
+            src = getattr(resp, "source", "unknown")
+            if _cfg.data_mode == "live" and src not in LIVE_SOURCES:
+                synthetic_seen.append(f"{tf}={src}")
+                candles_by_tf[tf] = []
+            else:
+                candles_by_tf[tf] = resp.candles
         except Exception as e:
             log.debug("[scanner] %s candle fetch failed: %s", tf, e)
             candles_by_tf[tf] = []
+
+    if synthetic_seen:
+        log.warning(
+            "[scanner] live mode: refused synthetic candles for %s — scanner will "
+            "report NO_TRADE until live provider returns.",
+            ", ".join(synthetic_seen),
+        )
 
     # ── 2. Data freshness guard ──────────────────────────────────────────────
     data_fresh, data_blocker = _check_data_freshness(candles_by_tf, now)
@@ -408,11 +447,29 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
 
 def _check_data_freshness(candles_by_tf: dict, now: datetime) -> tuple[bool, str]:
     """
-    M15 candles must be < 45 min old.
-    H4 candles must be < 8 h old.
+    Per-timeframe freshness check.
+
+    The threshold is 2 candle-periods AFTER the candle's OPEN time. This is
+    correct because a candle aged "1 period" is just the normally-aged last
+    closed bar; it's only stale once a new bar should already have closed.
+
+    Examples:
+      M15: bar opens at 10:00, closes 10:15. Considered fresh until 10:45
+           (one extra period of grace).
+      H4 : bar opens at 12:00, closes 16:00. Considered fresh until 20:00
+           (one extra period of grace).
+
+    The old hard-coded "H4 must be < 480 min old" was off-by-one and routinely
+    flipped the scanner to DATA_STALE between H4 close-times, silencing the
+    engine for hours at a stretch (April 2026 bug).
+
     Returns (fresh, blocker_message).
     """
-    for tf, max_age_min in [("M15", 45), ("H4", 480)]:
+    TF_MINUTES = {"M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
+    # Tighter on M15 (we expect a fresh bar every 15 min); loose on H4 (NY-aligned brokers)
+    GRACE_MULTIPLIER = {"M15": 2, "H1": 2, "H4": 2.5}
+
+    for tf in ("M15", "H4"):
         bars = candles_by_tf.get(tf, [])
         if not bars:
             return False, f"No {tf} candles available"
@@ -423,10 +480,13 @@ def _check_data_freshness(candles_by_tf: dict, now: datetime) -> tuple[bool, str
         if not latest_time.tzinfo:
             latest_time = latest_time.replace(tzinfo=timezone.utc)
         age_min = (now - latest_time).total_seconds() / 60
+        period_min = TF_MINUTES[tf]
+        max_age_min = period_min * GRACE_MULTIPLIER.get(tf, 2)
         if age_min > max_age_min:
             return False, (
                 f"{tf} candles are {age_min:.0f} min old "
-                f"(max {max_age_min} min). Check data feed."
+                f"(max {max_age_min:.0f} min = {GRACE_MULTIPLIER.get(tf,2)}x period). "
+                "Check data feed."
             )
     return True, ""
 

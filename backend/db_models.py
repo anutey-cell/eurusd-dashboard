@@ -128,6 +128,48 @@ class MT5TradeLog(Base):
     raw_response_json = Column(Text,       nullable=True)     # JSON string of MT5 response
 
 
+# ── pending_executions (MT5 bridge queue) ─────────────────────────────────────
+
+class PendingExecution(Base):
+    """
+    Queue of orders the VPS auto-executor has produced and that the Windows
+    laptop bridge daemon is expected to pull, execute on MT5, and report back.
+
+    Lifecycle:
+      PENDING  -> laptop daemon claims it (sets claimed_at)
+      EXECUTING -> daemon called mt5.order_send; awaiting response
+      ACCEPTED -> order_send returned a ticket
+      REJECTED -> daemon rejected (gate failure, spread, etc.)
+      FAILED   -> order_send raised / TCP error
+      EXPIRED  -> not consumed within 5 minutes; auto-cleaned by scheduler
+    """
+    __tablename__ = "pending_executions"
+
+    id              = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    created_at      = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    expires_at      = Column(DateTime(timezone=True), nullable=True, index=True)
+    pair            = Column(String(16),  nullable=False, default="xauusd")
+    signal          = Column(String(8),   nullable=False)            # BUY | SELL
+    entry           = Column(Float, nullable=False)
+    stop_loss       = Column(Float, nullable=False)
+    take_profit     = Column(Float, nullable=False)
+    risk_pips       = Column(Float, nullable=True)
+    quality_score   = Column(Integer, nullable=True)
+    rr              = Column(Float, nullable=True)
+    max_lot         = Column(Float, nullable=False, default=0.05)
+    reason          = Column(Text, nullable=True)                    # Setup description
+    confirmations_json = Column(Text, nullable=True)                 # 3-layer confirmation snapshot
+
+    # Workflow state
+    status          = Column(String(16), nullable=False, default="PENDING", index=True)
+    claimed_at      = Column(DateTime(timezone=True), nullable=True)
+    claimed_by      = Column(String(64), nullable=True)              # Bridge daemon ID
+    resolved_at     = Column(DateTime(timezone=True), nullable=True)
+    ticket          = Column(Integer, nullable=True)                 # MT5 ticket on success
+    lot_executed    = Column(Float, nullable=True)
+    execution_error = Column(Text, nullable=True)
+
+
 # ── telegram_alert_logs ───────────────────────────────────────────────────────
 
 class TelegramAlertLog(Base):

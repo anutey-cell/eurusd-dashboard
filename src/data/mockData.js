@@ -6,7 +6,7 @@ export const currentSignal = {
   timestamp:  '2026-05-14T09:00:00Z',
   session:    'London',
   timeframe:  'H4',
-  price:      3285.00,
+  price:      null,        // never seed a stale demo price; Header polls live /candles
   change:     -3.20,
   changePct:  -0.10,
   pair:       'xauusd',
@@ -167,7 +167,7 @@ export const recentNews = [
   {
     id: 5,
     time: '06:12',
-    headline: 'XAU/USD consolidates near 3285 — gold bulls eye break above 3300 resistance',
+    headline: 'XAU/USD remains supported amid central bank demand and softer real yields',
     source: 'FXStreet',
     sentiment: 'bullish',
   },

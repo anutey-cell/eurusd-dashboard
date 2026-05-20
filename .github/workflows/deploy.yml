@@ -1,0 +1,123 @@
+# ============================================================================
+# GitHub Actions — Auto-deploy to DigitalOcean Droplet
+# ============================================================================
+# On every push to `main` (after CI passes):
+#   1. SSH into your DigitalOcean droplet using the encrypted private key
+#   2. Pull the latest source
+#   3. Rebuild Docker images
+#   4. Restart containers via docker compose
+#   5. Wait for /api/v1/health to return 200
+#
+# Required GitHub repository secrets (Settings → Secrets and variables → Actions):
+#   - DO_HOST                       Droplet public IP (or DuckDNS hostname)
+#   - DO_USER                       Usually "root"
+#   - DO_SSH_PRIVATE_KEY            Contents of ~/.ssh/digitalocean_xauusd
+#                                   (the PRIVATE key, in full, with header + footer)
+#
+# The droplet itself reads its config from /opt/xauusd/deploy/.env.prod
+# (created during the manual first-deploy in Phase 4). GitHub Actions never
+# touches that file — your secrets stay on the droplet only.
+# ============================================================================
+
+name: Deploy to DigitalOcean
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:    # allow manual trigger from Actions tab
+
+concurrency:
+  group: do-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Pull, rebuild, restart
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Disable strict host check on first deploy — secrets verify identity
+          cat >> ~/.ssh/config <<EOF
+          Host droplet
+            HostName ${{ secrets.DO_HOST }}
+            User ${{ secrets.DO_USER }}
+            IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            ServerAliveInterval 30
+          EOF
+
+      - name: Pull + rebuild + restart on droplet
+        run: |
+          ssh droplet 'bash -se' <<'REMOTE'
+            set -euo pipefail
+            cd /opt/xauusd
+
+            echo "[deploy] Fetching latest from GitHub..."
+            # Use the embedded git remote already cloned during first deploy.
+            git fetch --quiet --tags origin
+            git reset --hard origin/main
+
+            echo "[deploy] Validating env file is present..."
+            test -f deploy/.env.prod || {
+              echo "FATAL: /opt/xauusd/deploy/.env.prod missing on droplet"
+              exit 1
+            }
+
+            echo "[deploy] Rebuilding + restarting containers..."
+            docker compose -f deploy/docker-compose.prod.yml \
+                           --env-file deploy/.env.prod \
+                           up -d --build --remove-orphans
+
+            echo "[deploy] Waiting for backend health (max 90s)..."
+            DEADLINE=$(( $(date +%s) + 90 ))
+            while true; do
+              if docker exec xauusd-backend python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" 2>/dev/null; then
+                echo "[deploy] ✓ backend healthy"
+                break
+              fi
+              if [ $(date +%s) -gt $DEADLINE ]; then
+                echo "[deploy] ✗ backend failed to come up in 90s"
+                docker compose -f deploy/docker-compose.prod.yml logs --tail=80 backend
+                exit 1
+              fi
+              sleep 3
+            done
+
+            echo "[deploy] Compose status:"
+            docker compose -f deploy/docker-compose.prod.yml ps
+          REMOTE
+
+      - name: Telegram notify on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -s -o /dev/null -X POST \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT}" \
+              -d parse_mode="HTML" \
+              -d text="🚨 <b>Deploy FAILED</b>%0AGitHub Actions deploy to DO droplet failed. Check %23${{ github.run_id }}"
+          fi
+
+      - name: Telegram notify on success
+        if: success()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -s -o /dev/null -X POST \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT}" \
+              -d parse_mode="HTML" \
+              -d text="✅ <b>Deploy OK</b>%0A${{ github.event.head_commit.message }}%0A$(echo '${{ github.sha }}' | cut -c1-7)"
+          fi

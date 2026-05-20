@@ -30,6 +30,24 @@ import ScanHistoryPanel       from './ScanHistoryPanel';
 import XauusdBacktestPanel    from './XauusdBacktestPanel';
 import PaperObservationPanel  from './PaperObservationPanel';
 import HighProbabilityPanel   from './HighProbabilityPanel';
+import KillzonePanel          from './KillzonePanel';
+import AutonomousExecutorPanel from './AutonomousExecutorPanel';
+import ProbabilitySweepPanel  from './ProbabilitySweepPanel';
+import EngineDiagnosticsPanel from './EngineDiagnosticsPanel';
+import EngineComparisonPanel  from './EngineComparisonPanel';
+import TraderMindsetPanel     from './TraderMindsetPanel';
+import TraderDevelopmentPanel from './TraderDevelopmentPanel';
+import IntermarketCorrelationPanel from './IntermarketCorrelationPanel';
+import { formatKenyaTime, KENYA_LABEL } from '../utils/time';
+
+// ─── Tab system — groups 18+ panels into 5 task-oriented tabs ───────────────
+const TABS = [
+  { id: 'live',        label: 'Live'        },
+  { id: 'context',     label: 'Context'     },
+  { id: 'learning',    label: 'Learning'    },
+  { id: 'backtest',    label: 'Backtest'    },
+  { id: 'journal',     label: 'Journal'     },
+];
 
 // ─── Instrument ───────────────────────────────────────────────────────────────
 // XAU/USD is the only supported instrument.
@@ -128,6 +146,15 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
   const history   = useDataSource(getSignalHistory, FALLBACKS.history,   null);
   const analytics = useDataSource(getAnalytics,     FALLBACKS.analytics, null);
 
+  // Tab selection — persisted to localStorage so reloads keep your view
+  const [activeTab, setActiveTab] = useState(() => {
+    try { return localStorage.getItem('xau_tab') || 'live'; }
+    catch { return 'live'; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('xau_tab', activeTab); } catch {}
+  }, [activeTab]);
+
   // journalKey bumps each time a trade is confirmed → triggers PaperTradeJournal reload
   const [journalKey, setJournalKey] = useState(0);
   // scanKey bumps each time a forced scan completes → triggers ScanHistoryPanel reload
@@ -161,7 +188,7 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
             <div className="flex items-center gap-1 hidden sm:flex">
               <Clock size={10} />
               <span>
-                Last update: <span className="font-mono text-gray-400">{lastUpdated.toLocaleTimeString()}</span>
+                Last update: <span className="font-mono text-gray-400">{formatKenyaTime(lastUpdated)} {KENYA_LABEL}</span>
               </span>
             </div>
           )}
@@ -193,7 +220,27 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
       {/* ── Main layout ────────────────────────────────────────────────────── */}
       <main className="flex-1 p-4 space-y-4 max-w-[1920px] mx-auto w-full">
 
-        {/* Row 1: three-column */}
+        {/* Tab navigation — persists in localStorage */}
+        <div className="flex items-center gap-1 bg-[#0d1117] border border-[#263044] rounded-lg p-1 sticky top-2 z-10 shadow-lg">
+          {TABS.map(tab => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`px-4 py-1.5 text-xs font-bold uppercase tracking-widest rounded transition-colors ${
+                activeTab === tab.id
+                  ? 'bg-blue-500/30 text-blue-200 border border-blue-500/60'
+                  : 'text-gray-400 hover:text-white hover:bg-[#263044]'
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+          <div className="ml-auto text-[10px] text-gray-500 px-2 hidden md:block">
+            Live = signals · Context = macro · Learning = curriculum · Backtest = research · Journal = history
+          </div>
+        </div>
+
+        {/* Row 1: three-column (always visible — anchor) */}
         <div className="flex gap-4 items-start">
 
           {/* Left — signal feeds both cards from one fetch */}
@@ -239,63 +286,106 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
               refetch={calendar.refetch}
               newsItems={calendar.data?.newsItems}
               recentNews={calendar.data?.recentNews}
+              provider={calendar.data?.source}
             />
           </div>
         </div>
 
-        {/* Row 2: checklist (local state only — no API) */}
-        <PreTradeChecklist />
+        {/* ═════════════════════════════════════════════════════════════════
+            TAB CONTENT — only the active tab renders. Other tabs are
+            unmounted, so their poll loops aren't burning CPU.
+            ═══════════════════════════════════════════════════════════════ */}
 
-        {/* Row 3: adaptive learning engine self-assessment */}
-        <EngineMaturityCard />
+        {activeTab === 'live' && (
+          <>
+            {/* Pre-trade checklist (local) */}
+            <PreTradeChecklist />
+            {/* Engine diagnostics — why no signal RIGHT NOW */}
+            <EngineDiagnosticsPanel />
+            {/* Killzone edge analyser — current session posture */}
+            <KillzonePanel />
+            {/* Autonomous executor — what the live system is about to do */}
+            <AutonomousExecutorPanel />
+            {/* High-probability predictor — multi-layer confluence */}
+            <HighProbabilityPanel />
+            {/* Institutional scanner — current SIGNAL_READY / SETUP_FORMING */}
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+              <InstitutionalScanPanel onScanComplete={() => setScanKey(k => k + 1)} />
+              <ScanHistoryPanel refreshKey={scanKey} />
+            </div>
+          </>
+        )}
 
-        {/* Row: Institutional Scanner — opportunity scanning + market view */}
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-          <InstitutionalScanPanel
-            onScanComplete={() => setScanKey(k => k + 1)}
-          />
-          <ScanHistoryPanel refreshKey={scanKey} />
-        </div>
+        {activeTab === 'context' && (
+          <>
+            {/* Intermarket correlations — DXY/Yields/Oil/VIX */}
+            <IntermarketCorrelationPanel />
+            {/* Reuse News panel here too (also visible at top) — extended view */}
+            <NewsPanel
+              loading={calendar.loading}
+              error={calendar.error}
+              isUsingFallback={calendar.isUsingFallback}
+              refetch={calendar.refetch}
+              newsItems={calendar.data?.newsItems}
+              recentNews={calendar.data?.recentNews}
+              provider={calendar.data?.source}
+            />
+          </>
+        )}
 
-        {/* Row 4: paper trading — run analysis + confirm */}
-        <PaperTradePanel
-          onConfirmed={() => setJournalKey(k => k + 1)}
-          selectedPair={instrument}
-        />
+        {activeTab === 'learning' && (
+          <>
+            {/* Trader Mindset — 10-dim scorecard (band + total) */}
+            <TraderMindsetPanel />
+            {/* Trader Development — 20-principle curriculum from canonical books */}
+            <TraderDevelopmentPanel />
+            {/* Engine maturity — adaptive-weight self-assessment */}
+            <EngineMaturityCard />
+          </>
+        )}
 
-        {/* Row 4: paper trading journal — DB-backed history with Log Result */}
-        <PaperTradeJournal refreshKey={journalKey} selectedPair={instrument} />
+        {activeTab === 'backtest' && (
+          <>
+            {/* Probability sweep — 12-24 combos in one run */}
+            <ProbabilitySweepPanel />
+            {/* Engine comparison — swing vs intraday vs momentum */}
+            <EngineComparisonPanel />
+            {/* Strict XAU/USD backtest (primary) */}
+            <XauusdBacktestPanel />
+            {/* Legacy walk-forward backtest (kept for reference) */}
+            <BacktestDashboard />
+          </>
+        )}
 
-        {/* Row: MT5 Demo Panel — XAU/USD only */}
-        <MT5Panel
-          selectedPair={instrument}
-          currentSignal={signal.data?.currentSignal}
-          tradePlan={signal.data?.tradePlan}
-        />
-
-        {/* Row 5: signal history (XAU/USD only) */}
-        <SignalHistory
-          loading={history.loading}
-          error={history.error}
-          isUsingFallback={history.isUsingFallback}
-          refetch={history.refetch}
-          trades={history.data?.trades}
-        />
-
-        {/* Row: High-Probability Predictor (decision support — manual execution) */}
-        <HighProbabilityPanel />
-
-        {/* Row: paper observation tracker (dual-engine swing + trend_pullback) */}
-        <PaperObservationPanel />
-
-        {/* Row: strict XAU/USD backtest (primary) */}
-        <XauusdBacktestPanel />
-
-        {/* Row: legacy walk-forward backtest (kept for reference) */}
-        <BacktestDashboard />
-
-        {/* Row: broker execution (disabled panel) */}
-        <ExecutionPanel />
+        {activeTab === 'journal' && (
+          <>
+            {/* Paper-trade panel — confirm + log */}
+            <PaperTradePanel
+              onConfirmed={() => setJournalKey(k => k + 1)}
+              selectedPair={instrument}
+            />
+            {/* DB-backed paper trade journal */}
+            <PaperTradeJournal refreshKey={journalKey} selectedPair={instrument} />
+            {/* Paper observation tracker (dual + 3rd engine) */}
+            <PaperObservationPanel />
+            {/* MT5 demo panel */}
+            <MT5Panel
+              selectedPair={instrument}
+              currentSignal={signal.data?.currentSignal}
+              tradePlan={signal.data?.tradePlan}
+            />
+            {/* Signal history */}
+            <SignalHistory
+              loading={history.loading}
+              error={history.error}
+              isUsingFallback={history.isUsingFallback}
+              refetch={history.refetch}
+              trades={history.data?.trades}
+            />
+            {/* Broker execution (disabled panel for audit) */}
+            <ExecutionPanel />
+          </>
+        )}
       </main>
     </div>
   );
