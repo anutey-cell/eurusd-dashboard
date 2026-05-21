@@ -4,22 +4,77 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+concurrency:
+  group: do-deploy
+  cancel-in-progress: true
 
 jobs:
   deploy:
+    name: Pull, rebuild, restart
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deploy to DigitalOcean
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.DO_HOST }}
-          username: ${{ secrets.DO_USER }}
-          key: ${{ secrets.DO_SSH_KEY }}
-          script: |
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          cat >> ~/.ssh/config <<EOF
+          Host droplet
+            HostName ${{ secrets.DO_HOST }}
+            User ${{ secrets.DO_USER }}
+            IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            ServerAliveInterval 30
+          EOF
+
+      - name: Pull, rebuild, restart on droplet
+        run: |
+          ssh droplet 'bash -se' <<'REMOTE'
+            set -euo pipefail
+
             cd /opt/xauusd
-            git pull origin main
-            sudo bash deploy/deploy.sh
+
+            echo "[deploy] Fetching latest from GitHub..."
+            git fetch --quiet --tags origin
+            git reset --hard origin/main
+
+            echo "[deploy] Validating env file is present..."
+            test -f deploy/.env.prod || {
+              echo "FATAL: /opt/xauusd/deploy/.env.prod missing on droplet"
+              exit 1
+            }
+
+            echo "[deploy] Rebuilding and restarting containers..."
+            docker compose -f deploy/docker-compose.prod.yml \
+              --env-file deploy/.env.prod \
+              up -d --build --remove-orphans
+
+            echo "[deploy] Waiting for backend health..."
+            DEADLINE=$(( $(date +%s) + 90 ))
+
+            while true; do
+              if docker exec xauusd-backend python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" 2>/dev/null; then
+                echo "[deploy] Backend healthy"
+                break
+              fi
+
+              if [ $(date +%s) -gt $DEADLINE ]; then
+                echo "[deploy] Backend failed to come up in 90s"
+                docker compose -f deploy/docker-compose.prod.yml logs --tail=80 backend
+                exit 1
+              fi
+
+              sleep 3
+            done
+
+            echo "[deploy] Compose status:"
+            docker compose -f deploy/docker-compose.prod.yml ps
+          REMOTE
