@@ -332,6 +332,56 @@ def evaluate_and_execute(db: Session) -> ExecutionAttempt:
         log.warning("[auto_exec] killzone_policy evaluation failed (fail-open): %s", exc)
         att.confirmations["killzone_policy"] = {"error": str(exc), "allow": True}
 
+    # ── Confirmation 5: ICT framework alignment ─────────────────────────
+    # 5th gate — combined Power-of-3 + Daily-Open + Premium/Discount + Judas.
+    # Each contributes 0-25 points; minimum 60/100 to fire.
+    # This is the "quality trade" filter — it codifies what an ICT trader
+    # would check before pulling the trigger:
+    #   - Are we in DISTRIBUTION phase (not still accumulating)?
+    #   - Does the signal direction agree with Daily Open?
+    #   - Is the entry in the correct zone (longs in discount, shorts in premium)?
+    #   - Has the Judas manipulation leg already played out?
+    try:
+        from services.ict_advanced import compute_ict_alignment
+        from data.candles import get_candles as _get_candles_for_ict
+        m15_resp = _get_candles_for_ict(interval="M15", limit=500, pair="xauusd")
+        h4_resp  = _get_candles_for_ict(interval="H4",  limit=100, pair="xauusd")
+        ict = compute_ict_alignment(
+            candles_m15=m15_resp.candles,
+            candles_h4=h4_resp.candles,
+            at=datetime.now(timezone.utc),
+            signal_direction=scanner_signal,
+        )
+        att.confirmations["ict_framework"] = {
+            "score":           ict.score,
+            "posture":         ict.posture,
+            "summary":         ict.summary[:200],
+            "blocking":        ict.blocking,
+            "po3_phase":       ict.po3.phase,
+            "po3_score":       ict.po3.score,
+            "do_bias":         ict.daily_open.bias,
+            "do_aligned":      ict.daily_open.aligned,
+            "do_score":        ict.daily_open.score,
+            "pd_position":     ict.premium_discount.position,
+            "pd_position_pct": ict.premium_discount.position_pct,
+            "pd_aligned":      ict.premium_discount.aligned,
+            "pd_score":        ict.premium_discount.score,
+            "judas_detected":  ict.judas.judas_detected,
+            "judas_reversed":  ict.judas.reversed,
+            "judas_score":     ict.judas.score,
+        }
+        # MISALIGNED (score < 60) → block. CAUTIOUS allowed for now.
+        if ict.posture == "MISALIGNED":
+            att.blocking_reason = (
+                f"ICT framework MISALIGNED ({ict.score}/100): " +
+                "; ".join(ict.blocking[:2])
+            )[:200]
+            att.blocking_layer = "ict_framework"
+            return att
+    except Exception as exc:
+        log.warning("[auto_exec] ict_framework evaluation failed (fail-open): %s", exc)
+        att.confirmations["ict_framework"] = {"error": str(exc), "score": 60}
+
     # ── All confirmations agree — build signal payload and fire ─────────
     signal_payload = {
         "pair":         "xauusd",
@@ -563,5 +613,37 @@ def preview_attempt(db: Session) -> dict:
             return att.to_dict() | {"would_fire": False}
     except Exception as exc:
         att.confirmations["killzone_policy"] = {"error": str(exc), "allow": True}
+
+    # 5th gate — ICT framework alignment (same as live executor)
+    try:
+        from services.ict_advanced import compute_ict_alignment
+        from data.candles import get_candles as _get_candles_for_ict
+        m15_resp = _get_candles_for_ict(interval="M15", limit=500, pair="xauusd")
+        h4_resp  = _get_candles_for_ict(interval="H4",  limit=100, pair="xauusd")
+        ict = compute_ict_alignment(
+            candles_m15=m15_resp.candles,
+            candles_h4=h4_resp.candles,
+            at=datetime.now(timezone.utc),
+            signal_direction=scan_info["signal"],
+        )
+        att.confirmations["ict_framework"] = {
+            "score":           ict.score,
+            "posture":         ict.posture,
+            "summary":         ict.summary[:200],
+            "blocking":        ict.blocking,
+            "po3_phase":       ict.po3.phase,
+            "do_bias":         ict.daily_open.bias,
+            "do_aligned":      ict.daily_open.aligned,
+            "pd_position":     ict.premium_discount.position,
+            "pd_aligned":      ict.premium_discount.aligned,
+            "judas_detected":  ict.judas.judas_detected,
+            "judas_reversed":  ict.judas.reversed,
+        }
+        if ict.posture == "MISALIGNED":
+            att.blocking_reason = (f"ICT framework MISALIGNED ({ict.score}/100)")[:200]
+            att.blocking_layer = "ict_framework"
+            return att.to_dict() | {"would_fire": False}
+    except Exception as exc:
+        att.confirmations["ict_framework"] = {"error": str(exc)}
 
     return att.to_dict() | {"would_fire": True, "max_lot": settings.auto_execution_max_lot}

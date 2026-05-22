@@ -36,6 +36,7 @@ const LAYER_LABELS = {
   predictor:         'Predictor',
   killzone:          'Killzone',
   killzone_policy:   'KZ × Dir Policy',
+  ict_framework:     'ICT Framework',
 };
 
 function statusFromStatus(status) {
@@ -139,12 +140,17 @@ function LayerCard({ name, data, blockedHere }) {
     ];
   } else if (name === 'killzone_policy') {
     // 4th confirmation gate — learned from 245-trade dataset.
-    // Shows the historical edge of this (killzone × direction) cell.
     lines = [
       `${data.decision || '—'}${data.is_exploratory ? ' (explore)' : ''}`,
       data.sample_size > 0
         ? `hist n=${data.sample_size} · WR ${data.historical_wr?.toFixed(0)}% · ExpR ${data.historical_exp_r >= 0 ? '+' : ''}${data.historical_exp_r?.toFixed(2)}`
         : (data.bypass_reason || 'no historical data'),
+    ];
+  } else if (name === 'ict_framework') {
+    // 5th confirmation gate — PO3 + Daily Open + Premium/Discount + Judas.
+    lines = [
+      `${data.score ?? '—'}/100 · ${data.posture || '—'}`,
+      `PO3:${data.po3_phase || '—'} · DO:${data.do_bias || '—'}${data.do_aligned===false ? ' ✗' : ''} · ${data.pd_position || '—'}${data.pd_aligned===false ? ' ✗' : ''}`,
     ];
   }
 
@@ -314,7 +320,7 @@ export default function AutonomousExecutorPanel() {
               </div>
             </div>
             <div>
-              <div className="text-[10px] uppercase tracking-widest text-gray-500">Confirmations Needed (4)</div>
+              <div className="text-[10px] uppercase tracking-widest text-gray-500">Confirmations Needed (5)</div>
               <div className="text-sm text-gray-200 mt-1">
                 <Lock size={10} className="inline mr-1 text-amber-400" />
                 Scanner ≥ {status.thresholds.scanner_min_score} ·
@@ -323,7 +329,11 @@ export default function AutonomousExecutorPanel() {
               </div>
               <div className="text-[10px] text-gray-400 mt-1">
                 <Lock size={10} className="inline mr-1 text-amber-400" />
-                + 4th gate: (killzone × direction) cell must show +ve historical ExpR
+                + 4th gate: (KZ × direction) historical ExpR &gt; 0
+              </div>
+              <div className="text-[10px] text-gray-400 mt-1">
+                <Lock size={10} className="inline mr-1 text-amber-400" />
+                + 5th gate: ICT framework ≥ 60 (PO3 + DO + P/D + Judas)
               </div>
               <div className="text-[10px] text-gray-500 mt-1">
                 If any layer disagrees, no trade. By design.
@@ -337,12 +347,13 @@ export default function AutonomousExecutorPanel() {
               Last Evaluation Cycle
             </div>
             <LastAttempt last={last} />
-            {(confs.scanner || confs.predictor || confs.killzone || confs.killzone_policy) && (
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
-                <LayerCard name="scanner"   data={confs.scanner}   blockedHere={blockedLayer === 'scanner'} />
-                <LayerCard name="predictor" data={confs.predictor} blockedHere={blockedLayer === 'predictor'} />
-                <LayerCard name="killzone"  data={confs.killzone}  blockedHere={blockedLayer === 'killzone'} />
+            {(confs.scanner || confs.predictor || confs.killzone || confs.killzone_policy || confs.ict_framework) && (
+              <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
+                <LayerCard name="scanner"         data={confs.scanner}         blockedHere={blockedLayer === 'scanner'} />
+                <LayerCard name="predictor"       data={confs.predictor}       blockedHere={blockedLayer === 'predictor'} />
+                <LayerCard name="killzone"        data={confs.killzone}        blockedHere={blockedLayer === 'killzone'} />
                 <LayerCard name="killzone_policy" data={confs.killzone_policy} blockedHere={blockedLayer === 'killzone_policy'} />
+                <LayerCard name="ict_framework"   data={confs.ict_framework}   blockedHere={blockedLayer === 'ict_framework'} />
               </div>
             )}
           </div>

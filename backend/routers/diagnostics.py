@@ -30,6 +30,84 @@ router = APIRouter(prefix="/diagnostics", tags=["diagnostics"])
 
 
 @router.get(
+    "/ict-framework",
+    response_model=APIResponse[dict],
+    summary="Advanced ICT alignment: PO3 + Daily Open + Premium/Discount + Judas (5th confirmation gate)",
+)
+@limiter.limit("30/minute")
+def ict_framework(
+    request: Request,
+    direction: str | None = Query(default=None, description="Optional: BUY or SELL — scores cell against this direction"),
+) -> APIResponse[dict]:
+    """
+    The 5th confirmation gate — combines four ICT day-trading concepts into
+    a single 0-100 alignment score. Used by the auto-executor to refuse
+    trades that fail the ICT confluence test even when scanner + predictor
+    + killzone + policy all pass.
+
+    Returns per-component breakdowns so you can see WHY the trade was
+    allowed or refused.
+    """
+    from datetime import datetime, timezone
+    from data.candles import get_candles
+    from services.ict_advanced import compute_ict_alignment
+    m15 = get_candles(interval="M15", limit=500, pair="xauusd")
+    h4  = get_candles(interval="H4",  limit=100, pair="xauusd")
+    sig = direction.upper() if direction else None
+    ict = compute_ict_alignment(
+        candles_m15=m15.candles,
+        candles_h4=h4.candles,
+        at=datetime.now(timezone.utc),
+        signal_direction=sig,
+    )
+    return APIResponse(data={
+        "scored_against_direction": sig,
+        "score":                    ict.score,
+        "posture":                  ict.posture,
+        "summary":                  ict.summary,
+        "blocking":                 ict.blocking,
+        "components": {
+            "po3": {
+                "phase":     ict.po3.phase,
+                "score":     ict.po3.score,
+                "range_pts": ict.po3.range_pts,
+                "body_pct":  ict.po3.body_pct,
+                "reason":    ict.po3.reason,
+            },
+            "daily_open": {
+                "daily_open":  ict.daily_open.daily_open,
+                "current":     ict.daily_open.current,
+                "bias":        ict.daily_open.bias,
+                "aligned":     ict.daily_open.aligned,
+                "score":       ict.daily_open.score,
+                "distance":    ict.daily_open.distance_pts,
+                "reason":      ict.daily_open.reason,
+            },
+            "premium_discount": {
+                "range_high":    ict.premium_discount.range_high,
+                "range_low":     ict.premium_discount.range_low,
+                "equilibrium":   ict.premium_discount.equilibrium,
+                "current":       ict.premium_discount.current,
+                "position":      ict.premium_discount.position,
+                "position_pct":  ict.premium_discount.position_pct,
+                "aligned":       ict.premium_discount.aligned,
+                "score":         ict.premium_discount.score,
+                "reason":        ict.premium_discount.reason,
+            },
+            "judas": {
+                "in_window":       ict.judas.in_window,
+                "detected":        ict.judas.judas_detected,
+                "direction":       ict.judas.judas_direction,
+                "swept_level":     ict.judas.swept_level,
+                "reversed":        ict.judas.reversed,
+                "score":           ict.judas.score,
+                "reason":          ict.judas.reason,
+            },
+        },
+    }, source="ict_framework")
+
+
+@router.get(
     "/killzone-policy",
     response_model=APIResponse[dict],
     summary="Killzone × direction policy table — the 4th gate of the auto-executor",
