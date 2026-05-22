@@ -1,27 +1,45 @@
 """
-XAUUSD Institutional Signal Engine — Executive Strategist
-=========================================================
+XAUUSD Institutional Demo Execution Engine
+==========================================
 
-The unified decision aggregator. Synthesises every existing engine
-(scanner, predictor, killzone analyser, killzone policy, ICT framework,
-correlation engine, calendar) into a single structured JSON verdict
-that follows the institutional strategist mandate:
+The unified decision aggregator implementing the institutional demo-mandate.
+Synthesises every existing engine (scanner, predictor, killzone analyser,
+killzone policy, ICT framework, correlation engine, calendar) into a single
+structured JSON verdict.
 
-  Decision ∈ { LONG, SHORT, STAND ASIDE }
-
+Decision ∈ { BUY, SELL, STAND ASIDE }
   STAND ASIDE is preferred when conditions are not high-quality.
 
-STRICT DECISION RULES (any failure → STAND ASIDE):
+OPERATING MODE
+  • DEMO ONLY · live trading is hard-disabled
+  • Fixed lot 0.01 · never larger, never increased after losses
+  • Capital preservation comes first
 
-  • setup_score ≥ 80
-  • risk_reward ≥ 2.5
-  • liquidity_model.confirmed == True
-  • stop_loss defined
-  • TP1 + TP2 defined
-  • invalidation defined
-  • macro does not directly contradict
-  • spread + volatility acceptable
-  • price not in mid-range with no edge
+5-CONDITION SCORING MODEL
+  C1  Timeframe alignment supports direction
+  C2  Liquidity sweep or liquidity target is confirmed
+  C3  Structure / momentum confirms direction
+  C4  Macro & session context does not conflict
+  C5  Risk-reward + invalidation are acceptable
+
+  5/5 → A-grade demo execution allowed   (est WR 78-85%)
+  4/5 → Valid demo execution allowed     (est WR 70-80%)
+  3/5 → Watchlist only, no execution     (est WR 58-68%)
+ ≤2/5 → STAND ASIDE
+
+EXECUTION STATUS ENUM (always set on every verdict)
+  SIGNAL_ONLY · DEMO_TRADE_PLACED · DEMO_TRADE_REJECTED · STAND_ASIDE
+  BRIDGE_OFFLINE · SPREAD_TOO_HIGH · NEWS_RISK_BLOCKED · INVALIDATED_BEFORE_ENTRY
+
+Demo execution is only attempted when ALL of these are true:
+  • conditions_passed ≥ 4
+  • rr ≥ 1.5  (preferred ≥ 2.5)
+  • entry/SL/TP1/TP2 all defined
+  • bridge heartbeat fresh (≤120s)
+  • spread acceptable
+  • not inside a high-impact news window
+  • demo_auto_enqueue setting on AND allow_demo_trading on
+  • live_trading_authorized stays false (hard-coded check)
 
 The aggregator NEVER fabricates data — every field comes from a real engine
 output. When a sub-engine has no opinion, the field is null and the strategist
@@ -117,6 +135,332 @@ def _atr(highs, lows, closes, n=14):
     for i in range(1, len(highs)):
         trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
     return round(sum(trs[-n:]) / n, 2)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Mandate-enum classifiers
+# Each returns one of the exact strings the institutional mandate requires —
+# no free-text, no surprise variants. The dashboard panel and Telegram
+# format both depend on these being stable.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Market State — 8 mandate categories
+_MARKET_STATE_TRENDING_BULL    = "Trending bullish"
+_MARKET_STATE_TRENDING_BEAR    = "Trending bearish"
+_MARKET_STATE_RANGE            = "Range-bound"
+_MARKET_STATE_SWEEP            = "Liquidity sweep"
+_MARKET_STATE_NEWS_REPRICE     = "News repricing"
+_MARKET_STATE_COMPRESSION      = "Compression before expansion"
+_MARKET_STATE_DECAY            = "Post-news volatility decay"
+_MARKET_STATE_NO_STRUCTURE     = "No clean structure"
+
+
+def _classify_market_state_mandate(
+    *,
+    ema20_h1: float, ema50_h1: float, ema100_h1: float | None,
+    rsi_h1: float, atr_h1: float, atr_h1_baseline: float,
+    news_clear: bool, scan_market_state: str,
+    swept_recent: bool, kz_posture: str | None,
+) -> str:
+    """Map the engine's many internal flags to ONE of the 8 mandate strings."""
+    if not news_clear:
+        return _MARKET_STATE_NEWS_REPRICE
+    if scan_market_state == "DATA_STALE":
+        return _MARKET_STATE_NO_STRUCTURE
+    if swept_recent:
+        return _MARKET_STATE_SWEEP
+    # Volatility compression: ATR < 60% of recent baseline → likely range
+    if atr_h1_baseline > 0 and atr_h1 < 0.6 * atr_h1_baseline:
+        # If trending EMAs say so, it's compression-before-expansion
+        if ema100_h1 is not None and (ema20_h1 > ema50_h1 > ema100_h1 or ema20_h1 < ema50_h1 < ema100_h1):
+            return _MARKET_STATE_COMPRESSION
+        return _MARKET_STATE_RANGE
+    # Post-news decay: ATR < 80% of baseline AND we're past a recent news window
+    if atr_h1_baseline > 0 and atr_h1 < 0.8 * atr_h1_baseline and kz_posture in ("OBSERVE", "AVOID"):
+        return _MARKET_STATE_DECAY
+    if ema100_h1 is not None:
+        if ema20_h1 > ema50_h1 > ema100_h1 and rsi_h1 > 50:
+            return _MARKET_STATE_TRENDING_BULL
+        if ema20_h1 < ema50_h1 < ema100_h1 and rsi_h1 < 50:
+            return _MARKET_STATE_TRENDING_BEAR
+    if abs(ema20_h1 - ema50_h1) < (atr_h1 * 0.25):
+        return _MARKET_STATE_RANGE
+    return _MARKET_STATE_NO_STRUCTURE
+
+
+# Session — 8 mandate categories  (mapped from UTC hour-of-day)
+_SESSION_ASIAN_RANGE       = "Asian range formation"
+_SESSION_LDN_OPEN_SWEEP    = "London open sweep"
+_SESSION_LDN_CONTINUATION  = "London continuation"
+_SESSION_LDN_LUNCH_CHOP    = "London lunch chop"
+_SESSION_NY_OPEN_SWEEP     = "New York open sweep"
+_SESSION_LDN_NY_OVERLAP    = "London/New York overlap expansion"
+_SESSION_POST_NEWS         = "Post-news disorder"
+_SESSION_LATE_LOW_QUAL     = "Late-session low-quality liquidity"
+
+
+def _classify_session_mandate(*, hour_utc: float, news_clear: bool) -> str:
+    """Map UTC hour to ONE of the 8 mandate session strings."""
+    if not news_clear:
+        return _SESSION_POST_NEWS
+    if   hour_utc < 6:             return _SESSION_ASIAN_RANGE
+    elif hour_utc < 8:             return _SESSION_LDN_OPEN_SWEEP
+    elif hour_utc < 11:            return _SESSION_LDN_CONTINUATION
+    elif hour_utc < 12:            return _SESSION_LDN_LUNCH_CHOP
+    elif hour_utc < 14:            return _SESSION_NY_OPEN_SWEEP
+    elif hour_utc < 17:            return _SESSION_LDN_NY_OVERLAP
+    elif hour_utc < 22:            return _SESSION_LATE_LOW_QUAL
+    else:                          return _SESSION_LATE_LOW_QUAL
+
+
+# Timeframe alignment — 6 mandate categories
+_TF_STRONG_BULL      = "Strong bullish"
+_TF_BULL_EXTENDED    = "Bullish but extended"
+_TF_NEUTRAL          = "Neutral"
+_TF_BEAR_EXTENDED    = "Bearish but extended"
+_TF_STRONG_BEAR      = "Strong bearish"
+_TF_CONFLICTED       = "Conflicted"
+
+
+def _classify_tf_alignment_mandate(
+    *,
+    d1_bias: str, h4_bias: str, h1_ema20: float, h1_ema50: float,
+    rsi_h1: float,
+) -> str:
+    """Map HTF biases to ONE of the 6 mandate strings."""
+    d = (d1_bias or "").lower()
+    h = (h4_bias or "").lower()
+
+    bulls = sum(1 for x in (d, h) if "bull" in x)
+    bears = sum(1 for x in (d, h) if "bear" in x)
+    h1_bull = h1_ema20 > h1_ema50
+
+    if bulls == 2 and h1_bull and rsi_h1 < 70:
+        return _TF_STRONG_BULL
+    if bulls == 2 and h1_bull and rsi_h1 >= 70:
+        return _TF_BULL_EXTENDED
+    if bears == 2 and not h1_bull and rsi_h1 > 30:
+        return _TF_STRONG_BEAR
+    if bears == 2 and not h1_bull and rsi_h1 <= 30:
+        return _TF_BEAR_EXTENDED
+    if bulls and bears:
+        return _TF_CONFLICTED
+    return _TF_NEUTRAL
+
+
+# Liquidity behaviour — 5 mandate categories
+_LIQ_RUNNING       = "Running liquidity"
+_LIQ_REJECTING     = "Rejecting liquidity"
+_LIQ_RECLAIMING    = "Reclaiming liquidity"
+_LIQ_CHOPPING      = "Chopping between pools"
+_LIQ_EXPANDING     = "Expanding away from swept liquidity"
+
+
+def _classify_liquidity_behaviour(*, scan: dict, model_letter: str, model_confirmed: bool) -> str:
+    """Pick one of the 5 mandate strings describing how price is acting at liquidity."""
+    eng_model = scan.get("engineModel", {}) or {}
+    liq = (eng_model.get("liquidity") or "").lower()
+    struct = (eng_model.get("structure") or "").lower()
+
+    if "reclaim" in liq or "reclaim" in struct:
+        return _LIQ_RECLAIMING
+    if "reject" in liq or "rejection" in struct:
+        return _LIQ_REJECTING
+    if model_letter == "A" and model_confirmed:
+        return _LIQ_EXPANDING
+    if "swept" in liq or "sweep" in liq:
+        return _LIQ_RUNNING
+    return _LIQ_CHOPPING
+
+
+# Estimated win-rate ranges — mandate values
+def _estimate_win_rate(passed: int) -> str:
+    if passed >= 5: return "78-85%"
+    if passed >= 4: return "70-80%"
+    if passed >= 3: return "58-68%"
+    return "no trade"
+
+
+# Bridge heartbeat freshness check
+def _is_bridge_alive(max_age_seconds: int = 120) -> bool:
+    """True iff any MT5 bridge daemon has pinged /bridge/health within window."""
+    try:
+        from routers.bridge import _BRIDGE_HEARTBEAT
+        if not _BRIDGE_HEARTBEAT:
+            return False
+        now = datetime.now(timezone.utc)
+        return any(
+            (now - ts).total_seconds() < max_age_seconds
+            for ts in _BRIDGE_HEARTBEAT.values()
+        )
+    except Exception:
+        return False
+
+
+# 5-condition evaluator
+def _evaluate_5_conditions(
+    *,
+    proposed_signal: str,
+    tf_alignment_label: str,
+    model_letter: str,
+    model_confirmed: bool,
+    scan_market_state: str,
+    ict_score: int,
+    macro_alignment: str,
+    news_clear: bool,
+    kz_posture: str | None,
+    rr: float,
+    entry: float | None,
+    stop_loss: float | None,
+    tp1: float | None,
+    tp2: float | None,
+) -> list[dict]:
+    """
+    Score the 5 mandate conditions. Each entry: {name, passed, detail}.
+    """
+    is_buy  = proposed_signal == "BUY"
+    is_sell = proposed_signal == "SELL"
+
+    # C1: Timeframe alignment supports direction
+    c1_ok = False
+    if is_buy and tf_alignment_label in (_TF_STRONG_BULL,):
+        c1_ok = True
+    elif is_sell and tf_alignment_label in (_TF_STRONG_BEAR,):
+        c1_ok = True
+    elif tf_alignment_label in (_TF_BULL_EXTENDED, _TF_BEAR_EXTENDED):
+        # Extended is acceptable only for fade-style entries — treat as half-pass (don't count)
+        c1_ok = False
+
+    # C2: Liquidity sweep / target confirmed
+    c2_ok = model_confirmed and model_letter in ("A", "B", "C", "D")
+
+    # C3: Structure or momentum confirms direction
+    c3_ok = (scan_market_state == "SIGNAL_READY") or (ict_score >= 60)
+
+    # C4: Macro / session does not conflict
+    c4_ok = (
+        macro_alignment != "Conflicted"
+        and news_clear
+        and kz_posture in ("TRADE", "PRESS")
+    )
+
+    # C5: RR + invalidation acceptable
+    c5_ok = bool(
+        rr and rr >= 1.5
+        and entry is not None and stop_loss is not None
+        and tp1 is not None and tp2 is not None
+    )
+
+    return [
+        {"name": "C1 Timeframe alignment supports direction",  "passed": c1_ok,
+         "detail": tf_alignment_label},
+        {"name": "C2 Liquidity sweep / target confirmed",      "passed": c2_ok,
+         "detail": f"Model {model_letter} · confirmed={model_confirmed}"},
+        {"name": "C3 Structure / momentum confirms direction", "passed": c3_ok,
+         "detail": f"scanner={scan_market_state} · ict={ict_score}/100"},
+        {"name": "C4 Macro / session does not conflict",        "passed": c4_ok,
+         "detail": f"macro={macro_alignment} · news={'CLEAR' if news_clear else 'BLOCK'} · kz={kz_posture or '—'}"},
+        {"name": "C5 RR + invalidation acceptable",             "passed": c5_ok,
+         "detail": f"rr={rr or 0:.2f} · SL={stop_loss} · TP1={tp1} · TP2={tp2}"},
+    ]
+
+
+# Execution-status decider — produces ONE of the 8 mandate enum values
+_EXEC_SIGNAL_ONLY      = "SIGNAL_ONLY"
+_EXEC_DEMO_PLACED      = "DEMO_TRADE_PLACED"
+_EXEC_DEMO_REJECTED    = "DEMO_TRADE_REJECTED"
+_EXEC_STAND_ASIDE      = "STAND_ASIDE"
+_EXEC_BRIDGE_OFFLINE   = "BRIDGE_OFFLINE"
+_EXEC_SPREAD_HIGH      = "SPREAD_TOO_HIGH"
+_EXEC_NEWS_BLOCKED     = "NEWS_RISK_BLOCKED"
+_EXEC_INVALIDATED      = "INVALIDATED_BEFORE_ENTRY"
+
+
+def _decide_execution_status(
+    *,
+    conditions_passed: int,
+    proposed_signal: str,
+    news_clear: bool,
+    spread_acceptable: bool,
+    bridge_alive: bool,
+    rr: float,
+    entry: float | None,
+    stop_loss: float | None,
+    tp1: float | None,
+    tp2: float | None,
+    demo_auto_enqueue: bool,
+    allow_demo: bool,
+) -> tuple[str, str]:
+    """
+    Pick the execution_status value. Returns (status, reason).
+
+    Mandate precedence:
+      1. STAND_ASIDE  — score below 3/5, or no direction
+      2. NEWS_RISK_BLOCKED / SPREAD_TOO_HIGH / BRIDGE_OFFLINE
+                      — clean setup but execution conditions fail
+      3. SIGNAL_ONLY  — 3/5 watchlist, or 4-5/5 but enqueue disabled / RR<1.5
+      4. DEMO_TRADE_PLACED — all gates pass
+      (DEMO_TRADE_REJECTED + INVALIDATED_BEFORE_ENTRY are set post-fact
+      by the bridge / monitor — not by this function.)
+    """
+    if proposed_signal not in ("BUY", "SELL") or conditions_passed < 3:
+        return _EXEC_STAND_ASIDE, "Setup below 3/5 conditions"
+
+    if conditions_passed == 3:
+        return _EXEC_SIGNAL_ONLY, "Watchlist — 3/5 (no demo execution)"
+
+    # 4-5/5 from here on — check execution gates
+    if not news_clear:
+        return _EXEC_NEWS_BLOCKED, "Inside high-impact news window"
+    if not spread_acceptable:
+        return _EXEC_SPREAD_HIGH, "Spread outside acceptable band"
+    if not bridge_alive:
+        return _EXEC_BRIDGE_OFFLINE, "MT5 bridge daemon heartbeat stale"
+    if not entry or not stop_loss or not tp1 or not tp2:
+        return _EXEC_SIGNAL_ONLY, "Trade levels incomplete"
+    if not rr or rr < 1.5:
+        return _EXEC_SIGNAL_ONLY, f"RR {rr or 0:.2f}<1.5 demo floor"
+    if not (demo_auto_enqueue and allow_demo):
+        return _EXEC_SIGNAL_ONLY, "Demo auto-enqueue disabled by operator"
+
+    return _EXEC_DEMO_PLACED, "All gates pass"
+
+
+def _build_mt5_execution_object(
+    *,
+    decision: str, entry: float, stop_loss: float,
+    tp1: float, tp2: float, rr: float,
+    setup_score_100: int, conditions_passed: int,
+    execution_status: str,
+) -> dict:
+    """
+    Strict MT5-bridge schema per the mandate. Only emitted when
+    execution_status == DEMO_TRADE_PLACED. Lot is HARD-CODED 0.01.
+    """
+    return {
+        "symbol":                  "XAUUSD",
+        "mode":                    "demo",
+        "action":                  decision,            # BUY or SELL
+        "lot":                     0.01,                # ← hard-coded
+        "entry":                   round(entry, 2),
+        "stop_loss":               round(stop_loss, 2),
+        "take_profit_1":           round(tp1, 2),
+        "take_profit_2":           round(tp2, 2),
+        "risk_reward":             round(rr, 2),
+        "setup_score":             setup_score_100,
+        "conditions_passed":       conditions_passed,
+        "execution_status":        execution_status,
+        "bridge_required":         True,
+        "live_execution_allowed":  False,               # ← always false
+        "learning_log_required":   True,
+    }
+
+
+def _compute_entry_tolerance(atr_h1: float) -> float:
+    """How far from `entry` the live price can be and still hit market exec."""
+    if atr_h1 <= 0:
+        return 1.0
+    return round(min(max(atr_h1 * 0.10, 0.5), 3.0), 2)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -415,13 +759,74 @@ def make_decision(db: Session) -> dict:
 
     decision = "STAND ASIDE"
     if not stand_aside_reasons and proposed_signal in ("BUY", "SELL"):
-        decision = "LONG" if proposed_signal == "BUY" else "SHORT"
+        # Mandate uses BUY/SELL (not LONG/SHORT) as the canonical decision values
+        decision = proposed_signal
 
-    # Quality band
+    # Quality band derived from the legacy 0-100 score (kept for backward-compat
+    # with the existing dashboard panel). The mandate's primary band signal is
+    # `conditions_passed` (see below).
     if total_setup_score >= 90: band = "A-grade"
     elif total_setup_score >= 80: band = "Valid"
     elif total_setup_score >= 70: band = "Watchlist"
     else: band = "No Trade"
+
+    # ── Mandate enums (8/8/6/5-category classifications) ────────────────
+    # ATR baseline = 50-period H1 ATR average, used to detect compression / decay
+    atr_baseline_h1 = 0.0
+    if len(h1) >= 50:
+        recent_atr_samples = []
+        for i in range(max(1, len(h1) - 50), len(h1)):
+            window = h1[max(0, i - 14):i]
+            if len(window) >= 14:
+                ws = _atr([c.high for c in window], [c.low for c in window], [c.close for c in window])
+                if ws: recent_atr_samples.append(ws)
+        if recent_atr_samples:
+            atr_baseline_h1 = sum(recent_atr_samples) / len(recent_atr_samples)
+
+    swept_recently = bool(
+        scan.get("engineModel", {}).get("liquidity", "").lower().count("swept")
+        or scan.get("engineModel", {}).get("liquidity", "").lower().count("sweep")
+    )
+    market_state_mandate = _classify_market_state_mandate(
+        ema20_h1=ema20_h1, ema50_h1=ema50_h1, ema100_h1=ema100_h1,
+        rsi_h1=rsi_h1, atr_h1=atr_h1, atr_h1_baseline=atr_baseline_h1,
+        news_clear=news_clear,
+        scan_market_state=scan.get("marketState", "UNKNOWN"),
+        swept_recent=swept_recently,
+        kz_posture=kz.get("posture"),
+    )
+    session_mandate = _classify_session_mandate(hour_utc=h, news_clear=news_clear)
+    tf_alignment_mandate = _classify_tf_alignment_mandate(
+        d1_bias=(scan.get("engineModel") or {}).get("d1Bias", ""),
+        h4_bias=(scan.get("engineModel") or {}).get("h4Bias", ""),
+        h1_ema20=ema20_h1, h1_ema50=ema50_h1,
+        rsi_h1=rsi_h1,
+    )
+    liquidity_behaviour = _classify_liquidity_behaviour(
+        scan=scan, model_letter=model_letter, model_confirmed=model_confirmed,
+    )
+
+    # ── 5-condition mandate evaluation ──────────────────────────────────
+    conditions = _evaluate_5_conditions(
+        proposed_signal=proposed_signal,
+        tf_alignment_label=tf_alignment_mandate,
+        model_letter=model_letter,
+        model_confirmed=model_confirmed,
+        scan_market_state=scan.get("marketState", "UNKNOWN"),
+        ict_score=(ict.score if ict else 0),
+        macro_alignment=macro_aligned,
+        news_clear=news_clear,
+        kz_posture=kz.get("posture"),
+        rr=rr or 0,
+        entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2,
+    )
+    conditions_passed = sum(1 for c in conditions if c["passed"])
+    est_win_rate = _estimate_win_rate(conditions_passed)
+
+    # If conditions_passed < 3 we MUST stand aside regardless of legacy score
+    if conditions_passed < 3 and decision != "STAND ASIDE":
+        decision = "STAND ASIDE"
+        stand_aside_reasons.insert(0, f"Conditions passed {conditions_passed}/5 (need ≥3 for any action)")
 
     # ── Next-trigger guidance ───────────────────────────────────────────
     long_trigger = ""
@@ -438,29 +843,82 @@ def make_decision(db: Session) -> dict:
     allow_alert  = (decision != "STAND ASIDE")
     allow_demo   = (decision != "STAND ASIDE" and total_setup_score >= 85
                     and settings.allow_demo_trading)
-    allow_live   = (decision != "STAND ASIDE" and total_setup_score >= 85
-                    and settings.live_trading_authorized
-                    and settings.auto_execution_enabled)
+    allow_live   = False   # ← MANDATE: live execution is hard-disabled in this engine
+
+    # ── Bridge / spread / news gates for execution_status ───────────────
+    bridge_alive = _is_bridge_alive(max_age_seconds=120)
+    # Spread acceptable: scanner sets risk.spreadStatus when live data is fresh
+    spread_status = ((scan.get("risk") or {}).get("spreadStatus") or "UNKNOWN").upper()
+    spread_acceptable = spread_status in ("OK", "NORMAL", "ACCEPTABLE", "UNKNOWN")
+    demo_auto_enqueue = getattr(settings, "demo_auto_enqueue", False)
+
+    execution_status, exec_reason = _decide_execution_status(
+        conditions_passed=conditions_passed,
+        proposed_signal=proposed_signal,
+        news_clear=news_clear,
+        spread_acceptable=spread_acceptable,
+        bridge_alive=bridge_alive,
+        rr=rr or 0,
+        entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2,
+        demo_auto_enqueue=demo_auto_enqueue,
+        allow_demo=settings.allow_demo_trading,
+    )
+
+    entry_tolerance = _compute_entry_tolerance(atr_h1)
+
+    mt5_execution_object = None
+    if execution_status == _EXEC_DEMO_PLACED and decision in ("BUY", "SELL"):
+        mt5_execution_object = _build_mt5_execution_object(
+            decision=decision,
+            entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2,
+            rr=rr or 0,
+            setup_score_100=total_setup_score,
+            conditions_passed=conditions_passed,
+            execution_status=execution_status,
+        )
+
+    # Per-cycle improvement note — what's stopping a 5/5 grade right now
+    failed_conditions = [c["name"] for c in conditions if not c["passed"]]
+    if conditions_passed >= 5:
+        improvement_note = "5/5 — no improvement gap."
+    else:
+        improvement_note = (
+            f"Missing: {'; '.join(failed_conditions[:3])}"
+            if failed_conditions else "—"
+        )
 
     return {
         "instrument": "XAUUSD",
         "timestamp":  now.isoformat(),
         "decision":   decision,
+        # ── MANDATE PRIMARY FIELDS ──
+        "conditions_passed":         conditions_passed,
+        "conditions":                conditions,
+        "estimated_win_rate_range":  est_win_rate,
+        "execution_status":          execution_status,
+        "execution_status_reason":   exec_reason,
+        "mt5_execution_object":      mt5_execution_object,
+        "improvement_note":          improvement_note,
+        "session_classification":    session_mandate,
+        "tf_alignment_label":        tf_alignment_mandate,
+        "liquidity_behaviour":       liquidity_behaviour,
+        # ── EXISTING FIELDS (preserved for dashboard panel + back-compat) ──
         "market_sentiment": (
             "Bullish" if (ema20_h1 > ema50_h1 and rsi_h1 > 50) else
             "Bearish" if (ema20_h1 < ema50_h1 and rsi_h1 < 50) else
             "Neutral" if abs(rsi_h1 - 50) < 5 else "Mixed"
         ),
-        "setup_score":   total_setup_score,
+        "setup_score":   total_setup_score,            # 0-100 legacy fine-grain score
         "quality_band":  band,
         "timeframe_alignment": {
             "daily":  f"close ${closes_h4[-1] if closes_h4 else current_price:.2f}, range {today_low}-{today_high}",
             "h4":     f"close ${closes_h4[-1]:.2f}" if closes_h4 else "—",
             "h1":     f"close ${closes_h1[-1]:.2f}, EMA20={ema20_h1}, EMA50={ema50_h1}, EMA100={ema100_h1}",
             "m15":    f"close ${closes_m15[-1]:.2f}, RSI={rsi_h1}, VWAP={vwap['vwap']}",
-            "alignment_summary": market_state,
+            "alignment_summary": tf_alignment_mandate,   # ← mandate enum
         },
-        "market_state": market_state,
+        "market_state":         market_state_mandate,    # ← mandate enum (was free-text)
+        "market_state_detail":  market_state,            # original detailed string kept here
         "liquidity_model": {
             "confirmed":        model_confirmed,
             "type": {
@@ -497,29 +955,31 @@ def make_decision(db: Session) -> dict:
             "candle_quality": (scan.get("engineModel") or {}).get("fvg", "—"),
         },
         "trade_plan": {
-            "entry_type": "Wait for confirmation" if decision == "STAND ASIDE" else "Market",
-            "entry":      entry,
-            "stop_loss":  stop_loss,
-            "tp1":        tp1,
-            "tp2":        tp2,
-            "tp3":        tp3,
-            "risk_reward":rr or None,
-            "invalidation": f"Price closes through {stop_loss}" if stop_loss else None,
+            "entry_type": (
+                "Wait for confirmation" if decision == "STAND ASIDE"
+                else "Market" if execution_status == _EXEC_DEMO_PLACED
+                else "Signal only — no execution"
+            ),
+            "entry":           entry,
+            "entry_tolerance": entry_tolerance,         # MANDATE: ± tolerance in USD
+            "stop_loss":       stop_loss,
+            "tp1":             tp1,
+            "tp2":             tp2,
+            "tp3":             tp3,
+            "risk_reward":     rr or None,
+            "invalidation":    f"Price closes through {stop_loss}" if stop_loss else None,
+            "lot_size":        0.01,                   # MANDATE: ALWAYS 0.01 on demo
             "position_size_guidance": (
                 "No trade" if decision == "STAND ASIDE" else
-                "Normal" if total_setup_score >= 90 else
-                "Reduced" if total_setup_score >= 80 else
-                "Demo only"
+                "Demo only · 0.01 lot · learning mode"
             ),
         },
         "execution_permission": {
             "allow_alert":          allow_alert,
-            "allow_demo_execution": allow_demo,
-            "allow_live_execution": allow_live,
-            "reason": (
-                "All decision rules satisfied" if decision != "STAND ASIDE"
-                else "; ".join(stand_aside_reasons[:3])
-            ),
+            "allow_demo_execution": (execution_status == _EXEC_DEMO_PLACED),
+            "allow_live_execution": False,             # MANDATE: hard-disabled
+            "execution_status":     execution_status,  # mirror of top-level for legacy clients
+            "reason":               exec_reason,
         },
         "management_plan": {
             "after_tp1":   "Move SL to entry (breakeven)",
@@ -543,27 +1003,162 @@ def make_decision(db: Session) -> dict:
             f"ICT({ict.score if ict else '—'}/100 {ict.posture if ict else '—'})"
         ),
         "final_verdict": (
-            f"{decision} · score {total_setup_score}/100 · band {band} · model {model_letter}"
+            f"{decision} · {conditions_passed}/5 conditions · est WR {est_win_rate}"
+            f" · {execution_status} · model {model_letter}"
             + (f" · {gold_macro_bias}" if gold_macro_bias != "Neutral" else "")
         ),
     }
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Telegram formatters — pinned to EXACT mandate spec
+# ────────────────────────────────────────────────────────────────────────────
+
+def format_mandate_signal_message(
+    verdict: dict, *,
+    long_pct: float | None = None, short_pct: float | None = None,
+    spread_pts: float | None = None,
+) -> str:
+    """
+    Build the EXACT Telegram message format the mandate requires for
+    BUY / SELL decisions. Plain text — no HTML tags.
+
+    Optional inputs (sentiment / spread) come from the router, which has
+    access to MyFXBook and the live tick.
+    """
+    dec = verdict.get("decision", "STAND ASIDE")
+    if dec not in ("BUY", "SELL"):
+        return format_mandate_stand_aside_message(verdict)
+
+    arrow = "🟢 BUY" if dec == "BUY" else "🔴 SELL"
+    tp = verdict.get("trade_plan", {}) or {}
+    tc = verdict.get("technical_confirmation", {}) or {}
+    mc = verdict.get("macro_context", {}) or {}
+    lm = verdict.get("liquidity_model", {}) or {}
+
+    current_price = tp.get("entry")
+    entry         = tp.get("entry")
+    entry_tol     = tp.get("entry_tolerance", 0)
+    sl            = tp.get("stop_loss")
+    tp1           = tp.get("tp1")
+    tp2           = tp.get("tp2")
+    rr            = tp.get("risk_reward") or 0
+
+    # Extract RSI/ATR plain values from descriptive strings (best-effort)
+    rsi_str = (tc.get("rsi") or "").split()[0] if tc.get("rsi") else "—"
+    atr_str = (tc.get("atr_volatility") or "").split()[0] if tc.get("atr_volatility") else "—"
+
+    sentiment_str = "—"
+    if long_pct is not None and short_pct is not None:
+        sentiment_str = f"{long_pct:.0f}% Long / {short_pct:.0f}% Short"
+
+    cp = verdict.get("conditions_passed", 0)
+    wr = verdict.get("estimated_win_rate_range", "—")
+    es = verdict.get("execution_status", "STAND_ASIDE")
+    trade_placed = "YES" if es == "DEMO_TRADE_PLACED" else "NO"
+
+    # Brief analysis line — joins liquidity, structure, session, macro, risk
+    analysis = (
+        f"{lm.get('type','—')} · {verdict.get('liquidity_behaviour','—')} · "
+        f"{verdict.get('session_classification','—')} · macro={mc.get('macro_alignment','—')} · "
+        f"{verdict.get('execution_status_reason','—')}"
+    )
+
+    ts = verdict.get("timestamp", datetime.now(timezone.utc).isoformat())
+    try:
+        ts_gmt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M GMT")
+    except Exception:
+        ts_gmt = ts
+
+    return (
+        f"📈 XAUUSD SIGNAL 📈\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Direction:    {arrow}\n"
+        f"Price:        ${current_price}\n"
+        f"Score:        {cp}/5 conditions\n"
+        f"Est Win Rate: {wr}\n"
+        f"\n"
+        f"📌 TRADE LEVELS\n"
+        f"Entry:        ${entry} +/- ${entry_tol}\n"
+        f"Stop Loss:    ${sl}\n"
+        f"Take Profit 1: ${tp1}\n"
+        f"Take Profit 2: ${tp2}\n"
+        f"Risk:Reward:  1:{rr}\n"
+        f"\n"
+        f"📊 MARKET DATA\n"
+        f"RSI(14):      {rsi_str}\n"
+        f"ATR(14):      ${atr_str}\n"
+        f"Sentiment:    {sentiment_str}\n"
+        f"\n"
+        f"📝 Analysis:\n"
+        f"Score: {cp}/5. {analysis}\n"
+        f"Trade placed on demo: {trade_placed}\n"
+        f"Lot Size: 0.01\n"
+        f"Execution Status: {es}\n"
+        f"\n"
+        f"Time: {ts_gmt}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"NOT FINANCIAL ADVICE. Manage your risk."
+    )
+
+
+def format_mandate_stand_aside_message(verdict: dict) -> str:
+    """Exact format for STAND ASIDE informational alerts."""
+    tp = verdict.get("trade_plan", {}) or {}
+    nt = verdict.get("next_trigger", {}) or {}
+    cp = verdict.get("conditions_passed", 0)
+    price = tp.get("entry") or "—"
+    reason = verdict.get("stand_aside_reason") or verdict.get("execution_status_reason") or "Conditions unclear"
+
+    ts = verdict.get("timestamp", datetime.now(timezone.utc).isoformat())
+    try:
+        ts_gmt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M GMT")
+    except Exception:
+        ts_gmt = ts
+
+    return (
+        f"⚪ XAUUSD STAND ASIDE\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Reason: {reason}\n"
+        f"Current Price: ${price}\n"
+        f"Score: {cp}/5\n"
+        f"Next BUY Trigger: {nt.get('long_trigger') or '—'}\n"
+        f"Next SELL Trigger: {nt.get('short_trigger') or '—'}\n"
+        f"Time: {ts_gmt}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Capital preserved. No trade taken."
+    )
+
+
 def _stand_aside_envelope(now: datetime, *, reason: str) -> dict:
     """Defensive envelope when the strategist can't get the data it needs."""
     return {
-        "instrument":    "XAUUSD",
-        "timestamp":     now.isoformat(),
-        "decision":      "STAND ASIDE",
-        "market_sentiment": "Neutral",
-        "setup_score":   0,
-        "quality_band":  "No Trade",
-        "stand_aside_reason": reason,
-        "final_verdict": f"STAND ASIDE — {reason}",
+        "instrument":               "XAUUSD",
+        "timestamp":                now.isoformat(),
+        "decision":                 "STAND ASIDE",
+        # Mandate primary fields — always present so downstream consumers don't crash
+        "conditions_passed":        0,
+        "conditions":               [],
+        "estimated_win_rate_range": "no trade",
+        "execution_status":         _EXEC_STAND_ASIDE,
+        "execution_status_reason":  reason,
+        "mt5_execution_object":     None,
+        "improvement_note":         reason,
+        "session_classification":   "Asian range formation",
+        "tf_alignment_label":       _TF_NEUTRAL,
+        "liquidity_behaviour":      _LIQ_CHOPPING,
+        # Legacy back-compat fields
+        "market_sentiment":         "Neutral",
+        "setup_score":              0,
+        "quality_band":             "No Trade",
+        "market_state":             "No clean structure",
+        "stand_aside_reason":       reason,
+        "final_verdict":            f"STAND ASIDE — {reason}",
         "execution_permission": {
             "allow_alert":          False,
             "allow_demo_execution": False,
             "allow_live_execution": False,
+            "execution_status":     _EXEC_STAND_ASIDE,
             "reason":               reason,
         },
     }

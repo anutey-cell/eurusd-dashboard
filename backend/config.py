@@ -126,6 +126,13 @@ class Settings(BaseSettings):
     telegram_signal_alerts:          bool = True   # alert when BUY/SELL signal fires
     telegram_confirm_alerts:         bool = True   # alert when signal confirmed to DB
     telegram_trade_alerts:           bool = True   # alert when demo trade placed / rejected
+    telegram_standby_alerts:         bool = False  # informational alerts when verdict is STAND ASIDE
+
+    # ── Mandate demo-execution opt-in ─────────────────────────────────────────
+    # When True, the strategist will enqueue a 0.01-lot MT5 PendingExecution row
+    # every time execution_status == DEMO_TRADE_PLACED. Operator opts in
+    # explicitly; default OFF so the system runs as SIGNAL_ONLY out-of-the-box.
+    demo_auto_enqueue:               bool = False
     # Legacy fallback — honoured if TELEGRAM_ENABLED is set in older .env files
     telegram_enabled:                bool = False
 

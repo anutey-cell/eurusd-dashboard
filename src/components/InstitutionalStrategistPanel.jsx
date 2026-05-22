@@ -22,19 +22,29 @@ import { usePollInterval } from '../hooks/usePollInterval';
 const POLL_MS = 30_000;
 
 const DECISION_CFG = {
+  // Mandate primary decision values
+  BUY:           { cls: 'border-emerald-500/70 bg-emerald-500/15 text-emerald-300',
+                   Icon: TrendingUp, label: 'BUY' },
+  SELL:          { cls: 'border-red-500/70     bg-red-500/15     text-red-300',
+                   Icon: TrendingDown, label: 'SELL' },
+  // Legacy aliases (kept so older cached verdicts still render)
   LONG:          { cls: 'border-emerald-500/70 bg-emerald-500/15 text-emerald-300',
-                   Icon: TrendingUp, label: 'LONG' },
+                   Icon: TrendingUp, label: 'BUY' },
   SHORT:         { cls: 'border-red-500/70     bg-red-500/15     text-red-300',
-                   Icon: TrendingDown, label: 'SHORT' },
+                   Icon: TrendingDown, label: 'SELL' },
   'STAND ASIDE': { cls: 'border-amber-500/50   bg-amber-500/10   text-amber-300',
                    Icon: MinusCircle, label: 'STAND ASIDE' },
 };
 
-const BAND_CLS = {
-  'A-grade':   'bg-emerald-600/30 text-emerald-200 border-emerald-500/60',
-  Valid:       'bg-blue-600/30    text-blue-200    border-blue-500/60',
-  Watchlist:   'bg-amber-600/30   text-amber-200   border-amber-500/60',
-  'No Trade':  'bg-red-600/30     text-red-200     border-red-500/60',
+const EXECUTION_STATUS_CLS = {
+  DEMO_TRADE_PLACED:        'bg-emerald-600/30 text-emerald-200 border-emerald-500/60',
+  SIGNAL_ONLY:              'bg-blue-600/30    text-blue-200    border-blue-500/60',
+  STAND_ASIDE:              'bg-amber-600/30   text-amber-200   border-amber-500/60',
+  BRIDGE_OFFLINE:           'bg-orange-600/30  text-orange-200  border-orange-500/60',
+  SPREAD_TOO_HIGH:          'bg-orange-600/30  text-orange-200  border-orange-500/60',
+  NEWS_RISK_BLOCKED:        'bg-orange-600/30  text-orange-200  border-orange-500/60',
+  DEMO_TRADE_REJECTED:      'bg-red-600/30     text-red-200     border-red-500/60',
+  INVALIDATED_BEFORE_ENTRY: 'bg-red-600/30     text-red-200     border-red-500/60',
 };
 
 function PriceLine({ label, value, valueCls = 'text-white' }) {
@@ -91,38 +101,70 @@ export default function InstitutionalStrategistPanel() {
 
   const dec = v?.decision || 'STAND ASIDE';
   const cfg = DECISION_CFG[dec] || DECISION_CFG['STAND ASIDE'];
-  const bandCls = BAND_CLS[v?.quality_band] || BAND_CLS['No Trade'];
 
   return (
     <div className="bg-[#0d1117] border-2 border-[#263044] rounded-xl p-5 space-y-4">
 
-      {/* Top banner: BIG decision + score */}
+      {/* Top banner: BIG decision + 5-condition score */}
       <div className={`rounded-lg border-2 p-4 ${cfg.cls}`}>
         <div className="flex items-center justify-between flex-wrap gap-3">
           <div className="flex items-center gap-3">
             <cfg.Icon size={40} />
             <div>
               <div className="text-[10px] uppercase tracking-widest opacity-80">
-                Institutional Strategist · XAUUSD
+                Institutional Demo Strategist · XAUUSD · 0.01 lot
               </div>
               <div className="text-3xl font-bold leading-tight">{cfg.label}</div>
               <div className="text-xs opacity-90 mt-0.5">{v?.final_verdict || '—'}</div>
             </div>
           </div>
           <div className="text-right">
-            <div className="text-[10px] uppercase tracking-widest opacity-70">Setup Score</div>
+            <div className="text-[10px] uppercase tracking-widest opacity-70">Conditions</div>
             <div className="text-4xl font-mono font-bold leading-none">
-              {v?.setup_score ?? 0}<span className="text-base opacity-50">/100</span>
+              {v?.conditions_passed ?? 0}<span className="text-base opacity-50">/5</span>
             </div>
-            <div className={`mt-1 inline-block text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded border ${bandCls}`}>
-              {v?.quality_band || '—'}
+            <div className="text-[10px] opacity-80 font-mono mt-0.5">
+              est WR {v?.estimated_win_rate_range || '—'}
+            </div>
+            <div className={`mt-1 inline-block text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded border ${EXECUTION_STATUS_CLS[v?.execution_status] || EXECUTION_STATUS_CLS.STAND_ASIDE}`}>
+              {v?.execution_status || 'STAND_ASIDE'}
             </div>
           </div>
         </div>
         <div className="text-xs opacity-90 mt-3 pl-12">
           {v?.market_state} · {v?.market_sentiment} · {v?.timeframe_alignment?.alignment_summary}
         </div>
+        <div className="text-[10px] opacity-70 mt-1 pl-12 font-mono">
+          {v?.session_classification} · {v?.liquidity_behaviour} · score {v?.setup_score ?? 0}/100 ({v?.quality_band})
+        </div>
       </div>
+
+      {/* 5-condition checklist */}
+      {v?.conditions?.length > 0 && (
+        <div className="bg-[#161b27] border border-[#263044] rounded p-3">
+          <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold mb-2">
+            5-Condition Mandate Score
+          </div>
+          <div className="space-y-1">
+            {v.conditions.map((c, i) => (
+              <div key={i} className="flex items-start gap-2 text-[11px]">
+                {c.passed
+                  ? <CheckCircle size={12} className="text-emerald-400 mt-0.5 flex-shrink-0" />
+                  : <MinusCircle size={12} className="text-gray-500 mt-0.5 flex-shrink-0" />}
+                <div className="flex-1">
+                  <div className={c.passed ? 'text-gray-200' : 'text-gray-500'}>{c.name}</div>
+                  <div className="text-[10px] text-gray-500 font-mono">{c.detail}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          {v.improvement_note && (
+            <div className="mt-2 pt-2 border-t border-[#263044] text-[10px] text-amber-300/80 italic">
+              {v.improvement_note}
+            </div>
+          )}
+        </div>
+      )}
 
       {error && (
         <div className="bg-red-500/10 border border-red-500/40 rounded p-2 text-xs text-red-300 flex items-center gap-2">
@@ -139,8 +181,8 @@ export default function InstitutionalStrategistPanel() {
           <div className="text-xs text-amber-200 mb-2">{v.stand_aside_reason}</div>
           {v.next_trigger && (
             <div className="space-y-1 text-[10px] text-amber-200/90 leading-snug border-t border-amber-500/20 pt-2">
-              <div><span className="text-emerald-300 font-bold">LONG valid IF:</span> {v.next_trigger.long_trigger || '—'}</div>
-              <div><span className="text-red-300 font-bold">SHORT valid IF:</span> {v.next_trigger.short_trigger || '—'}</div>
+              <div><span className="text-emerald-300 font-bold">BUY valid IF:</span> {v.next_trigger.long_trigger || '—'}</div>
+              <div><span className="text-red-300 font-bold">SELL valid IF:</span> {v.next_trigger.short_trigger || '—'}</div>
               <div className="text-amber-200/70 italic">{v.next_trigger.no_trade_condition}</div>
             </div>
           )}
@@ -148,15 +190,16 @@ export default function InstitutionalStrategistPanel() {
       )}
 
       {/* Trade plan — only if a real decision */}
-      {(dec === 'LONG' || dec === 'SHORT') && v?.trade_plan && (
-        <Block icon={Target} title="Trade Plan" accent="border-emerald-500/40">
-          <PriceLine label="Entry"     value={`$${v.trade_plan.entry}`} valueCls="text-white font-bold" />
-          <PriceLine label="Stop Loss" value={`$${v.trade_plan.stop_loss}`} valueCls="text-red-300" />
-          <PriceLine label="TP1"       value={`$${v.trade_plan.tp1}`} valueCls="text-emerald-300" />
-          <PriceLine label="TP2"       value={`$${v.trade_plan.tp2}`} valueCls="text-emerald-300" />
-          <PriceLine label="TP3"       value={`$${v.trade_plan.tp3}`} valueCls="text-emerald-300" />
-          <PriceLine label="Risk:Reward" value={`${v.trade_plan.risk_reward}R`} valueCls="text-amber-300 font-bold" />
-          <PriceLine label="Position Size" value={v.trade_plan.position_size_guidance} valueCls="text-blue-300" />
+      {(dec === 'BUY' || dec === 'SELL' || dec === 'LONG' || dec === 'SHORT') && v?.trade_plan && (
+        <Block icon={Target} title="Trade Plan (DEMO · 0.01 lot)" accent="border-emerald-500/40">
+          <PriceLine label="Entry"        value={`$${v.trade_plan.entry} ± $${v.trade_plan.entry_tolerance ?? 0}`} valueCls="text-white font-bold" />
+          <PriceLine label="Stop Loss"    value={`$${v.trade_plan.stop_loss}`} valueCls="text-red-300" />
+          <PriceLine label="TP1"          value={`$${v.trade_plan.tp1}`} valueCls="text-emerald-300" />
+          <PriceLine label="TP2"          value={`$${v.trade_plan.tp2}`} valueCls="text-emerald-300" />
+          {v.trade_plan.tp3 && <PriceLine label="TP3" value={`$${v.trade_plan.tp3}`} valueCls="text-emerald-300" />}
+          <PriceLine label="Risk:Reward"  value={`1:${v.trade_plan.risk_reward}`} valueCls="text-amber-300 font-bold" />
+          <PriceLine label="Lot Size"     value={`${v.trade_plan.lot_size ?? 0.01} (fixed)`} valueCls="text-blue-300" />
+          <PriceLine label="Entry Type"   value={v.trade_plan.entry_type} valueCls="text-gray-300" />
           <PriceLine label="Invalidation" value={v.trade_plan.invalidation} />
         </Block>
       )}
@@ -240,7 +283,7 @@ export default function InstitutionalStrategistPanel() {
       )}
 
       {/* Management plan — only when there IS a plan */}
-      {(dec === 'LONG' || dec === 'SHORT') && v?.management_plan && (
+      {(dec === 'BUY' || dec === 'SELL' || dec === 'LONG' || dec === 'SHORT') && v?.management_plan && (
         <Block icon={Shield} title="Management Plan">
           <PriceLine label="After TP1"            value={v.management_plan.after_tp1} />
           <PriceLine label="After TP2"            value={v.management_plan.after_tp2} />
