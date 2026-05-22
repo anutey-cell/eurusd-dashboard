@@ -289,13 +289,48 @@ def evaluate_and_execute(db: Session) -> ExecutionAttempt:
         att.blocking_layer  = "predictor"
         return att
 
-    # ── Confirmation 3: killzone ────────────────────────────────────────
+    # ── Confirmation 3: killzone (edge-score gate) ──────────────────────
     ok, kz_info, why = _confirm_killzone(db)
     att.confirmations["killzone"] = kz_info
     if not ok:
         att.blocking_reason = why
         att.blocking_layer  = "killzone"
         return att
+
+    # ── Confirmation 4: killzone × direction × engine POLICY ────────────
+    # 4th gate — learned from 245-trade historical sample. Refuses cells
+    # like (london_kz × SELL) and (ny_kz × any) which have negative ExpR.
+    # See backend/services/killzone_policy.py for the table + audit trail.
+    try:
+        from services.killzone_policy import evaluate as _eval_kz_policy
+        # We need an engine_id. The auto-executor consumes the scanner's
+        # output, which corresponds to the "swing" engine. If you wire
+        # trend_pullback or momentum_breakout to this executor in future,
+        # pass the actual engine_id here.
+        policy = _eval_kz_policy(
+            killzone_key=kz_info.get("killzone", "unknown"),
+            direction=scanner_signal,
+            engine_id="swing",   # scanner = swing-ICT engine
+        )
+        att.confirmations["killzone_policy"] = {
+            "decision":         policy.decision,
+            "allow":            policy.allow,
+            "reason":           policy.reason[:160],
+            "sample_size":      policy.sample_size,
+            "historical_wr":    policy.historical_wr,
+            "historical_exp_r": policy.historical_exp_r,
+            "is_exploratory":   policy.is_exploratory,
+            "bypass_reason":    policy.bypass_reason,
+        }
+        if not policy.allow:
+            att.blocking_reason = policy.reason
+            att.blocking_layer  = "killzone_policy"
+            return att
+    except Exception as exc:
+        # Policy module must never crash the executor. If it does, fail-safe
+        # to "allow" (the other three gates already constrained the trade).
+        log.warning("[auto_exec] killzone_policy evaluation failed (fail-open): %s", exc)
+        att.confirmations["killzone_policy"] = {"error": str(exc), "allow": True}
 
     # ── All confirmations agree — build signal payload and fire ─────────
     signal_payload = {
@@ -504,5 +539,29 @@ def preview_attempt(db: Session) -> dict:
     if not ok:
         att.blocking_reason, att.blocking_layer = why, "killzone"
         return att.to_dict() | {"would_fire": False}
+
+    # Apply the same killzone × direction policy filter as the live executor
+    try:
+        from services.killzone_policy import evaluate as _eval_kz_policy
+        policy = _eval_kz_policy(
+            killzone_key=kz_info.get("killzone", "unknown"),
+            direction=scan_info["signal"],
+            engine_id="swing",
+        )
+        att.confirmations["killzone_policy"] = {
+            "decision":         policy.decision,
+            "allow":            policy.allow,
+            "reason":           policy.reason[:160],
+            "sample_size":      policy.sample_size,
+            "historical_wr":    policy.historical_wr,
+            "historical_exp_r": policy.historical_exp_r,
+            "is_exploratory":   policy.is_exploratory,
+        }
+        if not policy.allow:
+            att.blocking_reason = policy.reason
+            att.blocking_layer  = "killzone_policy"
+            return att.to_dict() | {"would_fire": False}
+    except Exception as exc:
+        att.confirmations["killzone_policy"] = {"error": str(exc), "allow": True}
 
     return att.to_dict() | {"would_fire": True, "max_lot": settings.auto_execution_max_lot}

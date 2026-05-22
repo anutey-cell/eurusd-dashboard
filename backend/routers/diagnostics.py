@@ -30,6 +30,25 @@ router = APIRouter(prefix="/diagnostics", tags=["diagnostics"])
 
 
 @router.get(
+    "/killzone-policy",
+    response_model=APIResponse[dict],
+    summary="Killzone × direction policy table — the 4th gate of the auto-executor",
+)
+@limiter.limit("30/minute")
+def killzone_policy(request: Request) -> APIResponse[dict]:
+    """
+    Returns the learned policy table: for each (killzone, direction) cell,
+    whether the engine is ALLOWED / EXPLORE / BLOCKED to fire based on
+    historical edge in the 245-trade observation dataset.
+
+    Use this to audit what the auto-executor will refuse before it gets
+    to MT5. Updates require editing services/killzone_policy.py.
+    """
+    from services.killzone_policy import get_full_policy
+    return APIResponse(data=get_full_policy(), source="killzone_policy")
+
+
+@router.get(
     "/trader-development",
     response_model=APIResponse[dict],
     summary="Curriculum of 20 trading psychology principles — engine self-evaluation per principle",
