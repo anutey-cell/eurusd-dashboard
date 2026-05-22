@@ -1,15 +1,84 @@
 name: Deploy XAUUSD Dashboard
 
+# Pipeline: build → push to Docker Hub → SSH to droplet → pull + restart.
+# Total run time ≈ 3-4 min from `git push` to live (first run is longer;
+# subsequent runs reuse the BuildKit registry cache).
+#
+# Required GitHub repository secrets:
+#   DO_HOST                  Droplet public IP or DuckDNS hostname
+#   DO_USER                  Usually "root"
+#   DO_SSH_PRIVATE_KEY       Full contents of ~/.ssh/digitalocean_xauusd
+#   DOCKERHUB_USERNAME       e.g. "anudhe"
+#   DOCKERHUB_TOKEN          Access token (NOT your password) from
+#                            https://hub.docker.com/settings/security
+
 on:
   push:
     branches:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: deploy
+  cancel-in-progress: false      # never abort a half-deployed prod
+
 jobs:
+
+  build-and-push:
+    name: Build + push images to Docker Hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute short SHA
+        id: meta
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build + push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file:    ./backend/Dockerfile
+          platforms: linux/amd64                 # DO Droplets are x86_64
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/xauusd-backend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/xauusd-backend:${{ steps.meta.outputs.short_sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/xauusd-backend:buildcache
+          cache-to:   type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/xauusd-backend:buildcache,mode=max
+
+      - name: Build + push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file:    ./frontend.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/xauusd-frontend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/xauusd-frontend:${{ steps.meta.outputs.short_sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/xauusd-frontend:buildcache
+          cache-to:   type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/xauusd-frontend:buildcache,mode=max
+
   deploy:
     name: Deploy to DigitalOcean
+    needs: build-and-push
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: SSH and deploy
@@ -23,4 +92,26 @@ jobs:
             cd /opt/xauusd
             git fetch origin main
             git reset --hard origin/main
-            sudo bash deploy/deploy.sh
+
+            # Pin to this exact commit's images (immutable, rollback-friendly)
+            export IMAGE_TAG=${{ needs.build-and-push.outputs.short_sha }}
+            echo "[deploy] Using IMAGE_TAG=$IMAGE_TAG"
+
+            # Pull fresh images then recreate (no rebuild on droplet — fast)
+            docker compose -f deploy/docker-compose.prod.yml \
+                           --env-file deploy/.env.prod \
+                           pull
+            docker compose -f deploy/docker-compose.prod.yml \
+                           --env-file deploy/.env.prod \
+                           up -d --remove-orphans
+
+            # Wait for backend healthcheck
+            for i in $(seq 1 30); do
+              if docker exec xauusd-backend python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" 2>/dev/null; then
+                echo "[deploy] ✓ backend healthy on attempt $i"
+                break
+              fi
+              sleep 3
+            done
+
+            docker compose -f deploy/docker-compose.prod.yml ps

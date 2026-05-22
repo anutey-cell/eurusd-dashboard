@@ -10,8 +10,9 @@
 #   - Networks are private; Caddy on host:443 reverse-proxies via Docker network
 #   - Caddy runs on host (installed by bootstrap-vm.sh) — NOT containerised here,
 #     so cert renewal etc. survives stack restarts
-#   - Backend and frontend built from source on the VPS (ARM64-native) — no
-#     image registry push needed
+#   - Images are PULLED from Docker Hub (built by GitHub Actions, never on the
+#     droplet — keeps the 1 vCPU box from melting). To pin a specific build,
+#     set IMAGE_TAG=<short-sha> in the env or workflow. Default = "latest".
 #   - SQLite database mounted from /opt/xauusd/data (host volume) for easy backup
 #   - .env loaded explicitly via --env-file flag (NOT baked into image)
 #   - Healthchecks + restart policies hardened for unattended operation
@@ -20,9 +21,8 @@
 services:
 
   backend:
-    build:
-      context: ../backend
-      dockerfile: Dockerfile
+    image: anudhe/xauusd-backend:${IMAGE_TAG:-latest}
+    pull_policy: always         # always grab the latest digest for IMAGE_TAG
     container_name: xauusd-backend
     restart: unless-stopped
     expose:
@@ -57,9 +57,8 @@ services:
         max-file: "5"
 
   frontend:
-    build:
-      context: ..
-      dockerfile: frontend.Dockerfile
+    image: anudhe/xauusd-frontend:${IMAGE_TAG:-latest}
+    pull_policy: always
     container_name: xauusd-frontend
     restart: unless-stopped
     expose:

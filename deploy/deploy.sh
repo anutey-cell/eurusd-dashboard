@@ -72,11 +72,11 @@ systemctl reload caddy || systemctl restart caddy
 ok "Caddy reloaded with FQDN=$FQDN"
 
 # ── Build + start the stack ──────────────────────────────────────────────────
-log "Building docker images (this takes ~3 min on first run)…"
-docker compose -f deploy/docker-compose.prod.yml --env-file "$ENV_FILE" build
+log "Pulling latest images from Docker Hub (no local build)…"
+docker compose -f deploy/docker-compose.prod.yml --env-file "$ENV_FILE" pull
 
 log "Starting containers…"
-docker compose -f deploy/docker-compose.prod.yml --env-file "$ENV_FILE" up -d
+docker compose -f deploy/docker-compose.prod.yml --env-file "$ENV_FILE" up -d --remove-orphans
 
 # ── Wait for backend health ──────────────────────────────────────────────────
 log "Waiting for backend health (up to 90s)…"
