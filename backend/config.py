@@ -133,6 +133,12 @@ class Settings(BaseSettings):
     # every time execution_status == DEMO_TRADE_PLACED. Operator opts in
     # explicitly; default OFF so the system runs as SIGNAL_ONLY out-of-the-box.
     demo_auto_enqueue:               bool = False
+
+    # ── Execution authority selector ──────────────────────────────────────────
+    # True  = institutional demo-mandate strategist is the sole decision engine
+    #         (5-condition scoring, fixed 0.01 lot, live execution hard-disabled)
+    # False = legacy 5-gate auto_executor runs (development / back-compat only)
+    use_mandate_strategist:          bool = True
     # Legacy fallback — honoured if TELEGRAM_ENABLED is set in older .env files
     telegram_enabled:                bool = False
 

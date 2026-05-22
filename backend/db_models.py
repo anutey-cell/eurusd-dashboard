@@ -152,7 +152,8 @@ class PendingExecution(Base):
     signal          = Column(String(8),   nullable=False)            # BUY | SELL
     entry           = Column(Float, nullable=False)
     stop_loss       = Column(Float, nullable=False)
-    take_profit     = Column(Float, nullable=False)
+    take_profit     = Column(Float, nullable=False)                  # = TP1 (close target)
+    take_profit_2   = Column(Float, nullable=True)                   # TP2 (stretch / BE trigger per mandate)
     risk_pips       = Column(Float, nullable=True)
     quality_score   = Column(Integer, nullable=True)
     rr              = Column(Float, nullable=True)

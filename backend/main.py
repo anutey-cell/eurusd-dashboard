@@ -61,6 +61,14 @@ async def lifespan(app: FastAPI):
                 ))
             except Exception:
                 pass
+            # pending_executions.take_profit_2 — mandate TP2 (stretch / BE trigger)
+            try:
+                _conn.execute(text(
+                    'ALTER TABLE pending_executions ADD COLUMN take_profit_2 FLOAT'
+                ))
+                log.info("Migration: added pending_executions.take_profit_2 column")
+            except Exception:
+                pass    # already present
     except Exception as _mig_exc:
         log.warning("Inline migrations skipped: %s", _mig_exc)
     log.info(

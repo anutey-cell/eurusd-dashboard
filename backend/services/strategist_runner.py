@@ -1,0 +1,226 @@
+"""
+Strategist Runner
+=================
+
+Shared driver for the institutional demo-execution strategist. Both the HTTP
+router (`/api/v1/strategist/decision`) and the background scheduler call into
+the SAME `run_once()` so the verdict, Telegram alert, MT5 enqueue, and audit
+log all happen identically regardless of who triggered them.
+
+Side-effects (in order):
+  1. make_decision(db)       — compute the verdict
+  2. fire_alert(verdict)     — Telegram BUY/SELL (or STAND ASIDE if enabled)
+  3. enqueue_demo_order(...) — PendingExecution row at lot=0.01 if all gates pass
+  4. persist_verdict(...)    — strategist_verdicts append-only log
+
+Dedupe state (alert fingerprints, enqueue fingerprints) is module-level so
+the same plan doesn't fire twice within the cooldown windows.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy.orm import Session
+
+from config import settings
+from db_models import PendingExecution
+from services.strategist import (
+    format_mandate_signal_message,
+    format_mandate_stand_aside_message,
+    make_decision,
+    persist_verdict,
+)
+
+log = logging.getLogger(__name__)
+
+# ── Dedupe state ─────────────────────────────────────────────────────────────
+_last_alert_fingerprint:    str   = ""
+_last_alert_at:             float = 0.0
+_last_standby_fingerprint:  str   = ""
+_last_standby_at:           float = 0.0
+_last_enqueue_fingerprint:  str   = ""
+_last_enqueue_at:           float = 0.0
+
+_ALERT_COOLDOWN_S    = 600.0    # 10 min for BUY/SELL alerts
+_STANDBY_COOLDOWN_S  = 3600.0   # 60 min for STAND ASIDE info alerts
+_ENQUEUE_COOLDOWN_S  = 600.0    # 10 min for same-plan re-enqueue
+
+
+# ── Public entry point ───────────────────────────────────────────────────────
+
+def run_once(db: Session) -> dict:
+    """
+    Compute one fresh verdict + run all side-effects + return the verdict dict.
+    Called by both the HTTP router (on fresh /decision) and the background loop.
+    Never raises — every side-effect is wrapped.
+    """
+    verdict = make_decision(db)
+
+    # Side-effects — order matters: enqueue first so the log can back-link it
+    pending_id = _maybe_enqueue_demo_order(db, verdict)
+    _maybe_fire_alert(verdict)
+
+    try:
+        persist_verdict(db, verdict, pending_execution_id=pending_id)
+    except Exception as exc:
+        log.debug("[strategist_runner] persistence skipped: %s", exc)
+
+    return verdict
+
+
+# ── Telegram side-effect ─────────────────────────────────────────────────────
+
+def _maybe_fire_alert(verdict: dict) -> None:
+    """Fire the mandate-format Telegram alert if cooldown allows."""
+    global _last_alert_fingerprint, _last_alert_at
+    global _last_standby_fingerprint, _last_standby_at
+
+    decision = verdict.get("decision")
+    es       = verdict.get("execution_status")
+    tp       = verdict.get("trade_plan") or {}
+
+    try:
+        if decision in ("BUY", "SELL"):
+            if not (verdict.get("execution_permission") or {}).get("allow_alert"):
+                return
+            fp = f"{decision}|{tp.get('entry')}|{tp.get('stop_loss')}|{es}"
+            if fp != _last_alert_fingerprint or (time.time() - _last_alert_at) > _ALERT_COOLDOWN_S:
+                long_pct, short_pct = _fetch_sentiment()
+                msg = format_mandate_signal_message(
+                    verdict,
+                    long_pct=long_pct, short_pct=short_pct,
+                )
+                _send_plain(msg)
+                _last_alert_fingerprint = fp
+                _last_alert_at          = time.time()
+        elif decision == "STAND ASIDE":
+            if not getattr(settings, "telegram_standby_alerts", False):
+                return
+            fp = f"STANDBY|{verdict.get('execution_status_reason')}|{verdict.get('conditions_passed')}"
+            if fp != _last_standby_fingerprint or (time.time() - _last_standby_at) > _STANDBY_COOLDOWN_S:
+                msg = format_mandate_stand_aside_message(verdict)
+                _send_plain(msg)
+                _last_standby_fingerprint = fp
+                _last_standby_at          = time.time()
+    except Exception as exc:
+        log.debug("[strategist_runner] alert hook failed (non-fatal): %s", exc)
+
+
+def _fetch_sentiment() -> tuple[float | None, float | None]:
+    """Pull live MyFXBook community sentiment for XAUUSD. Returns (long%, short%)."""
+    try:
+        if not getattr(settings, "myfxbook_enabled", False):
+            return (None, None)
+        from services.myfxbook_service import get_community_sentiment
+        s = get_community_sentiment(symbol="XAUUSD") or {}
+        return (s.get("long_percent"), s.get("short_percent"))
+    except Exception as exc:
+        log.debug("[strategist_runner] sentiment fetch failed: %s", exc)
+        return (None, None)
+
+
+def _send_plain(text: str) -> None:
+    """Send Telegram in plain-text mode so emojis + dashes render exactly."""
+    try:
+        import httpx
+        if not (settings.telegram_bot_token and settings.telegram_chat_id):
+            return
+        url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+        resp = httpx.post(url, json={
+            "chat_id":                  settings.telegram_chat_id,
+            "text":                     text,
+            "disable_web_page_preview": True,
+        }, timeout=10.0)
+        if not resp.is_success:
+            log.warning("[strategist_runner] Telegram send failed status=%s",
+                        resp.status_code)
+    except Exception as exc:
+        log.warning("[strategist_runner] Telegram plain send error: %s", exc)
+
+
+# ── MT5 enqueue side-effect ──────────────────────────────────────────────────
+
+def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
+    """
+    Insert PendingExecution(lot=0.01, max_lot=0.01) when all mandate gates pass.
+    Returns the row id, or None if nothing was enqueued.
+    """
+    global _last_enqueue_fingerprint, _last_enqueue_at
+
+    if verdict.get("execution_status") != "DEMO_TRADE_PLACED":
+        return None
+    mt5_obj = verdict.get("mt5_execution_object") or {}
+    if not mt5_obj:
+        return None
+
+    # Hard mandate guards
+    if mt5_obj.get("lot") != 0.01:
+        log.error("[strategist_runner] refused to enqueue: lot != 0.01 (%s)", mt5_obj.get("lot"))
+        return None
+    if mt5_obj.get("live_execution_allowed", True):
+        log.error("[strategist_runner] refused to enqueue: live_execution_allowed must be false")
+        return None
+    if not settings.allow_demo_trading:
+        log.info("[strategist_runner] enqueue skipped: ALLOW_DEMO_TRADING=false")
+        return None
+    if not settings.mt5_bridge_enabled:
+        log.info("[strategist_runner] enqueue skipped: MT5_BRIDGE_ENABLED=false")
+        return None
+
+    fp = (
+        f"{mt5_obj['action']}|{mt5_obj['entry']}|{mt5_obj['stop_loss']}"
+        f"|{mt5_obj['take_profit_1']}|{mt5_obj['take_profit_2']}"
+    )
+    if fp == _last_enqueue_fingerprint and (time.time() - _last_enqueue_at) < _ENQUEUE_COOLDOWN_S:
+        log.debug("[strategist_runner] enqueue dedupe — same plan within cooldown")
+        return None
+
+    try:
+        row = PendingExecution(
+            pair="xauusd",
+            signal=mt5_obj["action"],
+            entry=float(mt5_obj["entry"]),
+            stop_loss=float(mt5_obj["stop_loss"]),
+            take_profit=float(mt5_obj["take_profit_1"]),       # TP1 = primary close target
+            take_profit_2=float(mt5_obj["take_profit_2"]),     # TP2 = stretch / BE trigger
+            risk_pips=float(abs(mt5_obj["entry"] - mt5_obj["stop_loss"])),
+            quality_score=int(verdict.get("setup_score") or 0),
+            rr=float(mt5_obj["risk_reward"]),
+            max_lot=0.01,
+            reason=(
+                f"strategist mandate · {mt5_obj['conditions_passed']}/5 conditions"
+                f" · est WR {verdict.get('estimated_win_rate_range')}"
+            ),
+            confirmations_json=json.dumps({
+                "source":                "mandate_strategist",
+                "conditions":            verdict.get("conditions"),
+                "conditions_passed":     verdict.get("conditions_passed"),
+                "execution_status":      verdict.get("execution_status"),
+                "session":               verdict.get("session_classification"),
+                "market_state":          verdict.get("market_state"),
+                "liquidity_behaviour":   verdict.get("liquidity_behaviour"),
+                "tf_alignment":          verdict.get("tf_alignment_label"),
+                "mt5_execution_object":  mt5_obj,
+            }),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            status="PENDING",
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        _last_enqueue_fingerprint = fp
+        _last_enqueue_at          = time.time()
+        log.info(
+            "[strategist_runner] ENQUEUED #%d %s xauusd lot=0.01 entry=%s SL=%s TP1=%s TP2=%s",
+            row.id, mt5_obj["action"], mt5_obj["entry"], mt5_obj["stop_loss"],
+            mt5_obj["take_profit_1"], mt5_obj["take_profit_2"],
+        )
+        return row.id
+    except Exception as exc:
+        log.warning("[strategist_runner] enqueue failed (non-fatal): %s", exc)
+        try: db.rollback()
+        except Exception: pass
+        return None

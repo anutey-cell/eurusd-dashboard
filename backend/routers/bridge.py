@@ -67,11 +67,22 @@ def _require_bridge_secret(x_bridge_secret: str | None = Header(default=None)) -
 # ── Schemas ──────────────────────────────────────────────────────────────────
 
 class ExecutionResult(BaseModel):
-    """Reported by the bridge daemon after attempting the order."""
-    status:       str   = Field(..., description="ACCEPTED | REJECTED | FAILED")
-    ticket:       Optional[int]    = Field(default=None)
-    lot_executed: Optional[float]  = Field(default=None)
-    error:        Optional[str]    = Field(default=None, description="Human-readable failure reason")
+    """
+    Reported by the bridge daemon after attempting the order. Carries the
+    post-trade learning fields the mandate requires (MFE, MAE, result).
+    """
+    status:         str            = Field(..., description="ACCEPTED | REJECTED | FAILED | CLOSED")
+    ticket:         Optional[int]   = Field(default=None)
+    lot_executed:   Optional[float] = Field(default=None)
+    error:          Optional[str]   = Field(default=None)
+
+    # Mandate post-trade fields (filled when the position closes) ─────────
+    result:         Optional[str]   = Field(default=None, description="WIN | LOSS | BREAKEVEN")
+    pips_outcome:   Optional[float] = Field(default=None)
+    mfe_pts:        Optional[float] = Field(default=None, description="Max Favorable Excursion")
+    mae_pts:        Optional[float] = Field(default=None, description="Max Adverse Excursion")
+    rules_followed: Optional[bool]  = Field(default=None)
+    post_trade_note: Optional[str]  = Field(default=None)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -85,7 +96,8 @@ def _serialise(row: PendingExecution) -> dict:
         "signal":        row.signal,
         "entry":         row.entry,
         "stopLoss":      row.stop_loss,
-        "takeProfit":    row.take_profit,
+        "takeProfit":    row.take_profit,                          # = TP1 (initial target)
+        "takeProfit2":   getattr(row, "take_profit_2", None),      # TP2 (BE-trigger / stretch)
         "riskPips":      row.risk_pips,
         "qualityScore":  row.quality_score,
         "rr":            row.rr,
@@ -196,31 +208,69 @@ def report_result(
             detail=f"Cannot report result on {row.status} order",
         )
 
-    valid = {"ACCEPTED", "REJECTED", "FAILED"}
+    # CLOSED = the daemon is reporting the position's terminal outcome (post-fill)
+    # ACCEPTED = order was filled by MT5 but trade is still open (initial fill report)
+    valid = {"ACCEPTED", "REJECTED", "FAILED", "CLOSED"}
     if result.status not in valid:
         raise HTTPException(status_code=422, detail=f"status must be one of {valid}")
 
+    # Don't overwrite a terminal status with another partial. CLOSED can transition
+    # from ACCEPTED; everything else is one-shot.
+    if row.status == "ACCEPTED" and result.status == "CLOSED":
+        pass    # legitimate transition to terminal outcome
+    elif row.status not in ("EXECUTING", "PENDING"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot report result on {row.status} order",
+        )
+
     row.status         = result.status
     row.resolved_at    = datetime.now(timezone.utc)
-    row.ticket         = result.ticket
-    row.lot_executed   = result.lot_executed
-    row.execution_error = result.error
+    row.ticket         = result.ticket or row.ticket
+    row.lot_executed   = result.lot_executed or row.lot_executed
+    if result.error:
+        row.execution_error = result.error
     db.commit()
     db.refresh(row)
 
     log.info(
-        "[bridge] order %d resolved status=%s ticket=%s lot=%s err=%s",
-        order_id, result.status, result.ticket, result.lot_executed, result.error,
+        "[bridge] order %d resolved status=%s ticket=%s lot=%s mfe=%s mae=%s result=%s err=%s",
+        order_id, result.status, result.ticket, result.lot_executed,
+        result.mfe_pts, result.mae_pts, result.result, result.error,
     )
+
+    # ── Mandate post-trade writeback to strategist_verdicts ──────────────
+    # Back-link via pending_execution_id so the learning curve sees outcome.
+    try:
+        from db_models import StrategistVerdict
+        sv = (
+            db.query(StrategistVerdict)
+            .filter(StrategistVerdict.pending_execution_id == row.id)
+            .order_by(StrategistVerdict.created_at.desc())
+            .first()
+        )
+        if sv is not None:
+            if result.ticket is not None:
+                sv.mt5_ticket = result.ticket
+            if result.result:                sv.result        = result.result
+            if result.pips_outcome is not None: sv.pips_outcome = result.pips_outcome
+            if result.mfe_pts is not None:   sv.mfe_pts       = result.mfe_pts
+            if result.mae_pts is not None:   sv.mae_pts       = result.mae_pts
+            if result.rules_followed is not None: sv.rules_followed = 1 if result.rules_followed else 0
+            if result.post_trade_note:       sv.post_trade_note = result.post_trade_note
+            db.commit()
+    except Exception as exc:
+        log.warning("[bridge] strategist_verdicts post-trade writeback failed: %s", exc)
 
     # On ACCEPTED, also write to MT5TradeLog so the analytics + daily counter
     # are consistent with what they'd have seen if MT5 ran locally.
     if result.status == "ACCEPTED":
         try:
             from db_models import MT5TradeLog
-            from config import settings as _cfg
             db.add(MT5TradeLog(
-                mode="live" if _cfg.live_trading_authorized else "demo",
+                # MANDATE: bridge-driven trades are demo-only. Live execution is
+                # hard-disabled in the strategist regardless of LIVE_TRADING_AUTHORIZED.
+                mode="demo",
                 pair=row.pair,
                 broker_symbol="XAUUSD",
                 signal=row.signal,

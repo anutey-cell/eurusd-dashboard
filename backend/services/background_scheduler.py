@@ -188,15 +188,16 @@ def get_last_auto_attempt() -> dict | None:
 
 async def _auto_executor_loop():
     """
-    Calls auto_executor.evaluate_and_execute() every settings.auto_execution_interval_sec.
+    LEGACY 5-gate auto-executor loop. Only spawned when
+    settings.use_mandate_strategist is False (back-compat fallback).
 
-    The function is a no-op unless settings.auto_execution_enabled is True AND
-    all 3 confirmation layers + 13 MT5 gates pass. Daily ceiling and lot cap
-    are enforced inside the executor itself.
+    The mandate strategist (services.strategist_runner) is the authoritative
+    decision engine — this older loop produces parallel orders with a
+    different scoring model and lot policy. Keep it dormant in mandate mode.
     """
     from config import settings
     interval = getattr(settings, "auto_execution_interval_sec", 60)
-    log.info("[scheduler] auto-executor loop started (every %ds, enabled=%s)",
+    log.info("[scheduler] LEGACY auto-executor loop started (every %ds, enabled=%s)",
              interval, settings.auto_execution_enabled)
     while True:
         try:
@@ -207,6 +208,59 @@ async def _auto_executor_loop():
             raise
         except Exception as exc:
             log.warning("[scheduler] auto-executor loop error: %s", exc)
+
+
+# ── Mandate-strategist loop ──────────────────────────────────────────────────
+
+STRATEGIST_INTERVAL_SEC = 60      # one verdict per minute during active hours
+_last_strategist_verdict: dict | None = None
+
+
+def get_last_strategist_verdict() -> dict | None:
+    """Most recent verdict the background loop produced (for /scheduler/status)."""
+    return _last_strategist_verdict
+
+
+async def _strategist_loop():
+    """
+    Runs the institutional demo-mandate strategist every 60s autonomously.
+
+    On every tick:
+      • make_decision(db)
+      • Telegram alert (BUY/SELL with cooldown, STAND ASIDE if enabled)
+      • PendingExecution enqueue at lot=0.01 if all gates pass
+      • Append to strategist_verdicts (mandate signal log)
+
+    The dashboard's /strategist/decision cache hits this same verdict — so
+    one fresh compute per minute serves both autonomous operation AND the UI.
+    """
+    log.info("[scheduler] mandate-strategist loop started (every %ds)", STRATEGIST_INTERVAL_SEC)
+    while True:
+        try:
+            await asyncio.sleep(STRATEGIST_INTERVAL_SEC)
+            await asyncio.to_thread(_run_strategist_iteration)
+        except asyncio.CancelledError:
+            log.info("[scheduler] strategist loop cancelled")
+            raise
+        except Exception as exc:
+            log.warning("[scheduler] strategist loop error: %s", exc)
+
+
+def _run_strategist_iteration():
+    """Single strategist iteration (runs in thread; opens its own DB session)."""
+    global _last_strategist_verdict
+    from database import SessionLocal
+    from services.strategist_runner import run_once
+    with SessionLocal() as db:
+        v = run_once(db)
+        _last_strategist_verdict = v
+        log.info(
+            "[strategist_loop] %s · %s/5 · %s · %s",
+            v.get("decision"),
+            v.get("conditions_passed"),
+            v.get("execution_status"),
+            v.get("final_verdict", "")[:100],
+        )
 
 
 def _run_auto_executor_iteration():
@@ -359,13 +413,25 @@ async def start_background_loops():
     if _tasks:
         log.info("[scheduler] loops already running")
         return
+
+    from config import settings
+    use_mandate = getattr(settings, "use_mandate_strategist", True)
+
     _tasks = [
         asyncio.create_task(_scanner_loop(),           name="scanner_loop"),
         asyncio.create_task(_prediction_alert_loop(),  name="prediction_alert_loop"),
         asyncio.create_task(_drawdown_loop(),          name="drawdown_loop"),
         asyncio.create_task(_daily_summary_loop(),     name="daily_summary_loop"),
-        asyncio.create_task(_auto_executor_loop(),     name="auto_executor_loop"),
     ]
+
+    # Pick exactly ONE execution authority — never both, or they'll fight.
+    if use_mandate:
+        _tasks.append(asyncio.create_task(_strategist_loop(), name="strategist_loop"))
+        log.info("[scheduler] using MANDATE strategist (authoritative)")
+    else:
+        _tasks.append(asyncio.create_task(_auto_executor_loop(), name="auto_executor_loop"))
+        log.info("[scheduler] using LEGACY auto-executor (mandate disabled)")
+
     log.info("[scheduler] %d background loops started", len(_tasks))
 
 
