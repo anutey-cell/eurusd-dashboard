@@ -230,11 +230,22 @@ def get_candles(interval: str = "H4", limit: int = 200, pair: str = "xauusd") ->
                     "Live providers down for %s — serving cached response (age %.0fs)",
                     interval, age,
                 )
-                cached_resp.source = (
-                    "tradingview-cached" if cached_resp.source == "tradingview"
-                    else f"{cached_resp.source}-cached"
+                # Compute the "-cached" suffix WITHOUT mutating the stored
+                # object — otherwise repeated cache-hits append "-cached" over
+                # and over: tradingview → tradingview-cached → -cached-cached
+                # (seen in prod 2026-05-22 — scanner refused the bizarre tags).
+                base = cached_resp.source.replace("-cached", "") or "tradingview"
+                new_source = f"{base}-cached"
+                # Return a shallow copy with the corrected tag. The cached
+                # entry stays untouched, so the NEXT cache hit also says
+                # "tradingview-cached" (not "tradingview-cached-cached").
+                return CandleResponse(
+                    symbol=cached_resp.symbol,
+                    interval=cached_resp.interval,
+                    count=cached_resp.count,
+                    candles=cached_resp.candles,
+                    source=new_source,
                 )
-                return cached_resp
 
     # Live-mode + no provider + no cache + no override:
     # Return a flagged synthetic response (callers may refuse it) — but log
