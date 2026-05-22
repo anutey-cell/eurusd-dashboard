@@ -38,6 +38,7 @@ import EngineComparisonPanel  from './EngineComparisonPanel';
 import TraderMindsetPanel     from './TraderMindsetPanel';
 import TraderDevelopmentPanel from './TraderDevelopmentPanel';
 import IntermarketCorrelationPanel from './IntermarketCorrelationPanel';
+import InstitutionalStrategistPanel from './InstitutionalStrategistPanel';
 import { formatKenyaTime, KENYA_LABEL } from '../utils/time';
 
 // ─── Tab system — groups 18+ panels into 5 task-oriented tabs ───────────────
@@ -298,6 +299,8 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
 
         {activeTab === 'live' && (
           <>
+            {/* ★ Headline card — institutional strategist verdict */}
+            <InstitutionalStrategistPanel />
             {/* Pre-trade checklist (local) */}
             <PreTradeChecklist />
             {/* Engine diagnostics — why no signal RIGHT NOW */}

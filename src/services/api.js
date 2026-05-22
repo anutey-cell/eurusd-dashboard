@@ -477,6 +477,22 @@ export async function getIntermarketCorrelations({ timeframe = 'H1', nBars = 200
   return res.data ?? res;
 }
 
+/**
+ * GET /strategist/decision — unified institutional verdict (LONG / SHORT /
+ * STAND ASIDE) with strict format: setup score, quality band, trade plan,
+ * execution permissions, management plan, next-trigger guidance.
+ */
+export async function getStrategistDecision() {
+  const res = await apiFetch('/strategist/decision');
+  return res.data ?? res;
+}
+
+/** GET /strategist/refresh — force-fresh (bypass 60s cache) */
+export async function refreshStrategistDecision() {
+  const res = await apiFetch('/strategist/refresh');
+  return res.data ?? res;
+}
+
 // ─── MT5 API ──────────────────────────────────────────────────────────────────
 
 export async function getMT5Status() {
