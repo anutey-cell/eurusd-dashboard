@@ -114,4 +114,24 @@ jobs:
               sleep 3
             done
 
+            # Sync host-Caddy config from repo (substitutes {$FQDN} from /opt/xauusd/.fqdn).
+            # Only reloads if the rendered file actually changed — avoids needless cert work.
+            if [ -f /opt/xauusd/.fqdn ] && [ -f /opt/xauusd/deploy/Caddyfile ]; then
+              FQDN=$(cat /opt/xauusd/.fqdn)
+              sed "s|{\$FQDN}|$FQDN|g" /opt/xauusd/deploy/Caddyfile > /tmp/Caddyfile.rendered
+              if ! cmp -s /tmp/Caddyfile.rendered /etc/caddy/Caddyfile; then
+                echo "[deploy] Caddyfile changed — validating + reloading"
+                if caddy validate --config /tmp/Caddyfile.rendered --adapter caddyfile 2>&1 | tail -1 | grep -q "Valid configuration"; then
+                  cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak.$(date +%s)
+                  cp /tmp/Caddyfile.rendered /etc/caddy/Caddyfile
+                  systemctl reload caddy
+                  echo "[deploy] ✓ caddy reloaded"
+                else
+                  echo "[deploy] ✗ caddy validate FAILED — leaving existing config in place"
+                fi
+              else
+                echo "[deploy] Caddyfile unchanged — skip reload"
+              fi
+            fi
+
             docker compose -f deploy/docker-compose.prod.yml ps
