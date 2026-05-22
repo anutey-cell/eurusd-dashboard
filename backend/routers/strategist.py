@@ -35,6 +35,7 @@ from services.strategist import (
     format_mandate_signal_message,
     format_mandate_stand_aside_message,
     make_decision,
+    persist_verdict,
 )
 
 router = APIRouter(prefix="/strategist", tags=["strategist"])
@@ -83,7 +84,15 @@ def strategist_decision(
 
     # Side-effects run only on fresh computes (never on cache hits)
     _maybe_fire_alert(verdict)
-    _maybe_enqueue_demo_order(db, verdict)
+    pending_id = _maybe_enqueue_demo_order(db, verdict)
+
+    # Mandate logging requirement: persist every fresh verdict (append-only).
+    # If an order was enqueued, back-link the pending_execution_id so the
+    # learning curve can pair signal -> outcome.
+    try:
+        persist_verdict(db, verdict, pending_execution_id=pending_id)
+    except Exception as exc:
+        log.debug("[strategist] verdict persistence skipped: %s", exc)
 
     return APIResponse(data=verdict, source="strategist:fresh")
 
@@ -100,6 +109,77 @@ def strategist_refresh(
 ) -> APIResponse[dict]:
     _cache["cached_at"] = 0.0
     return strategist_decision(request=request, db=db)
+
+
+@router.get(
+    "/log",
+    response_model=APIResponse[dict],
+    summary="Recent strategist verdicts (mandate signal log)",
+)
+@limiter.limit("30/minute")
+def strategist_log(
+    request: Request,
+    limit: int = 100,
+    decision: str | None = None,         # filter: BUY | SELL | "STAND ASIDE"
+    execution_status: str | None = None,  # filter: DEMO_TRADE_PLACED | SIGNAL_ONLY | ...
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Returns the most recent N strategist verdicts (default 100, max 1000).
+    Each row is the full snapshot the mandate requires logged. Filter
+    optionally by decision and/or execution_status.
+    """
+    from db_models import StrategistVerdict
+
+    limit = max(1, min(limit, 1000))
+    q = db.query(StrategistVerdict)
+    if decision:
+        q = q.filter(StrategistVerdict.decision == decision)
+    if execution_status:
+        q = q.filter(StrategistVerdict.execution_status == execution_status)
+    rows = q.order_by(StrategistVerdict.created_at.desc()).limit(limit).all()
+
+    def _serialise(r) -> dict:
+        return {
+            "id":                       r.id,
+            "createdAt":                r.created_at.isoformat() if r.created_at else None,
+            "decision":                 r.decision,
+            "conditionsPassed":         r.conditions_passed,
+            "estimatedWinRateRange":    r.estimated_win_rate_range,
+            "executionStatus":          r.execution_status,
+            "executionStatusReason":    r.execution_status_reason,
+            "setupScore":               r.setup_score,
+            "qualityBand":              r.quality_band,
+            "marketState":              r.market_state,
+            "session":                  r.session_classification,
+            "tfAlignment":              r.tf_alignment_label,
+            "liquidityBehaviour":       r.liquidity_behaviour,
+            "entry":                    r.entry,
+            "stopLoss":                 r.stop_loss,
+            "tp1":                      r.tp1,
+            "tp2":                      r.tp2,
+            "rr":                       r.risk_reward,
+            "lotSize":                  r.lot_size,
+            "rsiH1":                    r.rsi_h1,
+            "atrH1":                    r.atr_h1,
+            "goldMacroBias":            r.gold_macro_bias,
+            "newsRisk":                 r.news_risk,
+            "improvementNote":          r.improvement_note,
+            "finalVerdict":             r.final_verdict_text,
+            "pendingExecutionId":       r.pending_execution_id,
+            "mt5Ticket":                r.mt5_ticket,
+            "result":                   r.result,
+            "mfePts":                   r.mfe_pts,
+            "maePts":                   r.mae_pts,
+        }
+
+    return APIResponse(
+        data={
+            "count": len(rows),
+            "verdicts": [_serialise(r) for r in rows],
+        },
+        source="strategist_log",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,33 +247,35 @@ def _send_plain(text: str) -> None:
 # MT5 demo enqueue — only when execution_status == DEMO_TRADE_PLACED
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> None:
+def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
     """
     If the verdict authorises a demo execution AND the operator has opted in,
     insert a PendingExecution row at lot=0.01 for the MT5 bridge to claim.
     Strict fingerprint dedupe so the same plan doesn't queue twice.
+
+    Returns the PendingExecution id (or None if nothing was enqueued).
     """
     global _last_enqueue_fingerprint, _last_enqueue_at
 
     if verdict.get("execution_status") != "DEMO_TRADE_PLACED":
-        return
+        return None
     mt5_obj = verdict.get("mt5_execution_object") or {}
     if not mt5_obj:
-        return
+        return None
 
     # Hard mandate guards — fail loudly if the verdict shape is wrong
     if mt5_obj.get("lot") != 0.01:
         log.error("[strategist] refused to enqueue: lot != 0.01 (%s)", mt5_obj.get("lot"))
-        return
+        return None
     if mt5_obj.get("live_execution_allowed", True):
         log.error("[strategist] refused to enqueue: live_execution_allowed must be false")
-        return
+        return None
     if not settings.allow_demo_trading:
         log.info("[strategist] enqueue skipped: ALLOW_DEMO_TRADING=false")
-        return
+        return None
     if not settings.mt5_bridge_enabled:
         log.info("[strategist] enqueue skipped: MT5_BRIDGE_ENABLED=false")
-        return
+        return None
 
     fp = (
         f"{mt5_obj['action']}|{mt5_obj['entry']}|{mt5_obj['stop_loss']}"
@@ -201,7 +283,7 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> None:
     )
     if fp == _last_enqueue_fingerprint and (time.time() - _last_enqueue_at) < _ENQUEUE_COOLDOWN_S:
         log.debug("[strategist] enqueue dedupe — same plan within cooldown")
-        return
+        return None
 
     try:
         row = PendingExecution(
@@ -241,9 +323,11 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> None:
             row.id, mt5_obj["action"], mt5_obj["entry"], mt5_obj["stop_loss"],
             mt5_obj["take_profit_1"], mt5_obj["take_profit_2"],
         )
+        return row.id
     except Exception as exc:
         log.warning("[strategist] enqueue failed (non-fatal): %s", exc)
         try:
             db.rollback()
         except Exception:
             pass
+        return None

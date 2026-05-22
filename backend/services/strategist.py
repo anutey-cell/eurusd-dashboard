@@ -1102,6 +1102,81 @@ def format_mandate_signal_message(
     )
 
 
+def persist_verdict(db: Session, verdict: dict, *, pending_execution_id: int | None = None) -> int | None:
+    """
+    Append one row to strategist_verdicts capturing the full mandate-required
+    signal log. Idempotent failure mode: any DB error is swallowed (verdicts
+    must never block the API response).
+
+    Returns the new row's id (or None on failure).
+    """
+    try:
+        from db_models import StrategistVerdict
+        import json as _json
+        tp = verdict.get("trade_plan", {}) or {}
+        mc = verdict.get("macro_context", {}) or {}
+        tc = verdict.get("technical_confirmation", {}) or {}
+
+        # RSI / ATR are stored as descriptive strings in technical_confirmation
+        # — parse the leading float so the log is queryable.
+        def _first_float(s: str | None) -> float | None:
+            if not s: return None
+            try:
+                head = s.split()[0]
+                return float(head)
+            except Exception:
+                return None
+
+        rsi_val = _first_float(tc.get("rsi"))
+        atr_val = _first_float(tc.get("atr_volatility"))
+
+        row = StrategistVerdict(
+            symbol="XAUUSD",
+            decision=verdict.get("decision", "STAND ASIDE"),
+            conditions_passed=verdict.get("conditions_passed", 0),
+            estimated_win_rate_range=verdict.get("estimated_win_rate_range"),
+            execution_status=verdict.get("execution_status", "STAND_ASIDE"),
+            execution_status_reason=verdict.get("execution_status_reason"),
+            setup_score=verdict.get("setup_score"),
+            quality_band=verdict.get("quality_band"),
+            market_state=verdict.get("market_state"),
+            session_classification=verdict.get("session_classification"),
+            tf_alignment_label=verdict.get("tf_alignment_label"),
+            liquidity_behaviour=verdict.get("liquidity_behaviour"),
+            market_sentiment=verdict.get("market_sentiment"),
+            entry=tp.get("entry"),
+            entry_tolerance=tp.get("entry_tolerance"),
+            stop_loss=tp.get("stop_loss"),
+            tp1=tp.get("tp1"),
+            tp2=tp.get("tp2"),
+            tp3=tp.get("tp3"),
+            risk_reward=tp.get("risk_reward"),
+            lot_size=tp.get("lot_size", 0.01),
+            rsi_h1=rsi_val,
+            atr_h1=atr_val,
+            dxy_bias=mc.get("dxy_bias"),
+            yields_bias=mc.get("yields_bias"),
+            gold_macro_bias=mc.get("gold_macro_bias"),
+            news_risk=mc.get("news_risk"),
+            improvement_note=verdict.get("improvement_note"),
+            final_verdict_text=verdict.get("final_verdict"),
+            full_verdict_json=_json.dumps(verdict, default=str),
+            pending_execution_id=pending_execution_id,
+            result="PENDING" if verdict.get("execution_status") == "DEMO_TRADE_PLACED" else None,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+    except Exception as exc:
+        log.warning("[strategist] persist_verdict failed (non-fatal): %s", exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
 def format_mandate_stand_aside_message(verdict: dict) -> str:
     """Exact format for STAND ASIDE informational alerts."""
     tp = verdict.get("trade_plan", {}) or {}

@@ -170,6 +170,84 @@ class PendingExecution(Base):
     execution_error = Column(Text, nullable=True)
 
 
+# ── strategist_verdicts (mandate signal log) ──────────────────────────────────
+
+class StrategistVerdict(Base):
+    """
+    Append-only log of every institutional-strategist verdict produced.
+    Required by the institutional demo-execution mandate ("for every generated
+    signal, log: ..."). One row per fresh /strategist/decision compute
+    (~once every 60s during the active session — small, easy to manage).
+
+    Used downstream to build:
+      • learning-curve dashboards (conditions × outcome)
+      • execution_status distribution over time
+      • improvement-note trend
+      • MFE/MAE post-trade (when the bridge resolves the order back to us)
+    """
+    __tablename__ = "strategist_verdicts"
+
+    id                       = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    created_at               = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+
+    # Mandate primary fields ─────────────────────────────────────────────
+    symbol                   = Column(String(16), nullable=False, default="XAUUSD")
+    decision                 = Column(String(16), nullable=False, index=True)  # BUY | SELL | STAND ASIDE
+    conditions_passed        = Column(Integer, nullable=False, default=0)
+    estimated_win_rate_range = Column(String(16), nullable=True)
+    execution_status         = Column(String(32), nullable=False, index=True)
+    execution_status_reason  = Column(Text,       nullable=True)
+
+    # Setup classification (mandate enums) ───────────────────────────────
+    setup_score              = Column(Integer, nullable=True)             # legacy 0-100
+    quality_band             = Column(String(16), nullable=True)
+    market_state             = Column(String(64), nullable=True)
+    session_classification   = Column(String(64), nullable=True)
+    tf_alignment_label       = Column(String(32), nullable=True)
+    liquidity_behaviour      = Column(String(64), nullable=True)
+    market_sentiment         = Column(String(16), nullable=True)
+
+    # Trade plan ─────────────────────────────────────────────────────────
+    entry                    = Column(Float,    nullable=True)
+    entry_tolerance          = Column(Float,    nullable=True)
+    stop_loss                = Column(Float,    nullable=True)
+    tp1                      = Column(Float,    nullable=True)
+    tp2                      = Column(Float,    nullable=True)
+    tp3                      = Column(Float,    nullable=True)
+    risk_reward              = Column(Float,    nullable=True)
+    lot_size                 = Column(Float,    nullable=False, default=0.01)
+
+    # Market-data snapshot ───────────────────────────────────────────────
+    rsi_h1                   = Column(Float,    nullable=True)
+    atr_h1                   = Column(Float,    nullable=True)
+    spread_pts               = Column(Float,    nullable=True)
+    long_pct                 = Column(Float,    nullable=True)  # MyFXBook sentiment
+    short_pct                = Column(Float,    nullable=True)
+    dxy_bias                 = Column(String(16), nullable=True)
+    yields_bias              = Column(String(16), nullable=True)
+    gold_macro_bias          = Column(String(32), nullable=True)
+    news_risk                = Column(String(16), nullable=True)
+
+    # Notes + traceability ───────────────────────────────────────────────
+    improvement_note         = Column(Text, nullable=True)
+    final_verdict_text       = Column(Text, nullable=True)
+    full_verdict_json        = Column(Text, nullable=True)   # complete JSON snapshot
+
+    # Linkage when a trade ends up firing ────────────────────────────────
+    pending_execution_id     = Column(Integer, nullable=True, index=True)
+    mt5_ticket               = Column(Integer, nullable=True, index=True)
+
+    # Post-trade fields (filled by bridge result + monitor) ──────────────
+    # These start NULL and are updated after the trade closes; that's why
+    # this row stays in `strategist_verdicts` as the durable source of truth.
+    result                   = Column(String(16), nullable=True)   # WIN | LOSS | BE | PENDING
+    pips_outcome             = Column(Float,    nullable=True)
+    mfe_pts                  = Column(Float,    nullable=True)     # Max Favorable Excursion
+    mae_pts                  = Column(Float,    nullable=True)     # Max Adverse Excursion
+    rules_followed           = Column(Integer, nullable=True)      # 1 / 0 (bool stored as int for sqlite + pg)
+    post_trade_note          = Column(Text, nullable=True)
+
+
 # ── telegram_alert_logs ───────────────────────────────────────────────────────
 
 class TelegramAlertLog(Base):
