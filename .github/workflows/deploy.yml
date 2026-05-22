@@ -18,15 +18,9 @@ jobs:
           host: ${{ secrets.DO_HOST }}
           username: ${{ secrets.DO_USER }}
           key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-
-	  script: |
-  	    set -euxo pipefail
- 	    cd /opt/xauusd
-	    pwd
- 	    ls -la
-	    ls -la deploy
- 	    git status
-	    git fetch origin main
- 	    git reset --hard origin/main
-  	    echo "Running deploy script..."
-  	    sudo bash -x deploy/deploy.sh
+          script: |
+            set -e
+            cd /opt/xauusd
+            git fetch origin main
+            git reset --hard origin/main
+            sudo bash deploy/deploy.sh
