@@ -28,8 +28,11 @@
     }
 
     # ── API routes → backend container ──────────────────────────────────────
+    # Caddy runs on the host (systemd, not in the Docker network) so it talks
+    # to containers via the 127.0.0.1 ports published by docker-compose.prod.yml.
+    # Do NOT use container names (e.g. backend:8000) — they don't resolve on host.
     handle /api/* {
-        reverse_proxy backend:8000 {
+        reverse_proxy localhost:8000 {
             # Backend healthcheck so Caddy can fail fast
             health_uri      /api/v1/health
             health_interval 30s
@@ -44,18 +47,18 @@
 
     # OpenAPI / Swagger docs served by FastAPI
     handle /docs* {
-        reverse_proxy backend:8000
+        reverse_proxy localhost:8000
     }
     handle /redoc* {
-        reverse_proxy backend:8000
+        reverse_proxy localhost:8000
     }
     handle /openapi.json {
-        reverse_proxy backend:8000
+        reverse_proxy localhost:8000
     }
 
     # ── Everything else → frontend (Vite dev server) ────────────────────────
     handle {
-        reverse_proxy frontend:5173 {
+        reverse_proxy localhost:5173 {
             header_up Host              {host}
             header_up X-Forwarded-Proto {scheme}
         }
