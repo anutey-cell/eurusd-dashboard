@@ -25,8 +25,8 @@ services:
     pull_policy: always         # always grab the latest digest for IMAGE_TAG
     container_name: xauusd-backend
     restart: unless-stopped
-    expose:
-      - "8000"          # internal-only; Caddy proxies on host:443
+    ports:
+      - "127.0.0.1:8000:8000"          # internal-only; Caddy proxies on host:443
     env_file:
       - ./.env.prod
     environment:
@@ -61,8 +61,8 @@ services:
     pull_policy: always
     container_name: xauusd-frontend
     restart: unless-stopped
-    expose:
-      - "5173"          # internal-only; Caddy proxies on host:443
+    ports:
+      - "127.0.0.1:5173:5173"          # internal-only; Caddy proxies on host:443
     environment:
       # Frontend doesn't talk to backend directly from the browser — Caddy
       # routes /api/* to backend internally. So VITE_API_BASE_URL is just
