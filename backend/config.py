@@ -127,6 +127,7 @@ class Settings(BaseSettings):
     telegram_confirm_alerts:         bool = True   # alert when signal confirmed to DB
     telegram_trade_alerts:           bool = True   # alert when demo trade placed / rejected
     telegram_standby_alerts:         bool = False  # informational alerts when verdict is STAND ASIDE
+    telegram_hourly_briefing:        bool = False  # hourly structured market briefing on NN:00 UTC
 
     # ── Mandate demo-execution opt-in ─────────────────────────────────────────
     # When True, the strategist will enqueue a 0.01-lot MT5 PendingExecution row

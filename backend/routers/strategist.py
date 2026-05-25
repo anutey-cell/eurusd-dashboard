@@ -73,6 +73,47 @@ def strategist_refresh(
 
 
 @router.get(
+    "/briefing/preview",
+    response_model=APIResponse[dict],
+    summary="Preview the hourly market briefing without sending it",
+)
+@limiter.limit("10/minute")
+def briefing_preview(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """Build the current hourly briefing and return it as plain text. No send."""
+    from services.hourly_briefing import build_briefing
+    msg = build_briefing(db)
+    return APIResponse(
+        data={"message": msg or "(failed to build briefing)"},
+        source="briefing:preview",
+    )
+
+
+@router.post(
+    "/briefing/send-now",
+    response_model=APIResponse[dict],
+    summary="Force-send the hourly briefing to Telegram immediately (bypasses dedupe)",
+)
+@limiter.limit("3/minute")
+def briefing_send_now(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Build + send the briefing right now, ignoring the once-per-hour dedupe.
+    Useful for testing format / verifying Telegram wiring without waiting.
+    """
+    from services.hourly_briefing import build_briefing, _send_plain
+    msg = build_briefing(db)
+    if not msg:
+        return APIResponse(data={"sent": False, "reason": "build failed"}, source="briefing")
+    sent = _send_plain(msg)
+    return APIResponse(data={"sent": sent, "preview": msg[:200] + "..."}, source="briefing")
+
+
+@router.get(
     "/log",
     response_model=APIResponse[dict],
     summary="Recent strategist verdicts (mandate signal log)",

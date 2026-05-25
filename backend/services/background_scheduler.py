@@ -263,6 +263,46 @@ def _run_strategist_iteration():
         )
 
 
+# ── Hourly market briefing loop ──────────────────────────────────────────────
+
+BRIEFING_CHECK_INTERVAL_SEC = 60     # cheap check — actual send is once/hour
+
+
+async def _hourly_briefing_loop():
+    """
+    Sends a structured XAUUSD market briefing to Telegram once per hour
+    (on the NN:00 mark). The send_briefing_if_due() helper handles its own
+    dedupe (one message per hour-of-day) so this loop can wake every minute
+    cheaply and still fire exactly once per hour.
+
+    Opt-in via settings.telegram_hourly_briefing (default False).
+    """
+    log.info("[scheduler] hourly briefing loop started (check every %ds)",
+             BRIEFING_CHECK_INTERVAL_SEC)
+    while True:
+        try:
+            await asyncio.sleep(BRIEFING_CHECK_INTERVAL_SEC)
+            await asyncio.to_thread(_run_briefing_iteration)
+        except asyncio.CancelledError:
+            log.info("[scheduler] hourly briefing loop cancelled")
+            raise
+        except Exception as exc:
+            log.warning("[scheduler] hourly briefing loop error: %s", exc)
+
+
+def _run_briefing_iteration():
+    """Single briefing check (runs in thread). Only sends on the hour mark."""
+    now = datetime.now(timezone.utc)
+    # Only attempt during the first 2 minutes of each hour so we don't
+    # late-send if a previous tick missed it during a restart.
+    if now.minute >= 2:
+        return
+    from database import SessionLocal
+    from services.hourly_briefing import send_briefing_if_due
+    with SessionLocal() as db:
+        send_briefing_if_due(db)
+
+
 def _run_auto_executor_iteration():
     """Single auto-executor iteration (runs in thread)."""
     global _last_auto_attempt
@@ -422,6 +462,7 @@ async def start_background_loops():
         asyncio.create_task(_prediction_alert_loop(),  name="prediction_alert_loop"),
         asyncio.create_task(_drawdown_loop(),          name="drawdown_loop"),
         asyncio.create_task(_daily_summary_loop(),     name="daily_summary_loop"),
+        asyncio.create_task(_hourly_briefing_loop(),   name="hourly_briefing_loop"),
     ]
 
     # Pick exactly ONE execution authority — never both, or they'll fight.
