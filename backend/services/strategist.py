@@ -321,15 +321,15 @@ def _evaluate_5_conditions(
     is_buy  = proposed_signal == "BUY"
     is_sell = proposed_signal == "SELL"
 
-    # C1: Timeframe alignment supports direction
+    # C1: Timeframe alignment supports direction.
+    # STRONG aligned = clean pass. "But extended" (overbought/oversold) is
+    # accepted as a pass too — the trade may still work but with reduced
+    # margin. C4 + C2 will catch when the extended setup is actually unsafe.
     c1_ok = False
-    if is_buy and tf_alignment_label in (_TF_STRONG_BULL,):
+    if is_buy  and tf_alignment_label in (_TF_STRONG_BULL,  _TF_BULL_EXTENDED):
         c1_ok = True
-    elif is_sell and tf_alignment_label in (_TF_STRONG_BEAR,):
+    elif is_sell and tf_alignment_label in (_TF_STRONG_BEAR, _TF_BEAR_EXTENDED):
         c1_ok = True
-    elif tf_alignment_label in (_TF_BULL_EXTENDED, _TF_BEAR_EXTENDED):
-        # Extended is acceptable only for fade-style entries — treat as half-pass (don't count)
-        c1_ok = False
 
     # C2: Liquidity sweep / target confirmed
     c2_ok = model_confirmed and model_letter in ("A", "B", "C", "D")
@@ -464,10 +464,178 @@ def _compute_entry_tolerance(atr_h1: float) -> float:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Self-sufficient helpers — strategist no longer depends on scanner.SIGNAL_READY
+# ────────────────────────────────────────────────────────────────────────────
+
+def _htf_bias_label(closes: list[float], lookback: int = 50) -> str:
+    """
+    "Bullish (HH/HL)" / "Bearish (LH/LL)" / "Neutral" — derived directly from
+    EMAs, no scanner dependency. Mirrors the scanner's engineModel.* labels
+    so downstream code that searches for "bull"/"bear" substrings still works.
+    """
+    if not closes or len(closes) < lookback:
+        return "Insufficient data"
+    ema20 = _ema(closes, 20)
+    ema50 = _ema(closes, min(lookback, 50))
+    last  = closes[-1]
+    if last > ema20 > ema50:    return "Bullish (HH/HL)"
+    if last < ema20 < ema50:    return "Bearish (LH/LL)"
+    if last > ema20:            return "Bullish (mixed)"
+    if last < ema20:            return "Bearish (mixed)"
+    return "Neutral"
+
+
+def _derive_direction_from_htf(
+    *, d1_bias: str, h4_bias: str, h1_ema20: float, h1_ema50: float,
+) -> tuple[str, str]:
+    """
+    Propose BUY/SELL/WAIT from HTF EMA alignment alone. Used as the fallback
+    when both the scanner and the predictor return WAIT — the strategist
+    must still have the courage to identify a directional thesis.
+
+    Voting rule: need at least 2 of 3 timeframes aligned with the same side.
+    """
+    d = (d1_bias or "").lower()
+    h = (h4_bias or "").lower()
+    h1_bull = h1_ema20 is not None and h1_ema50 is not None and h1_ema20 > h1_ema50
+    h1_bear = h1_ema20 is not None and h1_ema50 is not None and h1_ema20 < h1_ema50
+
+    bull_votes = ("bull" in d) + ("bull" in h) + bool(h1_bull)
+    bear_votes = ("bear" in d) + ("bear" in h) + bool(h1_bear)
+
+    if bull_votes >= 2 and bull_votes > bear_votes:
+        return ("BUY",  f"HTF aligned bullish (D1={d or '—'}, H4={h or '—'}, H1={'bull' if h1_bull else 'mixed'})")
+    if bear_votes >= 2 and bear_votes > bull_votes:
+        return ("SELL", f"HTF aligned bearish (D1={d or '—'}, H4={h or '—'}, H1={'bear' if h1_bear else 'mixed'})")
+    return ("WAIT", f"HTF conflicted (bull={bull_votes}, bear={bear_votes})")
+
+
+def _detect_liquidity_sweep(
+    *, candles_m15: list, candles_d1: list, lookback_m15_bars: int = 16,
+) -> dict:
+    """
+    Detect a sweep-and-reclaim of the previous calendar day's high or low
+    using recent M15 bars. The reclaim half is what the mandate's Model A
+    actually needs to confirm — a sweep alone isn't enough.
+
+    Returns:
+      swept     — bool: did price wick through prev-day H/L within lookback
+      side      — "high" | "low" | None
+      level     — the swept price level
+      reclaimed — bool: did price close back inside the prev-day range
+      rationale — human-readable summary
+    """
+    if (not candles_m15 or len(candles_m15) < lookback_m15_bars
+            or not candles_d1 or len(candles_d1) < 2):
+        return {"swept": False, "side": None, "level": None,
+                "reclaimed": False, "rationale": "Insufficient data"}
+
+    prev_d1   = candles_d1[-2]
+    prev_high = prev_d1.high
+    prev_low  = prev_d1.low
+
+    recent  = candles_m15[-lookback_m15_bars:]
+    cur     = candles_m15[-1].close
+
+    # Wick-only sweep (high wick must exceed prev_high; body close optional)
+    high_swept = any(c.high > prev_high for c in recent)
+    low_swept  = any(c.low  < prev_low  for c in recent)
+
+    # Reclaim = current price is back inside the prev-day range AFTER the sweep
+    high_reclaimed = high_swept and cur < prev_high
+    low_reclaimed  = low_swept  and cur > prev_low
+
+    if high_reclaimed:
+        return {"swept": True, "side": "high", "level": round(prev_high, 2),
+                "reclaimed": True,
+                "rationale": f"Swept prev-day high ${prev_high:.2f} → reclaimed below (current ${cur:.2f})"}
+    if low_reclaimed:
+        return {"swept": True, "side": "low", "level": round(prev_low, 2),
+                "reclaimed": True,
+                "rationale": f"Swept prev-day low ${prev_low:.2f} → reclaimed above (current ${cur:.2f})"}
+    if high_swept:
+        return {"swept": True, "side": "high", "level": round(prev_high, 2),
+                "reclaimed": False,
+                "rationale": f"Swept prev-day high ${prev_high:.2f}, no reclaim yet"}
+    if low_swept:
+        return {"swept": True, "side": "low", "level": round(prev_low, 2),
+                "reclaimed": False,
+                "rationale": f"Swept prev-day low ${prev_low:.2f}, no reclaim yet"}
+    return {"swept": False, "side": None, "level": None,
+            "reclaimed": False, "rationale": "No prev-day H/L sweep in recent bars"}
+
+
+def _generate_trade_plan(
+    *, direction: str, current_price: float, atr_h1: float,
+    candles_m15: list,
+    sl_atr_mult: float = 1.5,
+    tp_r_multiples: tuple = (1.5, 2.5, 4.0),
+    swing_lookback: int = 12,
+) -> dict:
+    """
+    Generate a self-contained ATR-based trade plan when the scanner doesn't
+    provide one. SL anchored to recent swing high/low (whichever is the
+    invalidation side) capped to ATR×mult so we don't over-stretch on quiet days.
+
+    Returns dict with entry / stop_loss / tp1 / tp2 / tp3 / rr / risk_pts.
+    """
+    if direction not in ("BUY", "SELL") or not current_price or atr_h1 <= 0:
+        return {"entry": None, "stop_loss": None, "tp1": None, "tp2": None,
+                "tp3": None, "rr": 0, "risk_pts": 0, "source": "none"}
+
+    # ATR bounds — never risk less than 15pts (noise floor), never more than 80pts
+    sl_dist_atr = max(min(atr_h1 * sl_atr_mult, 80.0), 15.0)
+
+    # Recent swing anchor
+    recent = candles_m15[-swing_lookback:] if candles_m15 and len(candles_m15) >= swing_lookback else (candles_m15 or [])
+    swing_low  = min((c.low  for c in recent), default=None) if recent else None
+    swing_high = max((c.high for c in recent), default=None) if recent else None
+
+    if direction == "BUY":
+        # SL = MAX of (recent swing low - buffer) and (entry - ATR distance)
+        #   i.e. take the wider of the two so we don't get knocked out by noise
+        sl_swing = (swing_low - 1.0) if swing_low else (current_price - sl_dist_atr)
+        sl_atr   = current_price - sl_dist_atr
+        sl       = min(sl_swing, sl_atr)         # wider of the two = lower price
+        rr_unit  = current_price - sl
+        if rr_unit < 5.0:                         # SL too tight, expand
+            rr_unit = sl_dist_atr
+            sl      = current_price - rr_unit
+        tp1 = round(current_price + rr_unit * tp_r_multiples[0], 2)
+        tp2 = round(current_price + rr_unit * tp_r_multiples[1], 2)
+        tp3 = round(current_price + rr_unit * tp_r_multiples[2], 2)
+    else:    # SELL
+        sl_swing = (swing_high + 1.0) if swing_high else (current_price + sl_dist_atr)
+        sl_atr   = current_price + sl_dist_atr
+        sl       = max(sl_swing, sl_atr)
+        rr_unit  = sl - current_price
+        if rr_unit < 5.0:
+            rr_unit = sl_dist_atr
+            sl      = current_price + rr_unit
+        tp1 = round(current_price - rr_unit * tp_r_multiples[0], 2)
+        tp2 = round(current_price - rr_unit * tp_r_multiples[1], 2)
+        tp3 = round(current_price - rr_unit * tp_r_multiples[2], 2)
+
+    return {
+        "entry":     round(current_price, 2),
+        "stop_loss": round(sl, 2),
+        "tp1":       tp1,
+        "tp2":       tp2,
+        "tp3":       tp3,
+        "rr":        round(tp_r_multiples[1], 2),   # primary RR = to TP2
+        "risk_pts":  round(rr_unit, 2),
+        "source":    "strategist_atr",
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Execution-model classifier
 # ────────────────────────────────────────────────────────────────────────────
 
-def _classify_execution_model(*, scan: dict, ict: dict, news_clear: bool) -> tuple[str, bool, str, str]:
+def _classify_execution_model(
+    *, scan: dict, ict: dict, news_clear: bool,
+    sweep: dict | None = None, ict_score: int = 0,
+) -> tuple[str, bool, str, str]:
     """
     Identify which institutional execution model the current setup fits:
       A — Liquidity Sweep Reversal
@@ -476,6 +644,11 @@ def _classify_execution_model(*, scan: dict, ict: dict, news_clear: bool) -> tup
       D — News Repricing Continuation
       E — None / Stand Aside
     Returns (model_name, confirmed, swept_level_str, target_str).
+
+    Mandate refactor: Model A is now confirmed by the strategist's OWN
+    sweep detection (services.strategist._detect_liquidity_sweep) when the
+    scanner is in WATCHLIST / not SIGNAL_READY. Previously gated only on
+    scanner.SIGNAL_READY which almost never fires on real markets.
     """
     market_state = scan.get("marketState", "")
     eng_model    = scan.get("engineModel", {}) or {}
@@ -483,25 +656,34 @@ def _classify_execution_model(*, scan: dict, ict: dict, news_clear: bool) -> tup
     struct_text  = (eng_model.get("structure") or "").lower()
     fvg_text     = (eng_model.get("fvg") or "").lower()
     bias         = (scan.get("institutionalBias") or "").lower()
+    sweep        = sweep or {}
 
-    swept_level = ""
-    target = ""
-
-    # MODEL A: Sweep + reclaim + structure shift
-    swept = ("swept" in liq_text or "sweep" in liq_text) and "no liquidity" not in liq_text
+    # MODEL A: Sweep + reclaim — independent of scanner state.
+    # Confirmation tiers:
+    #   - strategist sweep+reclaim AND (scanner BOS/CHoCH OR ICT score ≥ 60) → CONFIRMED
+    #   - scanner-reported sweep + BOS + SIGNAL_READY                        → CONFIRMED (legacy path)
+    #   - sweep alone (no reclaim, no structure)                             → unconfirmed
     bos   = "bos" in struct_text or "choch" in struct_text
-    if swept and bos and market_state == "SIGNAL_READY":
+    if sweep.get("swept") and sweep.get("reclaimed"):
+        if bos or ict_score >= 60:
+            return ("A", True, sweep.get("rationale", "Sweep + reclaim"), "back inside prev-day range")
+        return ("A", False, sweep.get("rationale", "Sweep + reclaim"), "awaiting structure confirmation")
+    # Legacy: scanner-driven confirmation
+    legacy_swept = ("swept" in liq_text or "sweep" in liq_text) and "no liquidity" not in liq_text
+    if legacy_swept and bos and market_state == "SIGNAL_READY":
         return ("A", True, liq_text[:80], "next liquidity pool")
 
-    # MODEL B: Breakout + retest
+    # MODEL B: Breakout + retest (still requires scanner signal — relies on FVG zone detection)
     if "retest" in struct_text or "retest" in fvg_text:
-        return ("B", market_state == "SIGNAL_READY", struct_text[:80], "continuation target")
+        confirmed = market_state == "SIGNAL_READY" or ict_score >= 70
+        return ("B", confirmed, struct_text[:80] or fvg_text[:80], "continuation target")
 
-    # MODEL C: Trend pullback
-    if "reversal" in bias.lower() and "in zone" in fvg_text:
-        return ("C", market_state == "SIGNAL_READY", fvg_text[:80], "trend liquidity")
+    # MODEL C: Trend pullback (FVG-in-zone retest)
+    if "reversal" in bias and "in zone" in fvg_text:
+        confirmed = market_state == "SIGNAL_READY" or ict_score >= 70
+        return ("C", confirmed, fvg_text[:80], "trend liquidity")
 
-    # MODEL D: Post-news continuation
+    # MODEL D: Post-news continuation — never confirmed during the window
     if not news_clear:
         return ("D", False, "post-news repricing window", "wait for spread normalisation")
 
@@ -583,7 +765,33 @@ def make_decision(db: Session) -> dict:
         log.warning("[strategist] killzone failed: %s", exc)
         kz = {}
 
+    # ── Independent timeframe biases from candle EMAs (not scanner) ─────
+    # The scanner has been returning "Insufficient D1 data" for D1 bias in
+    # production. Compute our own from raw candles so the strategist never
+    # depends on the scanner's HTF read.
+    d1_closes = [c.close for c in d1] if d1 else []
+    h4_closes = [c.close for c in h4] if h4 else []
+    d1_bias_local = _htf_bias_label(d1_closes, lookback=20)
+    h4_bias_local = _htf_bias_label(h4_closes, lookback=50)
+
+    # ── Detect liquidity sweep directly from candles (not scanner) ──────
+    sweep = _detect_liquidity_sweep(candles_m15=m15, candles_d1=d1)
+    log.debug("[strategist] sweep detection: %s", sweep.get("rationale"))
+
+    # ── Direction proposal — scanner > predictor > strategist HTF fallback ─
     proposed_signal = scan.get("signal") or pred.get("direction") or "WAIT"
+    direction_source = "scanner" if scan.get("signal") in ("BUY", "SELL") else \
+                       "predictor" if pred.get("direction") in ("BUY", "SELL") else None
+    if proposed_signal not in ("BUY", "SELL"):
+        # Both upstream engines abstain. Use HTF EMA alignment as the courage gate.
+        derived, rationale = _derive_direction_from_htf(
+            d1_bias=d1_bias_local, h4_bias=h4_bias_local,
+            h1_ema20=ema20_h1, h1_ema50=ema50_h1,
+        )
+        if derived in ("BUY", "SELL"):
+            proposed_signal = derived
+            direction_source = "strategist_htf"
+            log.info("[strategist] direction derived from HTF: %s (%s)", derived, rationale)
 
     try:
         ict = compute_ict_alignment(
@@ -677,9 +885,11 @@ def make_decision(db: Session) -> dict:
     else:
         market_state = "Range-bound / mixed"
 
-    # Execution model
+    # Execution model — now receives our own sweep detection + ICT score so
+    # Model A can confirm independent of scanner.SIGNAL_READY
     model_letter, model_confirmed, swept_text, target_text = _classify_execution_model(
         scan=scan, ict=(ict.score if ict else 0), news_clear=news_clear,
+        sweep=sweep, ict_score=(ict.score if ict else 0),
     )
 
     # ── Compute setup score (out of 100, per the strategist mandate) ────
@@ -703,18 +913,21 @@ def make_decision(db: Session) -> dict:
     total_setup_score = score_alignment + score_liquidity + score_structure + \
                         score_session + score_macro + score_dxy + score_spread
 
-    # ── Build trade plan if feasible ────────────────────────────────────
-    plan_obj = scan.get("recommendedAction", {}).get("tradePlan") or {}
+    # ── Build trade plan ────────────────────────────────────────────────
+    # Preference order:
+    #   1. Scanner's recommendedAction.tradePlan (when SIGNAL_READY)
+    #   2. Strategist's own ATR-based plan when scanner abstains BUT we
+    #      have a direction (either from predictor or HTF-derived)
+    plan_obj  = scan.get("recommendedAction", {}).get("tradePlan") or {}
     entry        = plan_obj.get("entry")
     stop_loss    = plan_obj.get("stopLoss")
     take_profit  = plan_obj.get("takeProfit")
-    risk_pts     = plan_obj.get("riskPoints") or plan_obj.get("riskPips")
-    target_pts   = plan_obj.get("targetPoints")
     rr           = plan_obj.get("rr") or 0
+    plan_source  = "scanner" if entry and stop_loss else None
 
     tp1, tp2, tp3 = None, None, None
     if entry and stop_loss and take_profit and proposed_signal in ("BUY", "SELL"):
-        # Stagger TPs: TP1 = 1R, TP2 = 2R (scanner's full TP), TP3 = 3R
+        # Scanner-provided plan — stagger to TP1/TP2/TP3
         rr_unit = abs(entry - stop_loss)
         if proposed_signal == "BUY":
             tp1 = round(entry + rr_unit * 1.0, 2)
@@ -725,6 +938,24 @@ def make_decision(db: Session) -> dict:
             tp2 = round(entry - rr_unit * 2.5, 2)
             tp3 = round(entry - rr_unit * 4.0, 2)
         rr = round(abs(tp2 - entry) / rr_unit, 2)
+
+    elif proposed_signal in ("BUY", "SELL") and current_price and atr_h1 > 0:
+        # Scanner abstained → strategist generates its own ATR plan
+        gen = _generate_trade_plan(
+            direction=proposed_signal,
+            current_price=current_price,
+            atr_h1=atr_h1,
+            candles_m15=m15,
+        )
+        if gen.get("entry") is not None:
+            entry, stop_loss = gen["entry"], gen["stop_loss"]
+            tp1, tp2, tp3    = gen["tp1"], gen["tp2"], gen["tp3"]
+            rr               = gen["rr"]
+            plan_source      = "strategist_atr"
+            log.info(
+                "[strategist] generated ATR trade plan %s entry=%s SL=%s TP1=%s TP2=%s rr=%s",
+                proposed_signal, entry, stop_loss, tp1, tp2, rr,
+            )
 
     if rr and rr >= 2.5:
         score_rr = 10
@@ -796,9 +1027,14 @@ def make_decision(db: Session) -> dict:
         kz_posture=kz.get("posture"),
     )
     session_mandate = _classify_session_mandate(hour_utc=h, news_clear=news_clear)
+    # Use our LOCAL biases (computed from candle EMAs above), not the scanner's
+    # "Insufficient D1 data" stub. Falls back to scanner's text only if our
+    # local computation also failed (e.g. no D1 candles).
     tf_alignment_mandate = _classify_tf_alignment_mandate(
-        d1_bias=(scan.get("engineModel") or {}).get("d1Bias", ""),
-        h4_bias=(scan.get("engineModel") or {}).get("h4Bias", ""),
+        d1_bias=d1_bias_local if "Insufficient" not in d1_bias_local
+                else (scan.get("engineModel") or {}).get("d1Bias", ""),
+        h4_bias=h4_bias_local if "Insufficient" not in h4_bias_local
+                else (scan.get("engineModel") or {}).get("h4Bias", ""),
         h1_ema20=ema20_h1, h1_ema50=ema50_h1,
         rsi_h1=rsi_h1,
     )
@@ -930,6 +1166,20 @@ def make_decision(db: Session) -> dict:
             }.get(model_letter, "None"),
             "swept_level":      swept_text,
             "target_liquidity": target_text,
+            # Strategist's own sweep detection — visible alongside scanner state
+            "sweep_detected":   sweep.get("swept", False),
+            "sweep_side":       sweep.get("side"),
+            "sweep_level":      sweep.get("level"),
+            "sweep_reclaimed":  sweep.get("reclaimed", False),
+        },
+        "diagnostics": {
+            "direction_source": direction_source,    # scanner | predictor | strategist_htf | None
+            "plan_source":      plan_source,         # scanner | strategist_atr | None
+            "d1_bias_local":    d1_bias_local,
+            "h4_bias_local":    h4_bias_local,
+            "sweep_rationale":  sweep.get("rationale"),
+            "scanner_state":    scan.get("marketState"),
+            "scanner_score":    scan.get("qualityScore"),
         },
         "key_zones": {
             "immediate_supply": [today_high] if today_high else [],
