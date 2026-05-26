@@ -114,6 +114,60 @@ def briefing_send_now(
 
 
 @router.get(
+    "/learnings",
+    response_model=APIResponse[dict],
+    summary="Aggregate closed strategist trades into actionable lessons",
+)
+@limiter.limit("12/minute")
+def strategist_learnings(
+    request: Request,
+    window_days: int = 7,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Pulls strategist_verdicts with non-null result (WIN / LOSS / BREAKEVEN)
+    in the last `window_days`, aggregates by conditions_passed / killzone ×
+    direction / direction_source / sweep_side / macro alignment, and surfaces:
+      • overall WR, expectancy R, sample size
+      • per-bucket WR with comparison to mandate's predicted ranges
+      • top 3 winners + top 3 losers (by R-multiple)
+      • calibration notes — where reality diverges from theory
+    """
+    from services.learnings import build_learnings
+    window_days = max(1, min(window_days, 90))
+    data = build_learnings(db, window_days=window_days)
+    return APIResponse(data=data, source="strategist_learnings")
+
+
+@router.post(
+    "/learnings/digest-now",
+    response_model=APIResponse[dict],
+    summary="Force-send the weekly Telegram digest (bypasses schedule)",
+)
+@limiter.limit("3/minute")
+def strategist_digest_now(
+    request: Request,
+    window_days: int = 7,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """Build the weekly digest and POST it to Telegram immediately."""
+    from services.learnings import build_learnings, format_weekly_digest
+    from services.strategist_runner import _send_plain
+    data = build_learnings(db, window_days=window_days)
+    msg = format_weekly_digest(data)
+    sent = False
+    try:
+        _send_plain(msg)
+        sent = True
+    except Exception as exc:
+        log.warning("[strategist] digest send failed: %s", exc)
+    return APIResponse(
+        data={"sent": sent, "sample_size": data["sample_size"], "preview": msg[:600] + "..."},
+        source="strategist_learnings",
+    )
+
+
+@router.get(
     "/log",
     response_model=APIResponse[dict],
     summary="Recent strategist verdicts (mandate signal log)",

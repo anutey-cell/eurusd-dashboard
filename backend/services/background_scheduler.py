@@ -303,6 +303,64 @@ def _run_briefing_iteration():
         send_briefing_if_due(db)
 
 
+# ── Weekly learning digest loop ──────────────────────────────────────────────
+
+# Fire Sunday at 18:00 UTC (markets are closed worldwide → operator can read it)
+DIGEST_WEEKDAY_UTC  = 6       # Mon=0 … Sun=6
+DIGEST_HOUR_UTC     = 18
+DIGEST_CHECK_INTERVAL_SEC = 5 * 60     # poll every 5 minutes
+_last_digest_iso_week: str = ""        # de-dup key e.g. "2026-W21"
+
+
+async def _weekly_digest_loop():
+    """
+    Sends a weekly learnings digest to Telegram once per ISO week,
+    fired at Sunday 18:00 UTC. Aggregates the prior 7 days of closed
+    strategist trades into WR / expectancy / top winners / losers /
+    calibration notes — so the operator gets a structured progress
+    report every Sunday evening.
+
+    Opt-in via settings.telegram_hourly_briefing (same switch).
+    """
+    log.info("[scheduler] weekly digest loop started (Sun %02d:00 UTC)", DIGEST_HOUR_UTC)
+    while True:
+        try:
+            await asyncio.sleep(DIGEST_CHECK_INTERVAL_SEC)
+            await asyncio.to_thread(_run_digest_iteration)
+        except asyncio.CancelledError:
+            log.info("[scheduler] weekly digest loop cancelled")
+            raise
+        except Exception as exc:
+            log.warning("[scheduler] weekly digest loop error: %s", exc)
+
+
+def _run_digest_iteration():
+    """Single weekly-digest check. Only fires Sunday 18:00 UTC, once/week."""
+    global _last_digest_iso_week
+    from config import settings
+    if not getattr(settings, "telegram_hourly_briefing", False):
+        return        # reuse the briefing opt-in
+    now = datetime.now(timezone.utc)
+    if now.weekday() != DIGEST_WEEKDAY_UTC or now.hour != DIGEST_HOUR_UTC:
+        return
+    iso = f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
+    if iso == _last_digest_iso_week:
+        return        # already sent for this week
+
+    from database import SessionLocal
+    from services.learnings import build_learnings, format_weekly_digest
+    from services.strategist_runner import _send_plain
+    with SessionLocal() as db:
+        data = build_learnings(db, window_days=7)
+        msg  = format_weekly_digest(data)
+    try:
+        _send_plain(msg)
+        _last_digest_iso_week = iso
+        log.info("[digest] sent weekly digest for %s (n=%d)", iso, data["sample_size"])
+    except Exception as exc:
+        log.warning("[digest] send failed: %s", exc)
+
+
 def _run_auto_executor_iteration():
     """Single auto-executor iteration (runs in thread)."""
     global _last_auto_attempt
@@ -463,6 +521,7 @@ async def start_background_loops():
         asyncio.create_task(_drawdown_loop(),          name="drawdown_loop"),
         asyncio.create_task(_daily_summary_loop(),     name="daily_summary_loop"),
         asyncio.create_task(_hourly_briefing_loop(),   name="hourly_briefing_loop"),
+        asyncio.create_task(_weekly_digest_loop(),     name="weekly_digest_loop"),
     ]
 
     # Pick exactly ONE execution authority — never both, or they'll fight.
