@@ -990,46 +990,8 @@ def make_decision(db: Session) -> dict:
             f"KZ policy BLOCK ({kz.get('current_kz')} × {proposed_signal})"
         )
 
-    # ── MANDATE DECISION (driven by conditions_passed, not legacy score) ─
-    # Per the mandate:
-    #   5/5 → A-grade demo execution allowed
-    #   4/5 → valid demo execution allowed
-    #   3/5 → watchlist (signal but no execution)
-    #  ≤2/5 → STAND ASIDE
-    # So as long as conditions_passed >= 3 AND we have a direction, the
-    # decision IS that direction. Execution permission is a SEPARATE gate
-    # handled below (execution_status).
-    decision = "STAND ASIDE"
-    if proposed_signal in ("BUY", "SELL"):
-        # We need to know conditions_passed early — compute it here
-        # (the full conditions evaluation happens just below this block)
-        _early_conditions = _evaluate_5_conditions(
-            proposed_signal=proposed_signal,
-            tf_alignment_label=tf_alignment_mandate,
-            model_letter=model_letter,
-            model_confirmed=model_confirmed,
-            scan_market_state=scan.get("marketState", "UNKNOWN"),
-            ict_score=(ict.score if ict else 0),
-            macro_alignment=macro_aligned,
-            news_clear=news_clear,
-            kz_posture=kz.get("posture"),
-            rr=rr or 0,
-            entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2,
-        )
-        _early_passed = sum(1 for c in _early_conditions if c["passed"])
-        if _early_passed >= 3:
-            decision = proposed_signal     # mandate primary gate
-
-    # Quality band derived from the legacy 0-100 score (kept for backward-compat
-    # with the existing dashboard panel). The mandate's primary band signal is
-    # `conditions_passed` (see below).
-    if total_setup_score >= 90: band = "A-grade"
-    elif total_setup_score >= 80: band = "Valid"
-    elif total_setup_score >= 70: band = "Watchlist"
-    else: band = "No Trade"
-
     # ── Mandate enums (8/8/6/5-category classifications) ────────────────
-    # ATR baseline = 50-period H1 ATR average, used to detect compression / decay
+    # Computed FIRST so the decision block below has everything it needs.
     atr_baseline_h1 = 0.0
     if len(h1) >= 50:
         recent_atr_samples = []
@@ -1041,10 +1003,7 @@ def make_decision(db: Session) -> dict:
         if recent_atr_samples:
             atr_baseline_h1 = sum(recent_atr_samples) / len(recent_atr_samples)
 
-    swept_recently = bool(
-        scan.get("engineModel", {}).get("liquidity", "").lower().count("swept")
-        or scan.get("engineModel", {}).get("liquidity", "").lower().count("sweep")
-    )
+    swept_recently = bool(sweep.get("swept"))
     market_state_mandate = _classify_market_state_mandate(
         ema20_h1=ema20_h1, ema50_h1=ema50_h1, ema100_h1=ema100_h1,
         rsi_h1=rsi_h1, atr_h1=atr_h1, atr_h1_baseline=atr_baseline_h1,
@@ -1054,9 +1013,6 @@ def make_decision(db: Session) -> dict:
         kz_posture=kz.get("posture"),
     )
     session_mandate = _classify_session_mandate(hour_utc=h, news_clear=news_clear)
-    # Use our LOCAL biases (computed from candle EMAs above), not the scanner's
-    # "Insufficient D1 data" stub. Falls back to scanner's text only if our
-    # local computation also failed (e.g. no D1 candles).
     tf_alignment_mandate = _classify_tf_alignment_mandate(
         d1_bias=d1_bias_local if "Insufficient" not in d1_bias_local
                 else (scan.get("engineModel") or {}).get("d1Bias", ""),
@@ -1086,9 +1042,24 @@ def make_decision(db: Session) -> dict:
     conditions_passed = sum(1 for c in conditions if c["passed"])
     est_win_rate = _estimate_win_rate(conditions_passed)
 
-    # If conditions_passed < 3 we MUST stand aside regardless of legacy score
-    if conditions_passed < 3 and decision != "STAND ASIDE":
-        decision = "STAND ASIDE"
+    # ── MANDATE DECISION ────────────────────────────────────────────────
+    # Per the mandate:
+    #   5/5 → A-grade demo execution allowed
+    #   4/5 → valid demo execution allowed
+    #   3/5 → watchlist (signal but no execution)
+    #  ≤2/5 → STAND ASIDE
+    decision = "STAND ASIDE"
+    if conditions_passed >= 3 and proposed_signal in ("BUY", "SELL"):
+        decision = proposed_signal
+
+    # Quality band derived from the legacy 0-100 score (kept for the dashboard
+    # panel). The mandate's primary signal is conditions_passed.
+    if total_setup_score >= 90: band = "A-grade"
+    elif total_setup_score >= 80: band = "Valid"
+    elif total_setup_score >= 70: band = "Watchlist"
+    else: band = "No Trade"
+
+    if decision == "STAND ASIDE" and conditions_passed < 3 and proposed_signal in ("BUY", "SELL"):
         stand_aside_reasons.insert(0, f"Conditions passed {conditions_passed}/5 (need ≥3 for any action)")
 
     # ── Next-trigger guidance ───────────────────────────────────────────
