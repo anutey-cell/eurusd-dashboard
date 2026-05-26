@@ -60,42 +60,49 @@ def _pull_strategist_verdict(db: Session) -> dict:
 
 
 def _pull_market_snapshot() -> dict:
-    """24h price movement + intraday range + current tick."""
+    """
+    24h price movement + intraday range + freshest current price.
+
+    Uses M5 for `current` (max 5-min stale) so the briefing matches what the
+    dashboard ticker shows. Uses H1 for 24h delta (24 H1 bars = 24h). Uses
+    D1 for the 5-day H/L context line.
+    """
     from data.candles import get_candles
     try:
-        h1 = get_candles(interval="H1", limit=30, pair="xauusd")
-        d1 = get_candles(interval="D1", limit=5,  pair="xauusd")
+        m5 = get_candles(interval="M5", limit=300, pair="xauusd")   # 25h on M5
+        h1 = get_candles(interval="H1", limit=30,  pair="xauusd")
+        d1 = get_candles(interval="D1", limit=5,   pair="xauusd")
     except Exception as exc:
         log.warning("[briefing] candle fetch failed: %s", exc)
         return {"current": None, "move_24h": None, "move_24h_pct": None,
                 "session_high": None, "session_low": None}
 
-    if not h1 or not h1.candles:
+    if not m5 or not m5.candles:
         return {"current": None}
 
-    candles = h1.candles
-    current = candles[-1].close
+    # Freshest price = last M5 close (matches the dashboard header ticker)
+    current = m5.candles[-1].close
 
-    # 24-bar move on H1 = previous calendar-day's same-hour close
-    if len(candles) >= 25:
-        yesterday = candles[-25].close
+    # 24h delta — prefer H1 (24 bars = 24h); fall back to M5 first close
+    if h1 and h1.candles and len(h1.candles) >= 25:
+        yesterday = h1.candles[-25].close
+    elif len(m5.candles) >= 289:
+        yesterday = m5.candles[-289].close
     else:
-        yesterday = candles[0].close
+        yesterday = m5.candles[0].close
     move      = current - yesterday
     move_pct  = (move / yesterday) * 100 if yesterday else 0.0
 
-    # Today's intraday range
+    # Today's intraday range from M5 (more accurate than H1 high/low rollups)
     now_utc = datetime.now(timezone.utc)
-    today_bars = [c for c in candles
+    today_bars = [c for c in m5.candles
                   if (c.time if c.time.tzinfo else c.time.replace(tzinfo=timezone.utc))
                      .astimezone(timezone.utc).date() == now_utc.date()]
     session_high = max((c.high for c in today_bars), default=None)
     session_low  = min((c.low  for c in today_bars), default=None)
+    daily_open   = today_bars[0].open if today_bars else None
 
-    # Daily open (today's first H1 open)
-    daily_open = today_bars[0].open if today_bars else None
-
-    # 5-day H/L for the wider context line
+    # 5-day H/L from D1
     week_high = max(c.high for c in d1.candles) if d1 and d1.candles else None
     week_low  = min(c.low  for c in d1.candles) if d1 and d1.candles else None
 
@@ -171,12 +178,23 @@ def _format_message(*, verdict: dict, market: dict) -> str:
         return "  ·  ".join(f"${x}" for x in uniq[:max_n])
 
     # ── MACRO ──────────────────────────────────────────────────────────
+    # Predictor's `direction` field is the implied signal for GOLD, not DXY's
+    # own direction. Translate to plain-English for the briefing reader.
     mc = verdict.get("macro_context") or {}
-    dxy  = mc.get("dxy_bias",  "—")
-    yld  = mc.get("yields_bias", "—")
+    dxy_raw  = mc.get("dxy_bias",  "NEUTRAL")
+    yld_raw  = mc.get("yields_bias", "NEUTRAL")
     gold_bias = mc.get("gold_macro_bias", "—")
     news = mc.get("news_risk", "—")
     news_icon = "🟢" if news == "CLEAR" else "🟠"
+
+    def _macro_label(d: str, factor: str) -> str:
+        """Translate predictor direction → human-readable narrative."""
+        if d == "BUY":    return f"{factor} supportive of gold"
+        if d == "SELL":   return f"{factor} pressuring gold"
+        return f"{factor} neutral"
+
+    dxy  = _macro_label(dxy_raw, "DXY")
+    yld  = _macro_label(yld_raw, "Yields")
 
     # ── OPPORTUNITY WATCH ──────────────────────────────────────────────
     nt = verdict.get("next_trigger") or {}

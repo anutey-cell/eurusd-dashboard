@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { Activity, Wifi, WifiOff, Clock, TrendingUp, TrendingDown, AlertTriangle, Database } from 'lucide-react';
 import { getDataStatus, getCandles } from '../services/api';
 import { formatKenyaTime, nowKenyaHour, KENYA_LABEL } from '../utils/time';
@@ -17,97 +17,95 @@ function getCurrentSession() {
 }
 
 /**
- * Live-price ticker:
- *   1. Polls GET /candles?pair=xauusd&interval=M15&limit=96 (24h window) every
- *      15s. Pins anchor to last close; computes 24h change from first→last.
- *   2. Between polls, jitters ±$0.30 around the anchor so the UI feels alive.
- *   3. Until the first poll lands we show "—" — never a stale demo seed.
+ * Live-price ticker — honest version.
  *
- * Returns { price, tick, change, changePct } — all live.
+ * Polls GET /candles?pair=xauusd&interval=M5&limit=288 (24h of M5 bars) every
+ * 5 s. Shows the last M5 close — no fake jitter, no fabricated animation.
+ * Tick direction only flips on a real close change.
+ *
+ * The embedded TradingView chart still streams the true real-time tick, so
+ * a small lag here (max 5 min) is expected. An "age" badge surfaces how
+ * stale the close is so the operator can sanity-check.
+ *
+ * Returns { price, tick, change, changePct, ageSeconds, source, isLive }.
  */
-// Provider sources we ACCEPT as real prices. Anything else (synthetic/demo)
-// is rejected — the dashboard shows "—" with a warning chip rather than
-// flashing a misleading synthetic price near the BASE_PRICE_XAUUSD seed.
 const LIVE_SOURCES = new Set(['tradingview', 'mt5', 'tradingview-cached', 'mt5-cached']);
+const PRICE_POLL_MS = 5_000;
 
 function useLivePrice() {
-  const [price, setPrice]       = useState(null);
-  const [tick, setTick]         = useState(null);
-  const [change, setChange]     = useState(null);
+  const [price, setPrice]         = useState(null);
+  const [tick, setTick]           = useState(null);
+  const [change, setChange]       = useState(null);
   const [changePct, setChangePct] = useState(null);
-  const [source, setSource]     = useState(null);   // "tradingview" | "synthetic" | …
-  const anchorRef               = useRef(null);     // last confirmed real close
+  const [source, setSource]       = useState(null);
+  const [closeTime, setCloseTime] = useState(null);
+  const [ageSeconds, setAgeSeconds] = useState(null);
 
-  // Pull 24h of M15 candles, compute live close + 24h change
   useEffect(() => {
     let cancelled = false;
 
     async function pull() {
       try {
-        const res = await getCandles({ pair: 'xauusd', interval: 'M15', limit: 96 });
+        // 24h on M5 = 288 bars
+        const res = await getCandles({ pair: 'xauusd', interval: 'M5', limit: 288 });
         const candles  = res?.candles ?? res?.data?.candles ?? [];
-        // `source` lives in the APIResponse envelope; the api.js helper returns
-        // the parsed envelope, so it's res.source directly.
         const provider = res?.source ?? res?.data?.source ?? 'unknown';
 
         if (cancelled) return;
         setSource(provider);
 
-        // Refuse to surface synthetic / demo numbers — clear all state so
-        // the UI shows "—" and the warning chip surfaces.
         if (!LIVE_SOURCES.has(provider)) {
-          anchorRef.current = null;
           setPrice(null);
           setChange(null);
           setChangePct(null);
           setTick(null);
+          setCloseTime(null);
           return;
         }
-
         if (candles.length < 2) return;
+
         const first = candles[0];
         const last  = candles[candles.length - 1];
         const close = last?.close;
         const ref   = first?.close;
         if (typeof close !== 'number' || !Number.isFinite(close)) return;
 
-        anchorRef.current = close;
         setPrice(prev => {
-          if (prev != null) setTick(close >= prev ? 'up' : 'down');
+          if (prev != null && prev !== close) {
+            setTick(close >= prev ? 'up' : 'down');
+          }
           return close;
         });
+        if (last?.time) setCloseTime(last.time);
         if (typeof ref === 'number' && Number.isFinite(ref) && ref > 0) {
-          const delta = close - ref;
-          setChange(delta);
-          setChangePct((delta / ref) * 100);
+          setChange(close - ref);
+          setChangePct(((close - ref) / ref) * 100);
         }
       } catch {
-        // silent — keep the previous price; jitter below still animates the UI
+        // silent — keep showing the previous honest price
       }
     }
 
     pull();
-    const id = setInterval(pull, 15_000);
+    const id = setInterval(pull, PRICE_POLL_MS);
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
-  // Tiny jitter between real-price pulls so the ticker doesn't look frozen.
-  // Only runs once we have a valid live anchor — never animates synthetic data.
+  // Recompute age every second so the operator sees how stale the close is.
   useEffect(() => {
+    if (!closeTime) return;
     const id = setInterval(() => {
-      if (anchorRef.current == null) return;
-      const jitter = (Math.random() - 0.5) * 0.60; // ±$0.30
-      setPrice(prev => {
-        const base = prev ?? anchorRef.current;
-        const next = Math.round((base + jitter) * 100) / 100;
-        setTick(jitter >= 0 ? 'up' : 'down');
-        return next;
-      });
-    }, 1800);
+      const t = new Date(closeTime).getTime();
+      if (!Number.isFinite(t)) return;
+      setAgeSeconds(Math.max(0, Math.floor((Date.now() - t) / 1000)));
+    }, 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [closeTime]);
 
-  return { price, tick, change, changePct, source, isLive: LIVE_SOURCES.has(source) };
+  return {
+    price, tick, change, changePct, source, ageSeconds,
+    isLive: LIVE_SOURCES.has(source),
+  };
 }
 
 function useDataStatus() {
@@ -130,7 +128,7 @@ export default function Header({ instrument }) {
   // All values are pulled live from /candles every 15s — never a demo seed.
   // First poll lands ~1s after mount; before that we show "—".
   // `isLive` is false when the backend returned synthetic/demo data (provider down).
-  const { price, tick, changePct, source, isLive: priceIsLive } = useLivePrice();
+  const { price, tick, changePct, source, ageSeconds, isLive: priceIsLive } = useLivePrice();
   const { status, error: statusError } = useDataStatus();
   const pairLabel = instrument?.label ?? 'XAU/USD';
   const decimals  = instrument?.decimals ?? 2;
@@ -168,13 +166,15 @@ export default function Header({ instrument }) {
         <span className="text-xs text-gray-500 hidden sm:block">Gold · ICT Signal Dashboard</span>
       </div>
 
-      {/* Live Price Ticker */}
+      {/* Live Price Ticker — last M5 close (max 5 min lag). The embedded
+          TradingView chart streams the true real-time tick; cross-check there.  */}
       <div className="flex items-center gap-2 bg-[#161b27] border border-[#263044] rounded-lg px-4 py-2">
         <span className="text-xs font-semibold text-gray-400 mr-1">{pairLabel}</span>
         <span
           className={`font-mono text-xl font-bold transition-colors duration-300 ${
             tick === 'up' ? 'text-emerald-400' : tick === 'down' ? 'text-red-400' : 'text-white'
           }`}
+          title="Last completed M5 close — for real-time tick see TradingView chart"
         >
           {price != null ? price.toFixed(decimals) : '—'}
         </span>
@@ -184,6 +184,15 @@ export default function Header({ instrument }) {
             ? `${isUp ? '+' : ''}${changePct.toFixed(2)}% 24h`
             : '—'}
         </div>
+        {/* "M5 · <age>" tag explicitly so the user understands what this number is */}
+        {priceIsLive && (
+          <span
+            className="text-[9px] font-mono text-gray-500 px-1.5 py-0.5 rounded border border-[#1c2333]"
+            title="The displayed price is the last completed M5 bar's close. Age = seconds since that bar closed."
+          >
+            M5 · {ageSeconds != null ? `${ageSeconds}s` : '—'}
+          </span>
+        )}
         {/* Source chip — green for live providers, red when backend served synthetic */}
         {source && (
           <span
