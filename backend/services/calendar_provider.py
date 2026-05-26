@@ -371,25 +371,47 @@ def get_macro_calendar(
 # ── ForexFactory free calendar (no API key required) ──────────────────────────
 
 _FF_THISWEEK_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-# Cache results for 5 minutes to avoid hammering the free endpoint
+# Cache for 30 min. The published JSON is updated infrequently and faireconomy
+# rate-limits aggressive callers, so erring on the side of fewer fetches.
 _FF_CACHE: dict[str, tuple[float, list[dict]]] = {}
-_FF_CACHE_TTL_SEC = 5 * 60
+_FF_CACHE_TTL_SEC = 30 * 60
+# When rate-limited, accept cached data up to this much older than the normal TTL.
+_FF_STALE_TOLERANCE_SEC = 12 * 60 * 60   # 12 h
 
 
 def get_forexfactory_calendar(date: str | None = None, *, force_refresh: bool = False) -> list[dict]:
     """
     Free public economic calendar from faireconomy.media (ForexFactory mirror).
     NO API KEY required — uses the same JSON feed many trading platforms ship with.
-    Refresh-cached for 5 minutes.
+
+    Caching:
+      • Fresh cache: 30 min TTL — normal path.
+      • Stale-tolerant fallback: if the upstream rate-limits us, fall back to
+        cached data up to 12 h old rather than failing the whole request.
+      • Cache miss + upstream error → propagate the exception.
     """
     import time as _time
-    cache_key = "thisweek"
-    if not force_refresh:
-        cached = _FF_CACHE.get(cache_key)
-        if cached and (_time.time() - cached[0]) < _FF_CACHE_TTL_SEC:
-            return _filter_ff_by_date(cached[1], date)
+    from exceptions import RateLimitError, ProviderUnavailableError
 
-    raw = _http_get(_FF_THISWEEK_URL, provider="forexfactory")
+    cache_key = "thisweek"
+    now_ts = _time.time()
+    cached = _FF_CACHE.get(cache_key)
+
+    if not force_refresh and cached and (now_ts - cached[0]) < _FF_CACHE_TTL_SEC:
+        return _filter_ff_by_date(cached[1], date)
+
+    try:
+        raw = _http_get(_FF_THISWEEK_URL, provider="forexfactory")
+    except (RateLimitError, ProviderUnavailableError) as exc:
+        # Upstream rate-limit / outage. Use stale cache if we have one.
+        if cached and (now_ts - cached[0]) < _FF_STALE_TOLERANCE_SEC:
+            logger.warning(
+                "[forexfactory] upstream %s — serving cache from %.0f min ago",
+                type(exc).__name__, (now_ts - cached[0]) / 60.0,
+            )
+            return _filter_ff_by_date(cached[1], date)
+        raise
+
     if not isinstance(raw, list):
         raise ValueError("ForexFactory returned non-list payload")
 
