@@ -963,16 +963,18 @@ def make_decision(db: Session) -> dict:
         score_rr = 5
     total_setup_score += score_rr
 
-    # ── Apply STRICT DECISION RULES ─────────────────────────────────────
+    # ── Diagnostic reasons (for reporting, NOT decision gating) ─────────
+    # These were used to force STAND ASIDE in the legacy 80/100 model. The
+    # 5-condition mandate model now governs the decision; these reasons are
+    # surfaced as `stand_aside_reason` text only when the decision is in fact
+    # STAND ASIDE (conditions < 3 OR no direction).
     stand_aside_reasons = []
-    if total_setup_score < 80:
-        stand_aside_reasons.append(f"Setup score {total_setup_score}<80")
     if not entry or not stop_loss:
         stand_aside_reasons.append("Entry/SL not defined")
     if not tp1 or not tp2:
         stand_aside_reasons.append("TPs incomplete")
-    if rr and rr < 2.5:
-        stand_aside_reasons.append(f"RR {rr}<2.5")
+    if rr and rr < 1.5:
+        stand_aside_reasons.append(f"RR {rr}<1.5 (demo floor)")
     if not model_confirmed or model_letter == "E":
         stand_aside_reasons.append("No confirmed execution model")
     if macro_aligned == "Conflicted":
@@ -980,7 +982,7 @@ def make_decision(db: Session) -> dict:
     if not news_clear:
         stand_aside_reasons.append("Inside news risk window")
     if proposed_signal not in ("BUY", "SELL"):
-        stand_aside_reasons.append("Scanner is in WAIT")
+        stand_aside_reasons.append("No direction (scanner/predictor/HTF all WAIT)")
     if ict and ict.posture == "MISALIGNED":
         stand_aside_reasons.append(f"ICT framework MISALIGNED ({ict.score}/100)")
     if kz_policy is not None and not kz_policy.allow:
@@ -988,10 +990,35 @@ def make_decision(db: Session) -> dict:
             f"KZ policy BLOCK ({kz.get('current_kz')} × {proposed_signal})"
         )
 
+    # ── MANDATE DECISION (driven by conditions_passed, not legacy score) ─
+    # Per the mandate:
+    #   5/5 → A-grade demo execution allowed
+    #   4/5 → valid demo execution allowed
+    #   3/5 → watchlist (signal but no execution)
+    #  ≤2/5 → STAND ASIDE
+    # So as long as conditions_passed >= 3 AND we have a direction, the
+    # decision IS that direction. Execution permission is a SEPARATE gate
+    # handled below (execution_status).
     decision = "STAND ASIDE"
-    if not stand_aside_reasons and proposed_signal in ("BUY", "SELL"):
-        # Mandate uses BUY/SELL (not LONG/SHORT) as the canonical decision values
-        decision = proposed_signal
+    if proposed_signal in ("BUY", "SELL"):
+        # We need to know conditions_passed early — compute it here
+        # (the full conditions evaluation happens just below this block)
+        _early_conditions = _evaluate_5_conditions(
+            proposed_signal=proposed_signal,
+            tf_alignment_label=tf_alignment_mandate,
+            model_letter=model_letter,
+            model_confirmed=model_confirmed,
+            scan_market_state=scan.get("marketState", "UNKNOWN"),
+            ict_score=(ict.score if ict else 0),
+            macro_alignment=macro_aligned,
+            news_clear=news_clear,
+            kz_posture=kz.get("posture"),
+            rr=rr or 0,
+            entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2,
+        )
+        _early_passed = sum(1 for c in _early_conditions if c["passed"])
+        if _early_passed >= 3:
+            decision = proposed_signal     # mandate primary gate
 
     # Quality band derived from the legacy 0-100 score (kept for backward-compat
     # with the existing dashboard panel). The mandate's primary band signal is
