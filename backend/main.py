@@ -19,7 +19,7 @@ from logging_config import setup_logging
 from middleware import RequestLoggingMiddleware, AuthMiddleware
 from rate_limit import limiter
 from routers import health, candles, calendar, signal, analytics, backtest, execution, mt5 as mt5_router, telegram as telegram_router, engine as engine_router, readiness as readiness_router, risk as risk_router, scan as scan_router, observations as observations_router, prediction as prediction_router, killzones as killzones_router, institutional as institutional_router, bridge as bridge_router, diagnostics as diagnostics_router, strategist as strategist_router
-
+from routers.overview import router as overview_router
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
 
@@ -213,6 +213,7 @@ app.include_router(institutional_router.router, prefix=prefix)
 app.include_router(bridge_router.router,         prefix=prefix)
 app.include_router(diagnostics_router.router,    prefix=prefix)
 app.include_router(strategist_router.router,     prefix=prefix)
+app.include_router(overview_router, prefix="/api/v1")
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────
