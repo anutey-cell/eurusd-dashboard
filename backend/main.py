@@ -223,3 +223,50 @@ async def root() -> JSONResponse:
         "docs":    "/docs",
         "version": settings.version,
     })
+from datetime import datetime, timezone
+import os
+
+@app.get("/api/v1/overview/daily")
+def daily_overview():
+    return {
+        "status": "ok",
+        "instrument": "XAU/USD",
+        "data_mode": os.getenv("DATA_MODE", "unknown"),
+        "database": "connected",
+        "fx_provider": os.getenv("FX_PROVIDER", os.getenv("MARKET_DATA_PROVIDER", "unknown")),
+        "calendar_provider": os.getenv("CALENDAR_PROVIDER", "unknown"),
+        "broker_execution_enabled": os.getenv("BROKER_EXECUTION_ENABLED", "false"),
+        "price": None,
+        "bias": "pending_engine_data",
+        "market_state": "pending_engine_data",
+        "timeframes": {
+            "m15": {},
+            "h1": {},
+            "h4": {},
+            "daily": {}
+        },
+        "levels": {
+            "support": [],
+            "resistance": [],
+            "supply": [],
+            "demand": [],
+            "liquidity": []
+        },
+        "indicators": {
+            "rsi_14": None,
+            "atr_14": None,
+            "ema_20": None,
+            "ema_50": None,
+            "vwap": None
+        },
+        "macro": {
+            "dxy_bias": "unknown",
+            "yields_bias": "unknown",
+            "calendar_provider": os.getenv("CALENDAR_PROVIDER", "unknown"),
+            "news_risk": "unknown"
+        },
+        "latest_signal": {},
+        "bridge_status": {},
+        "analysis_instruction": "Daily overview endpoint active. Enrich with live scan, candles, calendar and signal data.",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
