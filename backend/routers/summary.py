@@ -302,13 +302,18 @@ def _ict_section(db: Session) -> dict:
         if not ict:
             return {"score": None}
         return {
-            "score":             ict.score,
-            "posture":           ict.posture,
-            "po3_phase":         ict.po3_phase,
-            "daily_open_bias":   ict.daily_open_bias,
-            "pd_zone":           ict.pd_zone,
-            "judas_detected":    ict.judas_detected,
-            "blocking_factors":  ict.blocking_factors,
+            "score":            ict.score,
+            "posture":          ict.posture,
+            "po3_phase":        ict.po3.phase if ict.po3 else None,
+            "po3_score":        ict.po3.score if ict.po3 else None,
+            "daily_open_bias":  ict.daily_open.bias if ict.daily_open else None,
+            "daily_open_aligned": ict.daily_open.aligned if ict.daily_open else None,
+            "pd_position":      ict.premium_discount.position if ict.premium_discount else None,
+            "pd_aligned":       ict.premium_discount.aligned if ict.premium_discount else None,
+            "judas_in_window":  ict.judas.in_window if ict.judas else None,
+            "judas_detected":   ict.judas.judas_detected if ict.judas else None,
+            "blocking":         ict.blocking,
+            "summary":          ict.summary,
         }
     except Exception as exc:
         return {"error": str(exc)}
