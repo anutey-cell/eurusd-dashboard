@@ -220,7 +220,6 @@ def daily_overview() -> dict[str, Any]:
         "mt5_tick": first_ok(
             "mt5_tick",
             [
-                "/mt5/tick/XAUUSD",
                 "/mt5/tick/XAU/USD",
             ],
         ),
