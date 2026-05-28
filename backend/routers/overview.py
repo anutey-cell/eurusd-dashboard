@@ -1,161 +1,235 @@
 from __future__ import annotations
 
+import json
+import os
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import APIRouter
 
 router = APIRouter(prefix="/overview", tags=["overview"])
 
+LOCAL_API_BASE = os.getenv("OVERVIEW_INTERNAL_API_BASE", "http://127.0.0.1:8000/api/v1")
 
-def safe_call(name: str, fn: Callable[[], Any]) -> dict[str, Any]:
+
+def fetch_json(path: str, *, headers: dict[str, str] | None = None, timeout: int = 8) -> dict[str, Any]:
     """
-    Prevent one failing engine component from breaking the whole overview endpoint.
+    Fetch an internal API endpoint from the same backend container.
+    This avoids directly importing route functions that may require Request, Depends, DB sessions, or headers.
     """
+    url = f"{LOCAL_API_BASE}{path}"
+
+    request = urllib.request.Request(
+        url,
+        headers=headers or {},
+        method="GET",
+    )
+
     try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            return {
+                "status": "ok",
+                "url": url,
+                "http_status": response.status,
+                "data": json.loads(raw) if raw else None,
+                "error": None,
+            }
+
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8")
+        except Exception:
+            body = ""
+
         return {
-            "status": "ok",
-            "data": fn(),
-            "error": None,
+            "status": "error",
+            "url": url,
+            "http_status": exc.code,
+            "data": None,
+            "error": body or str(exc),
         }
+
     except Exception as exc:
         return {
             "status": "error",
+            "url": url,
+            "http_status": None,
             "data": None,
-            "error": f"{name}: {type(exc).__name__}: {exc}",
+            "error": f"{type(exc).__name__}: {exc}",
         }
 
 
-def try_import(path: str, attr: str):
+def first_ok(name: str, paths: list[str], *, headers: dict[str, str] | None = None) -> dict[str, Any]:
     """
-    Soft import helper so this endpoint remains resilient even if a service name changes.
+    Try several likely endpoint paths and return the first successful response.
+    This is useful while route paths are being normalized.
     """
-    try:
-        module = __import__(path, fromlist=[attr])
-        return getattr(module, attr)
-    except Exception:
-        return None
+    attempts = []
+
+    for path in paths:
+        result = fetch_json(path, headers=headers)
+        attempts.append(result)
+
+        if result.get("status") == "ok":
+            return {
+                "status": "ok",
+                "source": path,
+                "data": result.get("data"),
+                "attempts": attempts,
+            }
+
+    return {
+        "status": "error",
+        "source": None,
+        "data": None,
+        "attempts": attempts,
+        "error": f"No working endpoint found for {name}",
+    }
 
 
 @router.get("/daily", summary="Daily XAU/USD institutional overview")
 def daily_overview() -> dict[str, Any]:
     """
-    Aggregated daily overview for ChatGPT / analyst review.
+    Aggregated daily overview for XAU/USD.
 
-    This endpoint intentionally pulls from the existing engine layers where possible:
-    candles, scan, signal, kill zones, calendar risk, bridge status, and MT5 status.
-    If a component fails, the endpoint still returns the rest of the overview.
+    This endpoint pulls from existing backend routes:
+    - health
+    - candles
+    - scan
+    - signal
+    - kill zones
+    - calendar
+    - bridge
+    - MT5
     """
 
-    # --- Soft-load existing service functions/classes if available ---
-    # These names may need adjustment depending on your actual service function names.
-    # The safe fallback keeps the endpoint alive even before deeper integration.
+    bridge_secret = os.getenv("MT5_BRIDGE_SHARED_SECRET", "")
+    bridge_headers = {"X-Bridge-Secret": bridge_secret} if bridge_secret else {}
 
-    # Candle/live data
-    get_live_snapshot = (
-        try_import("services.live_feed", "get_live_snapshot")
-        or try_import("services.candle_provider", "get_live_snapshot")
-        or try_import("services.candle_provider", "get_candle_snapshot")
-    )
-
-    # Institutional scanner
-    run_scan = (
-        try_import("services.institutional_scanner", "run_scan")
-        or try_import("services.institutional_scanner", "run_fresh_scan")
-        or try_import("services.institutional_scanner", "scan_xauusd")
-    )
-
-    # Signal engine
-    get_latest_signal = (
-        try_import("services.signal_engine", "get_latest_signal")
-        or try_import("services.dual_engine_runner", "get_latest_signal")
-        or try_import("services.alert_service", "get_latest_signal")
-    )
-
-    # Kill zones
-    get_killzone_status = (
-        try_import("services.killzone_analyzer", "get_killzone_status")
-        or try_import("services.killzone_policy", "get_killzone_status")
-        or try_import("services.killzone_analyzer", "analyze_current_killzone")
-    )
-
-    # Calendar/news risk
-    get_calendar_risk = (
-        try_import("services.calendar_provider", "get_calendar_risk")
-        or try_import("services.calendar_provider", "get_today_calendar")
-        or try_import("services.myfxbook_provider", "get_calendar_risk")
-    )
-
-    # Bridge status
-    get_bridge_status = (
-        try_import("services.broker_provider", "get_bridge_status")
-        or try_import("services.auto_executor", "get_bridge_status")
-    )
-
-    # MT5 status
-    get_mt5_status = (
-        try_import("services.mt5_provider", "get_status")
-        or try_import("services.mt5_provider", "get_mt5_status")
-    )
-
-    overview = {
+    payload = {
         "status": "ok",
         "instrument": "XAU/USD",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "candles": safe_call(
-            "candles",
-            lambda: get_live_snapshot() if get_live_snapshot else {
-                "status": "not_wired",
-                "message": "No live candle snapshot function detected yet.",
-            },
+
+        "health": first_ok(
+            "health",
+            [
+                "/health",
+            ],
         ),
-        "latest_scan": safe_call(
+
+        "candles": {
+            "m15": first_ok(
+                "candles_m15",
+                [
+                    "/candles?pair=XAUUSD&timeframe=M15&limit=120",
+                    "/candles?symbol=XAUUSD&timeframe=M15&limit=120",
+                    "/candles/XAUUSD?timeframe=M15&limit=120",
+                    "/candles/XAU/USD?timeframe=M15&limit=120",
+                ],
+            ),
+            "h1": first_ok(
+                "candles_h1",
+                [
+                    "/candles?pair=XAUUSD&timeframe=H1&limit=120",
+                    "/candles?symbol=XAUUSD&timeframe=H1&limit=120",
+                    "/candles/XAUUSD?timeframe=H1&limit=120",
+                    "/candles/XAU/USD?timeframe=H1&limit=120",
+                ],
+            ),
+            "h4": first_ok(
+                "candles_h4",
+                [
+                    "/candles?pair=XAUUSD&timeframe=H4&limit=120",
+                    "/candles?symbol=XAUUSD&timeframe=H4&limit=120",
+                    "/candles/XAUUSD?timeframe=H4&limit=120",
+                    "/candles/XAU/USD?timeframe=H4&limit=120",
+                ],
+            ),
+            "daily": first_ok(
+                "candles_daily",
+                [
+                    "/candles?pair=XAUUSD&timeframe=D1&limit=80",
+                    "/candles?symbol=XAUUSD&timeframe=D1&limit=80",
+                    "/candles/XAUUSD?timeframe=D1&limit=80",
+                    "/candles/XAU/USD?timeframe=D1&limit=80",
+                ],
+            ),
+        },
+
+        "latest_scan": first_ok(
             "latest_scan",
-            lambda: run_scan() if run_scan else {
-                "status": "not_wired",
-                "message": "No scanner function detected yet.",
-            },
+            [
+                "/scan/status",
+                "/scan/xauusd",
+                "/scan",
+                "/market-view/xauusd",
+                "/scan/market-view/xauusd",
+            ],
         ),
-        "latest_signal": safe_call(
+
+        "latest_signal": first_ok(
             "latest_signal",
-            lambda: get_latest_signal() if get_latest_signal else {
-                "status": "not_wired",
-                "message": "No latest signal function detected yet.",
-            },
+            [
+                "/signal/current",
+                "/signal",
+                "/signal/history?limit=1",
+                "/signal/db/history?limit=1",
+            ],
         ),
-        "killzones": safe_call(
+
+        "killzones": first_ok(
             "killzones",
-            lambda: get_killzone_status() if get_killzone_status else {
-                "status": "not_wired",
-                "message": "No kill-zone status function detected yet.",
-            },
+            [
+                "/killzones/current",
+                "/killzones/edge",
+                "/killzones",
+            ],
         ),
-        "calendar_risk": safe_call(
-            "calendar_risk",
-            lambda: get_calendar_risk() if get_calendar_risk else {
-                "status": "not_wired",
-                "message": "No calendar risk function detected yet.",
-            },
+
+        "calendar_risk": first_ok(
+            "calendar",
+            [
+                "/calendar",
+                "/calendar?impact=high",
+                "/calendar/today",
+            ],
         ),
-        "bridge_status": safe_call(
+
+        "bridge_status": first_ok(
             "bridge_status",
-            lambda: get_bridge_status() if get_bridge_status else {
-                "status": "not_wired",
-                "message": "No bridge status function detected yet.",
-            },
+            [
+                "/bridge/status",
+                "/bridge/health",
+            ],
+            headers=bridge_headers,
         ),
-        "mt5_status": safe_call(
+
+        "mt5_status": first_ok(
             "mt5_status",
-            lambda: get_mt5_status() if get_mt5_status else {
-                "status": "not_wired",
-                "message": "No MT5 status function detected yet.",
-            },
+            [
+                "/mt5/status",
+                "/mt5/positions",
+            ],
         ),
-        "daily_analysis_hint": (
-            "Use candles, scan, signal, killzones, calendar_risk, bridge_status, "
-            "and mt5_status to produce daily XAU/USD institutional overview. "
-            "If any component is not_wired, inspect the matching router/service and connect the correct function."
+
+        "mt5_tick": first_ok(
+            "mt5_tick",
+            [
+                "/mt5/tick/XAUUSD",
+                "/mt5/tick/XAU/USD",
+            ],
+        ),
+
+        "analysis_instruction": (
+            "Use this overview to produce a daily institutional XAU/USD briefing. "
+            "Prioritize market structure, liquidity, session context, calendar risk, "
+            "latest signal quality, bridge heartbeat, and MT5 demo execution readiness."
         ),
     }
 
-    return overview
+    return payload
