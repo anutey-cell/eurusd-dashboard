@@ -14,27 +14,29 @@ router = APIRouter(prefix="/overview", tags=["overview"])
 LOCAL_API_BASE = os.getenv("OVERVIEW_INTERNAL_API_BASE", "http://127.0.0.1:8000/api/v1")
 
 
-def fetch_json(path: str, *, headers: dict[str, str] | None = None, timeout: int = 8) -> dict[str, Any]:
+def fetch_json(path: str, *, headers: dict[str, str] | None = None, timeout: int = 10) -> dict[str, Any]:
     """
-    Fetch an internal API endpoint from the same backend container.
-    This avoids directly importing route functions that may require Request, Depends, DB sessions, or headers.
+    Fetch an internal VPS/backend API endpoint.
+    This overview endpoint must not depend on the laptop-local MT5 bridge.
     """
     url = f"{LOCAL_API_BASE}{path}"
 
-    request = urllib.request.Request(
+    req = urllib.request.Request(
         url,
         headers=headers or {},
         method="GET",
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            raw = res.read().decode("utf-8")
+            data = json.loads(raw) if raw else None
+
             return {
-                "status": "ok",
-                "url": url,
-                "http_status": response.status,
-                "data": json.loads(raw) if raw else None,
+                "ok": True,
+                "source": path,
+                "http_status": res.status,
+                "data": data,
                 "error": None,
             }
 
@@ -46,8 +48,8 @@ def fetch_json(path: str, *, headers: dict[str, str] | None = None, timeout: int
             body = ""
 
         return {
-            "status": "error",
-            "url": url,
+            "ok": False,
+            "source": path,
             "http_status": exc.code,
             "data": None,
             "error": body or str(exc),
@@ -55,35 +57,37 @@ def fetch_json(path: str, *, headers: dict[str, str] | None = None, timeout: int
 
     except Exception as exc:
         return {
-            "status": "error",
-            "url": url,
+            "ok": False,
+            "source": path,
             "http_status": None,
             "data": None,
             "error": f"{type(exc).__name__}: {exc}",
         }
 
 
-def first_ok(name: str, paths: list[str], *, headers: dict[str, str] | None = None) -> dict[str, Any]:
+def first_working(name: str, paths: list[str], *, headers: dict[str, str] | None = None) -> dict[str, Any]:
     """
-    Try several likely endpoint paths and return the first successful response.
-    This is useful while route paths are being normalized.
+    Try multiple possible route paths and return the first successful one.
+    Keeps deployment resilient while route names are being normalized.
     """
-    attempts = []
+    attempts: list[dict[str, Any]] = []
 
     for path in paths:
         result = fetch_json(path, headers=headers)
         attempts.append(result)
 
-        if result.get("status") == "ok":
+        if result["ok"]:
             return {
                 "status": "ok",
-                "source": path,
-                "data": result.get("data"),
+                "name": name,
+                "source": result["source"],
+                "data": result["data"],
                 "attempts": attempts,
             }
 
     return {
-        "status": "error",
+        "status": "unavailable",
+        "name": name,
         "source": None,
         "data": None,
         "attempts": attempts,
@@ -91,144 +95,192 @@ def first_ok(name: str, paths: list[str], *, headers: dict[str, str] | None = No
     }
 
 
+def extract_health(health_block: dict[str, Any]) -> dict[str, Any]:
+    data = health_block.get("data") or {}
+
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
+        data = data["data"]
+
+    return {
+        "status": data.get("status"),
+        "instrument": data.get("instrument"),
+        "data_mode": data.get("data_mode"),
+        "database": data.get("database"),
+        "fx_provider": data.get("fx_provider"),
+        "calendar_provider": data.get("calendar_provider"),
+        "broker_execution_enabled": data.get("broker_execution_enabled"),
+        "timestamp": data.get("timestamp"),
+    }
+
+
 @router.get("/daily", summary="Daily XAU/USD institutional overview")
 def daily_overview() -> dict[str, Any]:
     """
-    Aggregated daily overview for XAU/USD.
+    Public daily overview for ChatGPT / analyst review.
 
-    This endpoint pulls from existing backend routes:
-    - health
-    - candles
-    - scan
-    - signal
-    - kill zones
-    - calendar
-    - bridge
-    - MT5
+    Design principle:
+    - VPS data is the source for public overview.
+    - Laptop MT5 bridge remains local execution/backup price feed.
+    - This endpoint should be safely fetchable from ChatGPT.
     """
 
-    bridge_secret = os.getenv("MT5_BRIDGE_SHARED_SECRET", "")
+    bridge_secret = os.getenv("MT5_BRIDGE_SHARED_SECRET", "").strip()
     bridge_headers = {"X-Bridge-Secret": bridge_secret} if bridge_secret else {}
 
-    payload = {
+    health = first_working(
+        "health",
+        [
+            "/health",
+        ],
+    )
+
+    # Keep paths flexible until exact router paths are normalized.
+    candles_m15 = first_working(
+        "candles_m15",
+        [
+            "/candles?pair=XAUUSD&timeframe=M15&limit=120",
+            "/candles?pair=XAU/USD&timeframe=M15&limit=120",
+            "/candles?symbol=XAUUSD&timeframe=M15&limit=120",
+            "/candles/XAUUSD?timeframe=M15&limit=120",
+            "/candles/XAUUSD/M15?limit=120",
+        ],
+    )
+
+    candles_h1 = first_working(
+        "candles_h1",
+        [
+            "/candles?pair=XAUUSD&timeframe=H1&limit=120",
+            "/candles?pair=XAU/USD&timeframe=H1&limit=120",
+            "/candles?symbol=XAUUSD&timeframe=H1&limit=120",
+            "/candles/XAUUSD?timeframe=H1&limit=120",
+            "/candles/XAUUSD/H1?limit=120",
+        ],
+    )
+
+    candles_h4 = first_working(
+        "candles_h4",
+        [
+            "/candles?pair=XAUUSD&timeframe=H4&limit=120",
+            "/candles?pair=XAU/USD&timeframe=H4&limit=120",
+            "/candles?symbol=XAUUSD&timeframe=H4&limit=120",
+            "/candles/XAUUSD?timeframe=H4&limit=120",
+            "/candles/XAUUSD/H4?limit=120",
+        ],
+    )
+
+    candles_d1 = first_working(
+        "candles_d1",
+        [
+            "/candles?pair=XAUUSD&timeframe=D1&limit=80",
+            "/candles?pair=XAU/USD&timeframe=D1&limit=80",
+            "/candles?symbol=XAUUSD&timeframe=D1&limit=80",
+            "/candles/XAUUSD?timeframe=D1&limit=80",
+            "/candles/XAUUSD/D1?limit=80",
+        ],
+    )
+
+    latest_scan = first_working(
+        "latest_scan",
+        [
+            "/scan/status",
+            "/scan/xauusd",
+            "/scan",
+            "/scan/market-view/xauusd",
+            "/market-view/xauusd",
+        ],
+    )
+
+    latest_signal = first_working(
+        "latest_signal",
+        [
+            "/signal/current",
+            "/signal",
+            "/signal/history?limit=1",
+            "/signal/db/history?limit=1",
+        ],
+    )
+
+    calendar_risk = first_working(
+        "calendar_risk",
+        [
+            "/calendar",
+            "/calendar?impact=high",
+            "/calendar/today",
+        ],
+    )
+
+    killzone = first_working(
+        "killzone",
+        [
+            "/killzones/current",
+            "/killzones/edge",
+            "/killzones",
+        ],
+    )
+
+    bridge_status = first_working(
+        "bridge_status",
+        [
+            "/bridge/status",
+            "/bridge/health",
+        ],
+        headers=bridge_headers,
+    )
+
+    health_summary = extract_health(health)
+
+    execution_readiness = {
+        "mode": "demo",
+        "lot_size": 0.01,
+        "broker_execution_enabled": health_summary.get("broker_execution_enabled"),
+        "live_execution_allowed": False,
+        "laptop_bridge_required_for_mt5_execution": True,
+        "note": (
+            "Dashboard may scan and alert from VPS. MT5 execution requires laptop bridge "
+            "or Windows VPS bridge to be running."
+        ),
+    }
+
+    return {
         "status": "ok",
         "instrument": "XAU/USD",
         "timestamp": datetime.now(timezone.utc).isoformat(),
 
-        "health": first_ok(
-            "health",
-            [
-                "/health",
-            ],
-        ),
+        "health": health_summary,
 
-        "candles": {
-            "m15": first_ok(
-                "candles_m15",
-                [
-                    "/candles?pair=XAUUSD&timeframe=M15&limit=120",
-                    "/candles?symbol=XAUUSD&timeframe=M15&limit=120",
-                    "/candles/XAUUSD?timeframe=M15&limit=120",
-                    "/candles/XAU/USD?timeframe=M15&limit=120",
-                ],
-            ),
-            "h1": first_ok(
-                "candles_h1",
-                [
-                    "/candles?pair=XAUUSD&timeframe=H1&limit=120",
-                    "/candles?symbol=XAUUSD&timeframe=H1&limit=120",
-                    "/candles/XAUUSD?timeframe=H1&limit=120",
-                    "/candles/XAU/USD?timeframe=H1&limit=120",
-                ],
-            ),
-            "h4": first_ok(
-                "candles_h4",
-                [
-                    "/candles?pair=XAUUSD&timeframe=H4&limit=120",
-                    "/candles?symbol=XAUUSD&timeframe=H4&limit=120",
-                    "/candles/XAUUSD?timeframe=H4&limit=120",
-                    "/candles/XAU/USD?timeframe=H4&limit=120",
-                ],
-            ),
-            "daily": first_ok(
-                "candles_daily",
-                [
-                    "/candles?pair=XAUUSD&timeframe=D1&limit=80",
-                    "/candles?symbol=XAUUSD&timeframe=D1&limit=80",
-                    "/candles/XAUUSD?timeframe=D1&limit=80",
-                    "/candles/XAU/USD?timeframe=D1&limit=80",
-                ],
-            ),
+        "market_data": {
+            "source": health_summary.get("fx_provider") or "twelvedata",
+            "candles": {
+                "m15": candles_m15,
+                "h1": candles_h1,
+                "h4": candles_h4,
+                "d1": candles_d1,
+            },
         },
 
-        "latest_scan": first_ok(
-            "latest_scan",
-            [
-                "/scan/status",
-                "/scan/xauusd",
-                "/scan",
-                "/market-view/xauusd",
-                "/scan/market-view/xauusd",
-            ],
-        ),
+        "latest_scan": latest_scan,
+        "latest_signal": latest_signal,
+        "calendar_risk": calendar_risk,
+        "killzone": killzone,
+        "bridge_status": bridge_status,
+        "execution_readiness": execution_readiness,
 
-        "latest_signal": first_ok(
-            "latest_signal",
-            [
-                "/signal/current",
-                "/signal",
-                "/signal/history?limit=1",
-                "/signal/db/history?limit=1",
+        "analysis_contract": {
+            "purpose": "Provide ChatGPT with one public VPS endpoint for daily XAU/USD overview.",
+            "chatgpt_can_use_this": True,
+            "depends_on_laptop_localhost": False,
+            "laptop_bridge_role": "MT5 execution and backup Exness price feed only.",
+            "expected_analysis": [
+                "daily bias",
+                "market structure",
+                "liquidity zones",
+                "latest scan/signal quality",
+                "calendar/news risk",
+                "kill-zone context",
+                "execution readiness",
+                "long scenario",
+                "short scenario",
+                "stand-aside condition",
             ],
-        ),
-
-        "killzones": first_ok(
-            "killzones",
-            [
-                "/killzones/current",
-                "/killzones/edge",
-                "/killzones",
-            ],
-        ),
-
-        "calendar_risk": first_ok(
-            "calendar",
-            [
-                "/calendar",
-                "/calendar?impact=high",
-                "/calendar/today",
-            ],
-        ),
-
-        "bridge_status": first_ok(
-            "bridge_status",
-            [
-                "/bridge/status",
-                "/bridge/health",
-            ],
-            headers=bridge_headers,
-        ),
-
-        "mt5_status": first_ok(
-            "mt5_status",
-            [
-                "/mt5/status",
-                "/mt5/positions",
-            ],
-        ),
-
-        "mt5_tick": first_ok(
-            "mt5_tick",
-            [
-                "/mt5/tick/XAU/USD",
-            ],
-        ),
-
-        "analysis_instruction": (
-            "Use this overview to produce a daily institutional XAU/USD briefing. "
-            "Prioritize market structure, liquidity, session context, calendar risk, "
-            "latest signal quality, bridge heartbeat, and MT5 demo execution readiness."
-        ),
+        },
     }
-
-    return payload
