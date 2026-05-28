@@ -37,16 +37,26 @@ from services.strategist import (
 log = logging.getLogger(__name__)
 
 # ── Dedupe state ─────────────────────────────────────────────────────────────
-_last_alert_fingerprint:    str   = ""
-_last_alert_at:             float = 0.0
+# Tracks the LAST alert we actually fired (not just the last verdict). Used to
+# detect direction-flips and score-escalations so we can bypass cooldown when
+# something materially changes vs the prior alert.
+_last_alert: dict = {
+    "decision":           None,    # "BUY" | "SELL" | None
+    "execution_band":     None,    # "actionable" | "watchlist" | None
+    "conditions_passed":  0,
+    "sent_at":            0.0,
+}
 _last_standby_fingerprint:  str   = ""
 _last_standby_at:           float = 0.0
 _last_enqueue_fingerprint:  str   = ""
 _last_enqueue_at:           float = 0.0
 
-_ALERT_COOLDOWN_S    = 600.0    # 10 min for BUY/SELL alerts
-_STANDBY_COOLDOWN_S  = 3600.0   # 60 min for STAND ASIDE info alerts
-_ENQUEUE_COOLDOWN_S  = 600.0    # 10 min for same-plan re-enqueue
+# Cooldowns by signal band — addresses 92% duplicate noise audit finding
+_COOLDOWN_S_5OF5         = 600.0     # 10 min — high-conviction
+_COOLDOWN_S_4OF5         = 600.0     # 10 min — actionable
+_COOLDOWN_S_3OF5         = 3600.0    # 60 min — watchlist (was 10 min, too noisy)
+_STANDBY_COOLDOWN_S      = 3600.0    # 60 min for STAND ASIDE info alerts
+_ENQUEUE_COOLDOWN_S      = 600.0     # 10 min for same-plan re-enqueue
 
 
 # ── Public entry point ───────────────────────────────────────────────────────
@@ -73,40 +83,133 @@ def run_once(db: Session) -> dict:
 
 # ── Telegram side-effect ─────────────────────────────────────────────────────
 
+def _execution_band(execution_status: str) -> str:
+    """Collapse execution_status into one of three bands for dedupe purposes."""
+    if execution_status == "DEMO_TRADE_PLACED":
+        return "actionable"
+    if execution_status == "SIGNAL_ONLY":
+        return "watchlist"
+    return "blocked"     # BRIDGE_OFFLINE / SPREAD_TOO_HIGH / NEWS_RISK_BLOCKED / etc.
+
+
+def _cooldown_for(conditions_passed: int) -> float:
+    """Pick cooldown based on signal quality band."""
+    if conditions_passed >= 5: return _COOLDOWN_S_5OF5
+    if conditions_passed >= 4: return _COOLDOWN_S_4OF5
+    return _COOLDOWN_S_3OF5
+
+
 def _maybe_fire_alert(verdict: dict) -> None:
-    """Fire the mandate-format Telegram alert if cooldown allows."""
-    global _last_alert_fingerprint, _last_alert_at
-    global _last_standby_fingerprint, _last_standby_at
+    """
+    Smart alert dispatcher with quality-band cooldowns + transition detection.
+
+    Rules:
+      1. STAND ASIDE after we previously alerted BUY/SELL → fire invalidation
+         (one-shot, bypasses cooldown).
+      2. BUY/SELL with direction-flip vs last alert → fire immediately
+         (bypasses cooldown — meaningful market change).
+      3. BUY/SELL with score escalation (e.g. 3/5 → 4/5) → fire immediately
+         (bypasses cooldown — quality improved).
+      4. Otherwise apply band-specific cooldown:
+            5/5 actionable: 10 min
+            4/5 actionable: 10 min
+            3/5 watchlist : 60 min  ← the fix
+      5. Blocked executions (BRIDGE_OFFLINE etc.) — no separate alert,
+         the signal alert itself carries the status.
+    """
+    global _last_alert, _last_standby_fingerprint, _last_standby_at
 
     decision = verdict.get("decision")
     es       = verdict.get("execution_status")
-    tp       = verdict.get("trade_plan") or {}
+    cp       = verdict.get("conditions_passed", 0)
 
     try:
-        if decision in ("BUY", "SELL"):
-            if not (verdict.get("execution_permission") or {}).get("allow_alert"):
+        # ── Path 1: STAND ASIDE — handle invalidation + optional standby alerts ──
+        if decision == "STAND ASIDE":
+            # If we recently alerted BUY/SELL and now we're flat → invalidation
+            if _last_alert["decision"] in ("BUY", "SELL"):
+                _send_plain(_format_invalidation(verdict, prior=_last_alert))
+                log.info("[strategist_runner] invalidation alert fired (was %s, now STAND ASIDE)",
+                         _last_alert["decision"])
+                # Clear the prior alert state — invalidation is one-shot
+                _last_alert = {"decision": None, "execution_band": None,
+                               "conditions_passed": 0, "sent_at": time.time()}
                 return
-            fp = f"{decision}|{tp.get('entry')}|{tp.get('stop_loss')}|{es}"
-            if fp != _last_alert_fingerprint or (time.time() - _last_alert_at) > _ALERT_COOLDOWN_S:
-                long_pct, short_pct = _fetch_sentiment()
-                msg = format_mandate_signal_message(
-                    verdict,
-                    long_pct=long_pct, short_pct=short_pct,
-                )
-                _send_plain(msg)
-                _last_alert_fingerprint = fp
-                _last_alert_at          = time.time()
-        elif decision == "STAND ASIDE":
+
+            # Optional standby informational alert
             if not getattr(settings, "telegram_standby_alerts", False):
                 return
-            fp = f"STANDBY|{verdict.get('execution_status_reason')}|{verdict.get('conditions_passed')}"
-            if fp != _last_standby_fingerprint or (time.time() - _last_standby_at) > _STANDBY_COOLDOWN_S:
+            fp = f"STANDBY|{verdict.get('execution_status_reason')}|{cp}"
+            if (fp != _last_standby_fingerprint
+                    or (time.time() - _last_standby_at) > _STANDBY_COOLDOWN_S):
                 msg = format_mandate_stand_aside_message(verdict)
                 _send_plain(msg)
                 _last_standby_fingerprint = fp
                 _last_standby_at          = time.time()
+            return
+
+        # ── Path 2: BUY / SELL ──────────────────────────────────────────
+        if decision not in ("BUY", "SELL"):
+            return
+        if not (verdict.get("execution_permission") or {}).get("allow_alert"):
+            return
+
+        band = _execution_band(es)
+        prior_decision = _last_alert["decision"]
+        prior_cp       = _last_alert["conditions_passed"] or 0
+        elapsed        = time.time() - _last_alert["sent_at"]
+        cooldown       = _cooldown_for(cp)
+
+        # Bypass cooldown if direction flipped (BUY→SELL or first alert after STAND ASIDE)
+        bypass_flip      = prior_decision and prior_decision != decision
+        # Bypass cooldown if score escalated to a higher quality band
+        bypass_escalate  = cp > prior_cp and prior_decision == decision
+
+        if not bypass_flip and not bypass_escalate and elapsed < cooldown:
+            log.debug("[strategist_runner] alert suppressed — cooldown (%.0fs/%.0fs band=%s)",
+                      elapsed, cooldown, band)
+            return
+
+        # ── Fire ───────────────────────────────────────────────────────
+        long_pct, short_pct = _fetch_sentiment()
+        msg = format_mandate_signal_message(verdict, long_pct=long_pct, short_pct=short_pct)
+        _send_plain(msg)
+        reason = ("flip" if bypass_flip else "escalate" if bypass_escalate else "cooldown_expired")
+        log.info("[strategist_runner] alert fired %s/%d (band=%s, reason=%s)",
+                 decision, cp, band, reason)
+        _last_alert = {
+            "decision":          decision,
+            "execution_band":    band,
+            "conditions_passed": cp,
+            "sent_at":           time.time(),
+        }
     except Exception as exc:
         log.debug("[strategist_runner] alert hook failed (non-fatal): %s", exc)
+
+
+def _format_invalidation(verdict: dict, *, prior: dict) -> str:
+    """
+    One-shot 'previous signal cancelled' alert.
+    Tells the operator the BUY/SELL signal they got is no longer valid.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M GMT")
+    reason = verdict.get("execution_status_reason") or "Conditions no longer met"
+    arrow = "🟢→⚪" if prior["decision"] == "BUY" else "🔴→⚪"
+    return (
+        f"⚠️ XAUUSD SIGNAL INVALIDATED ⚠️\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Previous: {arrow} {prior['decision']} ({prior['conditions_passed']}/5)\n"
+        f"Now:      ⚪ STAND ASIDE ({verdict.get('conditions_passed', 0)}/5)\n"
+        f"Reason:   {reason}\n"
+        f"\n"
+        f"If you opened a manual trade on the prior signal:\n"
+        f"  • Move SL to entry (breakeven) if not already\n"
+        f"  • Consider closing — confluence has broken\n"
+        f"\n"
+        f"Time: {now}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Capital preservation > revenge."
+    )
 
 
 def _fetch_sentiment() -> tuple[float | None, float | None]:
