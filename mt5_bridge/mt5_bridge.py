@@ -71,22 +71,37 @@ TF_MAP = {
 # ── MT5 connection ─────────────────────────────────────────────────────────────
 
 def _connect() -> bool:
-    if not mt5.initialize():
-        log.error("MT5 initialize() failed — is MetaTrader 5 installed?")
-        return False
-    if MT5_LOGIN:
-        ok = mt5.login(MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER)
-        if not ok:
-            info = mt5.last_error()
-            log.error("MT5 login failed: %s", info)
-            return False
-        log.info("MT5 connected — login=%s server=%s", MT5_LOGIN, MT5_SERVER)
+    MT5_PATH = os.getenv("MT5_PATH", "").strip()
+
+    if MT5_PATH:
+        mt5_ok = mt5.initialize(path=MT5_PATH)
     else:
-        log.warning("MT5_LOGIN not set — using already-open terminal session")
+        mt5_ok = mt5.initialize()
+
+    if not mt5_ok:
+        log.error("MT5 initialize() failed — is MetaTrader 5 installed?")
+        log.error("MT5 last_error: %s", mt5.last_error())
+        return False
+
+    log.info("MT5 initialized successfully")
+
+    account = mt5.account_info()
+    if account is None:
+       log.error("MT5 initialized but no logged-in account session found.")
+       log.error("Open MT5 manually and log into the demo account, then restart this bridge.")
+       return False
+
+    log.info(
+       "MT5 session active — login=%s server=%s balance=%.2f currency=%s",
+       account.login,
+       account.server,
+       account.balance,
+       account.currency,
+)
+
     return True
 
-
-connected = _connect()
+MT5_CONNECTED = _connect()
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
@@ -102,7 +117,7 @@ def _ok(data) -> JSONResponse:
 
 
 def _resolve_symbol(pair: str) -> str:
-    """Convert pair code (eurusd) to broker symbol (EURUSDm). Auto-detects suffix."""
+    """Convert pair code (xauusd) to broker symbol (XAUUSDm). Auto-detects suffix."""
     base = pair.upper()
     # Try exact first
     if mt5.symbol_info(base):
@@ -122,17 +137,23 @@ def _resolve_symbol(pair: str) -> str:
 
 @app.get("/health")
 def health():
-    info = mt5.terminal_info()
     account = mt5.account_info()
-    return _ok({
-        "mt5_connected":  connected,
-        "terminal_build": getattr(info, 'build', None) if info else None,
-        "server":         getattr(account, 'server', None) if account else MT5_SERVER,
-        "login":          getattr(account, 'login', None) if account else MT5_LOGIN,
-        "currency":       getattr(account, 'currency', None) if account else None,
-        "balance":        getattr(account, 'balance', None) if account else None,
-    })
+    tick = mt5.symbol_info_tick("XAUUSD")
 
+    return {
+        "status": "ok",
+        "mt5_connected": account is not None,
+        "account": {
+            "login": account.login,
+            "server": account.server,
+            "balance": account.balance,
+            "equity": account.equity,
+            "currency": account.currency,
+            "trade_allowed": account.trade_allowed,
+            "trade_expert": account.trade_expert,
+        } if account else None,
+        "xauusd_tick_available": tick is not None,
+    }
 
 @app.get("/pairs")
 def pairs():
@@ -147,20 +168,33 @@ def pairs():
 @app.get("/tick/{pair}")
 def tick(pair: str):
     """Latest bid/ask for the given pair."""
-    if not connected:
+    account = mt5.account_info()
+    if account is None:
         raise HTTPException(503, "MT5 bridge not connected")
+
     symbol = _resolve_symbol(pair)
+
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        raise HTTPException(404, f"Symbol not found: {symbol}")
+
+    if not info.visible:
+        mt5.symbol_select(symbol, True)
+
     t = mt5.symbol_info_tick(symbol)
     if t is None:
         raise HTTPException(404, f"No tick data for {symbol} — check symbol name")
+
+    spread_multiplier = 100000 if "usd" in pair.lower() and "xau" not in pair.lower() else 10
+
     return _ok({
-        "pair":    pair.lower(),
-        "symbol":  symbol,
-        "bid":     t.bid,
-        "ask":     t.ask,
-        "spread":  round((t.ask - t.bid) * (100000 if 'usd' in pair.lower() and 'xau' not in pair.lower() else 10), 1),
-        "time":    datetime.fromtimestamp(t.time, tz=timezone.utc).isoformat(),
-        "volume":  t.volume,
+        "pair": pair.lower(),
+        "symbol": symbol,
+        "bid": t.bid,
+        "ask": t.ask,
+        "last": t.last,
+        "time": t.time,
+        "spread": round((t.ask - t.bid) * spread_multiplier, 2),
     })
 
 
@@ -170,7 +204,7 @@ def candles(pair: str, timeframe: str = "H4", limit: int = 300):
     Historical OHLCV candles from MT5.
     Returns up to `limit` completed candles (newest last).
     """
-    if not connected:
+    if mt5.account_info() is None:
         raise HTTPException(503, "MT5 bridge not connected")
     tf_code = TF_MAP.get(timeframe.upper())
     if tf_code is None:
@@ -209,7 +243,7 @@ def multi_candles(pair: str):
     Returns candles for all timeframes needed by the ICT engine in one call:
     D1 (HTF bias), H4 (structure/liquidity), H1 (FVG), M15 (entry timing).
     """
-    if not connected:
+    if mt5.account_info() is None:
         raise HTTPException(503, "MT5 bridge not connected")
     symbol = _resolve_symbol(pair)
     mt5.symbol_select(symbol, True)
