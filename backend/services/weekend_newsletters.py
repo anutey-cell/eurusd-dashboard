@@ -291,33 +291,47 @@ def _build_current_price_block() -> str:
         return f"  Price block error: {exc}"
 
 
-def _sanitize_d1_bars(d1_bars, mad_factor: float = 4.0) -> list:
+def _sanitize_d1_bars(d1_bars, mad_factor: float = 3.0, window: int = 20) -> list:
     """
     Drop bars whose high or low deviates more than mad_factor × MAD from
-    the median close. Catches data-feed glitches like the $5602 spike we
-    saw on 2026-05-22 in an otherwise ~$4500 range.
+    the median close, computed over the RECENT window only. Catches
+    data-feed glitches like the $5602 spike on 2026-01-28 that bled into
+    a current-regime ~$4500 sample.
 
-    Uses Median Absolute Deviation (MAD) rather than std-dev so a single
-    extreme tick can't poison the threshold itself.
+    Two principles:
+      1. Window-restricted — only the last `window` bars define the
+         "normal" range, so old regime-shift bars don't widen the threshold.
+      2. MAD-based — robust to the outliers being filtered (std-dev would
+         let a single extreme tick poison its own detection threshold).
+
+    Tighter factor (3 vs 4) since restricting window already narrows MAD.
     """
-    if len(d1_bars) < 5:
-        return list(d1_bars)
-    closes = sorted(c.close for c in d1_bars)
-    n = len(closes)
-    median = closes[n // 2]
+    bars = list(d1_bars)
+    if len(bars) < 5:
+        return bars
+
+    # Sample for threshold computation = most recent `window` bars
+    recent = bars[-window:] if len(bars) > window else bars
+    closes_sorted = sorted(c.close for c in recent)
+    median = closes_sorted[len(closes_sorted) // 2]
     if median <= 0:
-        return list(d1_bars)
-    deviations = sorted(abs(c.close - median) for c in d1_bars)
-    mad = deviations[len(deviations) // 2] or (median * 0.01)   # floor at 1% of median
+        return bars
+
+    deviations = sorted(abs(c.close - median) for c in recent)
+    mad = deviations[len(deviations) // 2] or (median * 0.01)
     threshold = mad_factor * mad
-    clean = [c for c in d1_bars
+
+    # Apply filter to ALL bars (not just window) — older spike bars get dropped
+    clean = [c for c in bars
              if abs(c.high - median) <= threshold
              and abs(c.low  - median) <= threshold]
-    rejected = len(d1_bars) - len(clean)
+    rejected = len(bars) - len(clean)
     if rejected:
-        log.info("[levels] dropped %d outlier D1 bar(s) (median=%.2f, MAD=%.2f, threshold=%.2f)",
-                 rejected, median, mad, threshold)
-    return clean if len(clean) >= 3 else list(d1_bars)
+        log.info(
+            "[levels] dropped %d outlier D1 bar(s) (median=%.2f, MAD=%.2f, threshold=%.2f)",
+            rejected, median, mad, threshold,
+        )
+    return clean if len(clean) >= 3 else bars
 
 
 def _build_key_levels() -> str:
@@ -329,14 +343,17 @@ def _build_key_levels() -> str:
         if not d1 or not d1.candles:
             return "  Level data unavailable."
 
-        # Filter out bad-tick bars before aggregating
-        clean_d1 = _sanitize_d1_bars(d1.candles)
+        # get_candles can return more than `limit` due to provider quirks.
+        # Slice to last 30 trading days BEFORE sanitizing so the "30-day"
+        # claim is honest and the MAD threshold reflects the recent regime.
+        recent_30 = d1.candles[-30:]
+        clean_d1 = _sanitize_d1_bars(recent_30)
 
         # Last week's H/L (last 5 D1 bars)
         last_week = clean_d1[-5:]
         week_high = max(c.high for c in last_week)
         week_low  = min(c.low  for c in last_week)
-        # Last 30 days range (post-sanitization)
+        # Last 30 trading days range (post-sanitization)
         month_high = max(c.high for c in clean_d1)
         month_low  = min(c.low  for c in clean_d1)
         # Friday's H/L (last full D1 bar)
