@@ -843,8 +843,16 @@ def make_decision(db: Session) -> dict:
         elif gold_macro_bias.startswith("Bullish"): macro_aligned = "Conflicted"
 
     # ── Key liquidity zones (computed) ──────────────────────────────────
-    prev_day_high = round(max(c.high for c in d1[-2:-1]), 2) if len(d1) >= 2 else None
-    prev_day_low  = round(min(c.low  for c in d1[-2:-1]), 2) if len(d1) >= 2 else None
+    # Sanitize D1 first so a single bad-tick bar can't poison the prev-day
+    # reference levels. MAD-based filter rejects bars whose H or L deviates
+    # >4× median absolute deviation from the median close.
+    try:
+        from services.weekend_newsletters import _sanitize_d1_bars
+        clean_d1 = _sanitize_d1_bars(d1) if d1 else []
+    except Exception:
+        clean_d1 = d1 or []
+    prev_day_high = round(max(c.high for c in clean_d1[-2:-1]), 2) if len(clean_d1) >= 2 else None
+    prev_day_low  = round(min(c.low  for c in clean_d1[-2:-1]), 2) if len(clean_d1) >= 2 else None
     today_bars_m15 = [c for c in m15 if (c.time if c.time.tzinfo else c.time.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).date() == now.date()]
     today_high = round(max(c.high for c in today_bars_m15), 2) if today_bars_m15 else None
     today_low  = round(min(c.low  for c in today_bars_m15), 2) if today_bars_m15 else None
