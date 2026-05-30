@@ -139,6 +139,63 @@ def strategist_learnings(
     return APIResponse(data=data, source="strategist_learnings")
 
 
+@router.get(
+    "/newsletter/saturday-recap/preview",
+    response_model=APIResponse[dict],
+    summary="Preview the Saturday weekly-recap newsletter without sending",
+)
+@limiter.limit("10/minute")
+def newsletter_saturday_preview(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from services.weekend_newsletters import build_saturday_recap
+    return APIResponse(data={"message": build_saturday_recap(db)}, source="newsletter:preview")
+
+
+@router.get(
+    "/newsletter/sunday-forecast/preview",
+    response_model=APIResponse[dict],
+    summary="Preview the Sunday week-ahead forecast newsletter without sending",
+)
+@limiter.limit("10/minute")
+def newsletter_sunday_preview(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from services.weekend_newsletters import build_sunday_forecast
+    return APIResponse(data={"message": build_sunday_forecast(db)}, source="newsletter:preview")
+
+
+@router.post(
+    "/newsletter/{kind}/send-now",
+    response_model=APIResponse[dict],
+    summary="Force-send a weekend newsletter (kind=saturday-recap|sunday-forecast)",
+)
+@limiter.limit("3/minute")
+def newsletter_send_now(
+    request: Request,
+    kind: str,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from services.weekend_newsletters import build_saturday_recap, build_sunday_forecast
+    from services.strategist_runner import _send_plain
+    if kind == "saturday-recap":
+        msg = build_saturday_recap(db)
+    elif kind == "sunday-forecast":
+        msg = build_sunday_forecast(db)
+    else:
+        return APIResponse(data={"sent": False, "error": "kind must be saturday-recap | sunday-forecast"})
+    sent = False
+    try:
+        _send_plain(msg)
+        sent = True
+    except Exception as exc:
+        log.warning("[newsletter] send failed: %s", exc)
+    return APIResponse(data={"sent": sent, "kind": kind, "preview": msg[:500] + "..."},
+                       source="newsletter:send")
+
+
 @router.post(
     "/learnings/digest-now",
     response_model=APIResponse[dict],

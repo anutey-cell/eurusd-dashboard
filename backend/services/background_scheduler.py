@@ -361,6 +361,76 @@ def _run_digest_iteration():
         log.warning("[digest] send failed: %s", exc)
 
 
+# ── Weekend newsletter loops ─────────────────────────────────────────────────
+#   Saturday 09:00 UTC → recap newsletter (week just closed)
+#   Sunday   18:00 UTC → forecast newsletter (week ahead, before 22:00 reopen)
+
+NEWSLETTER_CHECK_INTERVAL_SEC = 5 * 60     # poll every 5 minutes
+SATURDAY_RECAP_HOUR_UTC       = 9
+SUNDAY_FORECAST_HOUR_UTC      = 18
+_last_recap_iso_week:    str = ""
+_last_forecast_iso_week: str = ""
+
+
+async def _weekend_newsletter_loop():
+    """
+    Fires the Saturday recap (Sat 09:00 UTC) and Sunday forecast (Sun 18:00 UTC).
+    Both are one-per-week (deduped by ISO week). Gated by the same
+    telegram_hourly_briefing opt-in setting.
+    """
+    log.info("[scheduler] weekend newsletter loop started "
+             "(Sat %02d:00 recap, Sun %02d:00 forecast UTC)",
+             SATURDAY_RECAP_HOUR_UTC, SUNDAY_FORECAST_HOUR_UTC)
+    while True:
+        try:
+            await asyncio.sleep(NEWSLETTER_CHECK_INTERVAL_SEC)
+            await asyncio.to_thread(_run_newsletter_iteration)
+        except asyncio.CancelledError:
+            log.info("[scheduler] weekend newsletter loop cancelled")
+            raise
+        except Exception as exc:
+            log.warning("[scheduler] weekend newsletter loop error: %s", exc)
+
+
+def _run_newsletter_iteration():
+    """Single weekend newsletter check. Fires Sat 09:00 or Sun 18:00 UTC."""
+    global _last_recap_iso_week, _last_forecast_iso_week
+    from config import settings
+    if not getattr(settings, "telegram_hourly_briefing", False):
+        return
+
+    now = datetime.now(timezone.utc)
+    iso = f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
+
+    from database import SessionLocal
+    from services.strategist_runner import _send_plain
+    from services.weekend_newsletters import build_saturday_recap, build_sunday_forecast
+
+    # Saturday recap
+    if (now.weekday() == 5 and now.hour == SATURDAY_RECAP_HOUR_UTC
+            and iso != _last_recap_iso_week):
+        with SessionLocal() as db:
+            try:
+                msg = build_saturday_recap(db)
+                _send_plain(msg)
+                _last_recap_iso_week = iso
+                log.info("[newsletter] Saturday recap sent for %s", iso)
+            except Exception as exc:
+                log.warning("[newsletter] Saturday recap send failed: %s", exc)
+
+    # Sunday forecast
+    if (now.weekday() == 6 and now.hour == SUNDAY_FORECAST_HOUR_UTC
+            and iso != _last_forecast_iso_week):
+        with SessionLocal() as db:
+            try:
+                msg = build_sunday_forecast(db)
+                _send_plain(msg)
+                _last_forecast_iso_week = iso
+                log.info("[newsletter] Sunday forecast sent for %s", iso)
+            except Exception as exc:
+                log.warning("[newsletter] Sunday forecast send failed: %s", exc)
+
+
 def _run_auto_executor_iteration():
     """Single auto-executor iteration (runs in thread)."""
     global _last_auto_attempt
@@ -516,12 +586,13 @@ async def start_background_loops():
     use_mandate = getattr(settings, "use_mandate_strategist", True)
 
     _tasks = [
-        asyncio.create_task(_scanner_loop(),           name="scanner_loop"),
-        asyncio.create_task(_prediction_alert_loop(),  name="prediction_alert_loop"),
-        asyncio.create_task(_drawdown_loop(),          name="drawdown_loop"),
-        asyncio.create_task(_daily_summary_loop(),     name="daily_summary_loop"),
-        asyncio.create_task(_hourly_briefing_loop(),   name="hourly_briefing_loop"),
-        asyncio.create_task(_weekly_digest_loop(),     name="weekly_digest_loop"),
+        asyncio.create_task(_scanner_loop(),               name="scanner_loop"),
+        asyncio.create_task(_prediction_alert_loop(),      name="prediction_alert_loop"),
+        asyncio.create_task(_drawdown_loop(),              name="drawdown_loop"),
+        asyncio.create_task(_daily_summary_loop(),         name="daily_summary_loop"),
+        asyncio.create_task(_hourly_briefing_loop(),       name="hourly_briefing_loop"),
+        asyncio.create_task(_weekly_digest_loop(),         name="weekly_digest_loop"),
+        asyncio.create_task(_weekend_newsletter_loop(),    name="weekend_newsletter_loop"),
     ]
 
     # Pick exactly ONE execution authority — never both, or they'll fight.

@@ -258,8 +258,14 @@ def send_briefing_if_due(db: Session) -> bool:
     """
     global _last_briefing_hour_key
     from config import settings
+    from services.strategist_runner import is_weekend_quiet_hours
 
     if not getattr(settings, "telegram_hourly_briefing", False):
+        return False
+
+    # Weekend gate — hourly briefings pause; Sat recap + Sun forecast take over.
+    if is_weekend_quiet_hours():
+        log.debug("[briefing] suppressed — weekend quiet hours")
         return False
 
     now = datetime.now(timezone.utc)

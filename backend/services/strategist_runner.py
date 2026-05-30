@@ -59,6 +59,23 @@ _STANDBY_COOLDOWN_S      = 3600.0    # 60 min for STAND ASIDE info alerts
 _ENQUEUE_COOLDOWN_S      = 600.0     # 10 min for same-plan re-enqueue
 
 
+def is_weekend_quiet_hours() -> bool:
+    """
+    True during the forex/gold weekend close: Friday 21:00 UTC → Sunday 22:00 UTC.
+    No trade signals, no hourly briefings should fire in this window — the
+    Saturday recap and Sunday forecast newsletters handle weekend comms.
+    """
+    now = datetime.now(timezone.utc)
+    wd = now.weekday()      # Mon=0 … Sat=5, Sun=6
+    if wd == 5:                             # Saturday — always closed
+        return True
+    if wd == 6 and now.hour < 22:           # Sunday before reopen
+        return True
+    if wd == 4 and now.hour >= 21:          # Friday after close
+        return True
+    return False
+
+
 # ── Public entry point ───────────────────────────────────────────────────────
 
 def run_once(db: Session) -> dict:
@@ -122,6 +139,13 @@ def _maybe_fire_alert(verdict: dict) -> None:
     decision = verdict.get("decision")
     es       = verdict.get("execution_status")
     cp       = verdict.get("conditions_passed", 0)
+
+    # Weekend gate — markets are flat from Fri 21:00 UTC to Sun 22:00 UTC.
+    # No signals, no briefings, no invalidations during this window. The
+    # Saturday recap + Sunday forecast newsletters handle weekend comms.
+    if is_weekend_quiet_hours():
+        log.debug("[strategist_runner] alert suppressed — weekend quiet hours")
+        return
 
     try:
         # ── Path 1: STAND ASIDE — handle invalidation + optional standby alerts ──
