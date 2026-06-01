@@ -239,6 +239,20 @@ def execute_order(order: dict) -> dict:
     else:
         return {"status": "REJECTED", "error": f"Invalid signal {sig}"}
 
+    # ── Pick a filling mode the broker actually accepts ────────────────
+    # sym.filling_mode is a bitmask of supported modes:
+    #   bit 0 (=1) → FOK supported
+    #   bit 1 (=2) → IOC supported
+    # Brokers vary (Exness Trial servers commonly accept only FOK).
+    # Without auto-detection we hit retcode=10030 "Unsupported filling mode".
+    supported_bits = sym.filling_mode or 0
+    if supported_bits & 2:          # IOC preferred (allows partial fills)
+        type_filling = mt5.ORDER_FILLING_IOC
+    elif supported_bits & 1:        # FOK fallback
+        type_filling = mt5.ORDER_FILLING_FOK
+    else:                            # Return-after-deal — always allowed
+        type_filling = mt5.ORDER_FILLING_RETURN
+
     request = {
         "action":       mt5.TRADE_ACTION_DEAL,
         "symbol":       broker_sym,
@@ -249,14 +263,25 @@ def execute_order(order: dict) -> dict:
         "tp":           initial_tp,
         "comment":      f"XAUUSD-{'mandate' if mandate else 'legacy'}-bridge",
         "type_time":    mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": type_filling,
     }
 
     log.info(
-        "Placing %s on %s lots=%.2f sl=%.2f tp=%.2f (mandate=%s tp1=%s tp2=%s)",
-        sig, broker_sym, lots, sl, initial_tp, mandate, tp1, tp2,
+        "Placing %s on %s lots=%.2f sl=%.2f tp=%.2f (mandate=%s filling=%s tp1=%s tp2=%s)",
+        sig, broker_sym, lots, sl, initial_tp, mandate, type_filling, tp1, tp2,
     )
     result = mt5.order_send(request)
+
+    # If the broker still rejects the chosen mode (rare — bitmask wrong),
+    # retry once with the alternate. Belt-and-suspenders against unknown
+    # broker quirks.
+    if result is not None and result.retcode == 10030:
+        alt_filling = (mt5.ORDER_FILLING_FOK if type_filling == mt5.ORDER_FILLING_IOC
+                       else mt5.ORDER_FILLING_IOC)
+        log.warning("retcode 10030 with filling=%s — retrying with %s",
+                    type_filling, alt_filling)
+        request["type_filling"] = alt_filling
+        result = mt5.order_send(request)
 
     if result is None:
         return {"status": "FAILED", "error": f"order_send returned None; last_error={mt5.last_error()}"}
