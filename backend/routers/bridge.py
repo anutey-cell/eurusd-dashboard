@@ -329,21 +329,53 @@ def report_result(
 @router.get(
     "/health",
     response_model=APIResponse[dict],
-    summary="Bridge daemon heartbeat (laptop pings every minute)",
+    summary="Bridge daemon heartbeat + MT5 terminal state (laptop pings every minute)",
 )
 @limiter.limit("120/minute")
 def bridge_health(
     request: Request,
-    bridge_daemon_id: str = Header(default="unknown", alias="X-Bridge-Daemon-Id"),
+    bridge_daemon_id:     str = Header(default="unknown", alias="X-Bridge-Daemon-Id"),
+    # MT5 terminal state — daemon sends these so we know AutoTrading status
+    # without waiting for an order to fail with retcode=10027.
+    mt5_trade_allowed:    str | None = Header(default=None, alias="X-MT5-Trade-Allowed"),
+    mt5_dlls_allowed:     str | None = Header(default=None, alias="X-MT5-DLLs-Allowed"),
+    mt5_connected:        str | None = Header(default=None, alias="X-MT5-Connected"),
+    mt5_company:          str | None = Header(default=None, alias="X-MT5-Company"),
+    mt5_account_login:    str | None = Header(default=None, alias="X-MT5-Account-Login"),
+    mt5_account_server:   str | None = Header(default=None, alias="X-MT5-Account-Server"),
+    mt5_account_demo:     str | None = Header(default=None, alias="X-MT5-Account-Demo"),
+    mt5_balance:          str | None = Header(default=None, alias="X-MT5-Balance"),
     _: None = Depends(_require_bridge_secret),
 ) -> APIResponse[dict]:
-    # Just record the heartbeat in memory; the /status endpoint reads it
-    _BRIDGE_HEARTBEAT[bridge_daemon_id] = datetime.now(timezone.utc)
-    return APIResponse(data={"ok": True, "now": datetime.now(timezone.utc).isoformat()})
+    """Records heartbeat + MT5 terminal snapshot. /status endpoint reads both."""
+    now = datetime.now(timezone.utc)
+    _BRIDGE_HEARTBEAT[bridge_daemon_id] = now
+
+    # Stash the MT5 terminal state (None for legacy daemons that don't send headers)
+    def _as_bool(s: str | None) -> bool | None:
+        if s is None: return None
+        return s.lower() in ("true", "1", "yes")
+    def _as_float(s: str | None) -> float | None:
+        try: return float(s) if s else None
+        except Exception: return None
+
+    _MT5_TERMINAL_STATE[bridge_daemon_id] = {
+        "trade_allowed":   _as_bool(mt5_trade_allowed),
+        "dlls_allowed":    _as_bool(mt5_dlls_allowed),
+        "connected":       _as_bool(mt5_connected),
+        "company":         mt5_company,
+        "account_login":   mt5_account_login,
+        "account_server":  mt5_account_server,
+        "account_demo":    _as_bool(mt5_account_demo),
+        "balance":         _as_float(mt5_balance),
+        "last_seen":       now,
+    }
+    return APIResponse(data={"ok": True, "now": now.isoformat()})
 
 
-# Module-level heartbeat cache (single-process VPS — fine for our scale)
-_BRIDGE_HEARTBEAT: dict[str, datetime] = {}
+# Module-level caches (single-process VPS — fine for our scale)
+_BRIDGE_HEARTBEAT:      dict[str, datetime] = {}
+_MT5_TERMINAL_STATE:    dict[str, dict]     = {}
 
 
 @router.get(
@@ -374,14 +406,30 @@ def bridge_status(
         .first()
     )
 
-    heartbeats = {
-        daemon_id: {
-            "lastSeen":  ts.isoformat(),
+    heartbeats = {}
+    for daemon_id, ts in _BRIDGE_HEARTBEAT.items():
+        mt5_state = _MT5_TERMINAL_STATE.get(daemon_id, {})
+        heartbeats[daemon_id] = {
+            "lastSeen":   ts.isoformat(),
             "ageSeconds": int((now - ts).total_seconds()),
             "isFresh":    (now - ts).total_seconds() < 120,
+            "mt5": {
+                "tradeAllowed":   mt5_state.get("trade_allowed"),
+                "dllsAllowed":    mt5_state.get("dlls_allowed"),
+                "connected":      mt5_state.get("connected"),
+                "company":        mt5_state.get("company"),
+                "accountLogin":   mt5_state.get("account_login"),
+                "accountServer":  mt5_state.get("account_server"),
+                "accountDemo":    mt5_state.get("account_demo"),
+                "balance":        mt5_state.get("balance"),
+            } if mt5_state else None,
         }
-        for daemon_id, ts in _BRIDGE_HEARTBEAT.items()
-    }
+
+    # Single rolled-up flag: at least one fresh daemon with AutoTrading on
+    any_autotrading = any(
+        h["isFresh"] and (h.get("mt5") or {}).get("tradeAllowed") is True
+        for h in heartbeats.values()
+    )
 
     return APIResponse(
         data={
@@ -395,6 +443,7 @@ def bridge_status(
             "lastAccepted": _serialise(last_accepted) if last_accepted else None,
             "daemons":      heartbeats,
             "anyDaemonFresh": any(h["isFresh"] for h in heartbeats.values()),
+            "anyAutoTradingEnabled": any_autotrading,
             "now": now.isoformat(),
         },
         source="mt5_bridge",

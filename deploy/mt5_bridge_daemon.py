@@ -465,8 +465,29 @@ def report(order_id: int, result: dict) -> None:
 
 
 def heartbeat() -> None:
+    """
+    Heartbeat with MT5 terminal state. The backend uses trade_allowed and
+    dlls_allowed to surface AutoTrading status on /bridge/status without
+    waiting for an order to fail with retcode=10027.
+    """
+    headers = {}
     try:
-        session.get(api("/health"), timeout=10)
+        info = mt5.terminal_info()
+        acc  = mt5.account_info()
+        if info is not None:
+            headers["X-MT5-Trade-Allowed"]  = str(bool(info.trade_allowed)).lower()
+            headers["X-MT5-DLLs-Allowed"]   = str(bool(info.dlls_allowed)).lower()
+            headers["X-MT5-Connected"]      = str(bool(info.connected)).lower()
+            headers["X-MT5-Company"]        = (info.company or "")[:40]
+        if acc is not None:
+            headers["X-MT5-Account-Login"]  = str(acc.login)
+            headers["X-MT5-Account-Server"] = (acc.server or "")[:40]
+            headers["X-MT5-Account-Demo"]   = str(acc.trade_mode == 0).lower()  # 0 = DEMO
+            headers["X-MT5-Balance"]        = f"{acc.balance:.2f}"
+    except Exception as exc:
+        log.debug("heartbeat terminal_info failed: %s", exc)
+    try:
+        session.get(api("/health"), headers=headers, timeout=10)
     except Exception:
         pass
 
