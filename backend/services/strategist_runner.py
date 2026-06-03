@@ -60,6 +60,11 @@ _ENQUEUE_COOLDOWN_S      = 600.0     # 10 min for same-plan re-enqueue
 _AT_CAP_COOLDOWN_S       = 3600.0    # 60 min for "position cap reached" review alerts
 _last_at_cap_at:           float = 0.0
 
+# Direction-flip tracking — fires a one-shot 🔀 transition alert whenever
+# the engine's signaled direction switches BUY ↔ SELL. STAND ASIDE in between
+# is fine (e.g. SELL → STAND ASIDE → BUY counts as one flip).
+_last_signaled_direction: str | None = None
+
 
 def is_weekend_quiet_hours() -> bool:
     """
@@ -160,6 +165,8 @@ def _maybe_fire_alert(verdict: dict) -> None:
                 # Clear the prior alert state — invalidation is one-shot
                 _last_alert = {"decision": None, "execution_band": None,
                                "conditions_passed": 0, "sent_at": time.time()}
+                # NOTE: _last_signaled_direction stays set — the next BUY/SELL
+                # in the OPPOSITE direction will trigger the flip alert.
                 return
 
             # Optional standby informational alert
@@ -180,13 +187,25 @@ def _maybe_fire_alert(verdict: dict) -> None:
         if not (verdict.get("execution_permission") or {}).get("allow_alert"):
             return
 
+        # ── Direction-flip transition alert (one-shot per real flip) ────
+        # Fire BEFORE the normal signal so the regime shift is the first
+        # thing the operator sees. _last_signaled_direction is updated only
+        # when we actually emit a BUY/SELL alert — STAND ASIDE between
+        # flips doesn't reset it.
+        global _last_signaled_direction
+        if (_last_signaled_direction is not None
+                and _last_signaled_direction != decision):
+            try:
+                _send_plain(_format_direction_flip(verdict, prior_direction=_last_signaled_direction))
+                log.info("[strategist_runner] direction flip alert fired: %s → %s",
+                         _last_signaled_direction, decision)
+            except Exception as exc:
+                log.warning("[strategist_runner] direction flip alert failed: %s", exc)
+
         # ── Special path: POSITION_CAP_REACHED — review-mode alert ─────
-        # When we're at the hard ceiling, don't emit the usual signal block;
-        # emit a "review what's open" message instead. The would-have-been
-        # signal is logged in strategist_verdicts but operator must act on
-        # existing trades first.
         if es == "POSITION_CAP_REACHED":
             _maybe_fire_position_cap_alert(verdict)
+            _last_signaled_direction = decision   # still tracks direction even when not enqueuing
             return
 
         band = _execution_band(es)
@@ -218,8 +237,53 @@ def _maybe_fire_alert(verdict: dict) -> None:
             "conditions_passed": cp,
             "sent_at":           time.time(),
         }
+        _last_signaled_direction = decision   # track for next flip detection
     except Exception as exc:
         log.debug("[strategist_runner] alert hook failed (non-fatal): %s", exc)
+
+
+def _format_direction_flip(verdict: dict, *, prior_direction: str) -> str:
+    """
+    Compose the one-shot "engine just flipped direction" alert. Shown when
+    the engine's signaled direction switches BUY ↔ SELL after at least one
+    prior signal in the opposite direction. Surfaces the drivers behind the
+    regime shift so the operator understands WHY the flip happened.
+    """
+    new_direction = verdict.get("decision")
+    cp = verdict.get("conditions_passed", 0)
+    tp = verdict.get("trade_plan") or {}
+    diag = verdict.get("diagnostics") or {}
+    mc = verdict.get("macro_context") or {}
+
+    new_arrow   = "🟢 BUY" if new_direction == "BUY" else "🔴 SELL"
+    prior_arrow = "🟢 BUY" if prior_direction == "BUY" else "🔴 SELL"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M GMT")
+
+    return (
+        f"🔀 XAUUSD DIRECTION FLIP\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{prior_arrow}  →  {new_arrow}\n"
+        f"\n"
+        f"📊 NEW SIDE — {cp}/5 conditions\n"
+        f"  Price:          ${tp.get('entry', '—')}\n"
+        f"  TF alignment:   {verdict.get('tf_alignment_label', '—')}\n"
+        f"  Market state:   {verdict.get('market_state', '—')}\n"
+        f"  Session:        {verdict.get('session_classification', '—')}\n"
+        f"\n"
+        f"🌍 REGIME DRIVERS\n"
+        f"  D1 bias:        {diag.get('d1_bias_local', '—')}\n"
+        f"  H4 bias:        {diag.get('h4_bias_local', '—')}\n"
+        f"  Macro:          {mc.get('gold_macro_bias', '—')}\n"
+        f"  Macro align:    {mc.get('macro_alignment', '—')}\n"
+        f"  Sweep:          {diag.get('sweep_rationale', '—')}\n"
+        f"\n"
+        f"⚠️ First signals after a flip carry higher noise.\n"
+        f"   Wait for 4/5+ confirmation before pressing.\n"
+        f"\n"
+        f"Time: {now}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Regime shift confirmed by HTF + macro alignment."
+    )
 
 
 def _maybe_fire_position_cap_alert(verdict: dict) -> None:
