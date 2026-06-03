@@ -169,7 +169,8 @@ def _ict_stability(verdict: dict) -> dict:
     """ICT framework score → stability score."""
     import re
     text = verdict.get("institutional_logic", "") or ""
-    m = re.search(r"ict\((\d+)/100", text)
+    # institutional_logic actually emits "ICT(72/100 ALIGNED)" — case-insensitive match
+    m = re.search(r"ict\((\d+)/100", text, re.IGNORECASE)
     score = None
     if m:
         try:
