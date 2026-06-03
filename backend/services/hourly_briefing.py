@@ -1,11 +1,12 @@
 """
-XAUUSD Hourly Market Briefing
-=============================
+XAUUSD Daily Market Briefing
+============================
 
-Produces a once-per-hour structured market briefing for Telegram. Mandate-style
-plain-text + emojis. Pulls from the SAME strategist verdict the rest of the
-system uses, so what the briefing says matches what the dashboard / signal
-alerts say — no two sources of truth.
+Produces a once-per-day structured market briefing for Telegram, fired at
+23:00 EAT (20:00 UTC) — end of the New York session, before Asian open.
+Mandate-style plain-text + emojis. Pulls from the SAME strategist verdict
+the rest of the system uses, so what the briefing says matches what the
+dashboard / signal alerts say — no two sources of truth.
 
 The briefing covers:
   • Market movement     — current price, 24h change, intraday range
@@ -16,8 +17,11 @@ The briefing covers:
   • Opportunity watch   — specific BUY / SELL next-triggers
   • Risk note           — news windows in the next 60 min
 
-Triggered by background_scheduler._hourly_briefing_loop() — fires on the hour
-mark (NN:00 UTC). Operator opt-in via settings.telegram_hourly_briefing.
+Triggered by background_scheduler._daily_briefing_loop() — fires at
+20:00 UTC daily (= 23:00 Africa/Nairobi). Suppressed on weekends (Sat
+recap + Sun forecast newsletters handle that window). Operator opt-in
+via settings.telegram_hourly_briefing (env var name preserved for
+back-compat; gates the daily briefing now).
 """
 from __future__ import annotations
 
@@ -204,9 +208,9 @@ def _format_message(*, verdict: dict, market: dict) -> str:
 
     # ── COMPOSE MESSAGE ────────────────────────────────────────────────
     msg = (
-        f"🕐 XAUUSD HOURLY BRIEFING\n"
+        f"🕘 XAUUSD DAILY BRIEFING\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 {ts}\n"
+        f"📅 {ts}  (23:00 EAT close)\n"
         f"{price_line}\n"
         f"📊 Today: {range_line}\n"
         f"📈 vs Daily Open: {do_line}\n"
@@ -247,39 +251,39 @@ def _format_message(*, verdict: dict, market: dict) -> str:
 # Telegram send + dedupe (one briefing per hour, deterministic timing)
 # ────────────────────────────────────────────────────────────────────────────
 
-# Module-level: track which hour-of-day we've already briefed today
-_last_briefing_hour_key: str = ""   # "YYYY-MM-DD-HH"
+# Module-level: track which calendar date we've already briefed
+_last_briefing_date_key: str = ""   # "YYYY-MM-DD"
 
 
 def send_briefing_if_due(db: Session) -> bool:
     """
-    Called by the scheduler loop. Sends the briefing if we haven't already
-    sent one for the current hour. Returns True if a message was sent.
+    Called by the scheduler loop. Sends the daily briefing if we haven't
+    already sent one for today. Returns True if a message was sent.
     """
-    global _last_briefing_hour_key
+    global _last_briefing_date_key
     from config import settings
     from services.strategist_runner import is_weekend_quiet_hours
 
     if not getattr(settings, "telegram_hourly_briefing", False):
         return False
 
-    # Weekend gate — hourly briefings pause; Sat recap + Sun forecast take over.
+    # Weekend gate — daily briefing pauses; Sat recap + Sun forecast take over.
     if is_weekend_quiet_hours():
         log.debug("[briefing] suppressed — weekend quiet hours")
         return False
 
     now = datetime.now(timezone.utc)
-    hour_key = now.strftime("%Y-%m-%d-%H")
-    if hour_key == _last_briefing_hour_key:
-        return False    # already briefed this hour
+    date_key = now.strftime("%Y-%m-%d")
+    if date_key == _last_briefing_date_key:
+        return False    # already briefed today
 
     msg = build_briefing(db)
     if not msg:
         return False
 
     if _send_plain(msg):
-        _last_briefing_hour_key = hour_key
-        log.info("[briefing] sent for %s", hour_key)
+        _last_briefing_date_key = date_key
+        log.info("[briefing] sent daily briefing for %s", date_key)
         return True
     return False
 

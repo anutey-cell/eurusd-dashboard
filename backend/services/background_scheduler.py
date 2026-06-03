@@ -263,39 +263,49 @@ def _run_strategist_iteration():
         )
 
 
-# ── Hourly market briefing loop ──────────────────────────────────────────────
+# ── Daily market briefing loop ───────────────────────────────────────────────
+#
+# Fires once per day at 20:00 UTC (= 23:00 Africa/Nairobi / EAT). This is
+# the close of the NY session + just before Asian open — natural reflection
+# window for the operator. Weekends are skipped (Sat recap + Sun forecast
+# handle that).
 
-BRIEFING_CHECK_INTERVAL_SEC = 60     # cheap check — actual send is once/hour
+BRIEFING_CHECK_INTERVAL_SEC = 60     # cheap poll
+DAILY_BRIEFING_HOUR_UTC     = 20     # 23:00 EAT
 
 
-async def _hourly_briefing_loop():
+async def _daily_briefing_loop():
     """
-    Sends a structured XAUUSD market briefing to Telegram once per hour
-    (on the NN:00 mark). The send_briefing_if_due() helper handles its own
-    dedupe (one message per hour-of-day) so this loop can wake every minute
-    cheaply and still fire exactly once per hour.
+    Sends the daily XAUUSD market briefing to Telegram once per day at
+    20:00 UTC (23:00 EAT). The send_briefing_if_due() helper dedupes
+    by calendar date — this loop can wake every minute cheaply and still
+    fire exactly once per day.
 
-    Opt-in via settings.telegram_hourly_briefing (default False).
+    Opt-in via settings.telegram_hourly_briefing (env var name preserved
+    for back-compat; same flag governs both the daily briefing + the
+    weekend newsletters + the weekly digest).
     """
-    log.info("[scheduler] hourly briefing loop started (check every %ds)",
-             BRIEFING_CHECK_INTERVAL_SEC)
+    log.info("[scheduler] daily briefing loop started "
+             "(fires %02d:00 UTC = 23:00 EAT)", DAILY_BRIEFING_HOUR_UTC)
     while True:
         try:
             await asyncio.sleep(BRIEFING_CHECK_INTERVAL_SEC)
             await asyncio.to_thread(_run_briefing_iteration)
         except asyncio.CancelledError:
-            log.info("[scheduler] hourly briefing loop cancelled")
+            log.info("[scheduler] daily briefing loop cancelled")
             raise
         except Exception as exc:
-            log.warning("[scheduler] hourly briefing loop error: %s", exc)
+            log.warning("[scheduler] daily briefing loop error: %s", exc)
 
 
 def _run_briefing_iteration():
-    """Single briefing check (runs in thread). Only sends on the hour mark."""
+    """
+    Single briefing check (runs in thread). Only fires within the first
+    2 minutes of 20:00 UTC so we don't accidentally late-send during a
+    restart that lands at 20:15.
+    """
     now = datetime.now(timezone.utc)
-    # Only attempt during the first 2 minutes of each hour so we don't
-    # late-send if a previous tick missed it during a restart.
-    if now.minute >= 2:
+    if now.hour != DAILY_BRIEFING_HOUR_UTC or now.minute >= 2:
         return
     from database import SessionLocal
     from services.hourly_briefing import send_briefing_if_due
@@ -590,7 +600,7 @@ async def start_background_loops():
         asyncio.create_task(_prediction_alert_loop(),      name="prediction_alert_loop"),
         asyncio.create_task(_drawdown_loop(),              name="drawdown_loop"),
         asyncio.create_task(_daily_summary_loop(),         name="daily_summary_loop"),
-        asyncio.create_task(_hourly_briefing_loop(),       name="hourly_briefing_loop"),
+        asyncio.create_task(_daily_briefing_loop(),        name="daily_briefing_loop"),
         asyncio.create_task(_weekly_digest_loop(),         name="weekly_digest_loop"),
         asyncio.create_task(_weekend_newsletter_loop(),    name="weekend_newsletter_loop"),
     ]
