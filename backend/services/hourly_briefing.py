@@ -40,14 +40,22 @@ log = logging.getLogger(__name__)
 
 def build_briefing(db: Session) -> Optional[str]:
     """
-    Compose the hourly briefing message. Returns the formatted text, or None
+    Compose the daily briefing message. Returns the formatted text, or None
     if there's no fresh data (rare — strategist normally degrades to STAND ASIDE
     rather than failing). Never raises.
     """
     try:
         verdict = _pull_strategist_verdict(db)
         market  = _pull_market_snapshot()
-        return _format_message(verdict=verdict, market=market)
+        # Regime-stability index — gives early warning of an incoming flip
+        try:
+            from services.regime_stability import compute_regime_stability, format_regime_stability_block
+            regime  = compute_regime_stability(db)
+            regime_block = format_regime_stability_block(regime)
+        except Exception as exc:
+            log.warning("[briefing] regime stability failed: %s", exc)
+            regime_block = None
+        return _format_message(verdict=verdict, market=market, regime_block=regime_block)
     except Exception as exc:
         log.warning("[briefing] build failed: %s", exc)
         return None
@@ -126,7 +134,7 @@ def _pull_market_snapshot() -> dict:
 # Message formatter
 # ────────────────────────────────────────────────────────────────────────────
 
-def _format_message(*, verdict: dict, market: dict) -> str:
+def _format_message(*, verdict: dict, market: dict, regime_block: str | None = None) -> str:
     now = datetime.now(timezone.utc)
     ts  = now.strftime("%Y-%m-%d %H:00 GMT")
 
@@ -240,6 +248,13 @@ def _format_message(*, verdict: dict, market: dict) -> str:
         f"🟢 BUY unlock:  {long_trigger}\n"
         f"🔴 SELL unlock: {short_trigger}\n"
         f"Blockers: {blockers}\n"
+    )
+
+    # Regime-stability index — appended before footer when available
+    if regime_block:
+        msg += f"\n{regime_block}\n"
+
+    msg += (
         f"\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"DEMO learning only · 0.01 lot · capital preservation first."
