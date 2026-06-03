@@ -141,12 +141,17 @@ class Settings(BaseSettings):
     # False = legacy 5-gate auto_executor runs (development / back-compat only)
     use_mandate_strategist:          bool = True
 
-    # ── Position-cap risk gate ────────────────────────────────────────────────
-    # Hard ceiling on concurrent open MT5 positions. When at the cap, the
-    # strategist refuses to enqueue new orders and instead emits a
-    # "POSITION_CAP_REACHED" status — operator gets a Telegram alert listing
-    # the open trades and is asked to review/close before new ones can enter.
-    max_concurrent_positions:        int  = 5
+    # ── Position-cap risk gate (dynamic pyramid) ──────────────────────────────
+    # Base cap: 5 concurrent positions of 0.01 lot each.
+    # When floating P&L crosses the threshold AND HTF trend continues AND
+    # recent volume confirms institutional participation, the cap relaxes
+    # to the extended ceiling (pyramid scaling on confirmed trend).
+    # If any of those three conditions falls back, cap snaps to base —
+    # existing positions stay, but no new adds are allowed.
+    max_concurrent_positions:        int   = 5      # base cap (kept name for back-compat)
+    max_positions_extended:          int   = 10     # cap when pyramid override is active
+    extended_cap_profit_usd:         float = 300.0  # floating P&L threshold to unlock extended cap
+    extended_cap_volume_ratio:       float = 1.2    # recent 3-bar vol vs prior-20 median ratio
     # Legacy fallback — honoured if TELEGRAM_ENABLED is set in older .env files
     telegram_enabled:                bool = False
 

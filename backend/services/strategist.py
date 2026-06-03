@@ -377,6 +377,71 @@ _EXEC_INVALIDATED      = "INVALIDATED_BEFORE_ENTRY"
 _EXEC_POSITION_CAP     = "POSITION_CAP_REACHED"   # ← risk gate: too many open trades
 
 
+def _volume_confirms_continuation(h1_candles, window: int = 20, recent: int = 3,
+                                  ratio_threshold: float = 1.2) -> tuple[bool, float]:
+    """
+    True if the average volume of the last `recent` H1 bars is at least
+    `ratio_threshold` × the median volume of the prior `window` bars.
+
+    Volume above norm = institutional participation = trend continuation
+    is more likely than a retail-driven retrace.
+
+    Returns (passes, observed_ratio). observed_ratio is the actual recent-avg
+    over prior-median so the verdict can surface it for transparency.
+    """
+    if not h1_candles or len(h1_candles) < window + recent:
+        return (False, 0.0)
+    recent_vols = [c.volume for c in h1_candles[-recent:]]
+    prior_vols  = sorted(c.volume for c in h1_candles[-(window + recent):-recent])
+    if not recent_vols or not prior_vols:
+        return (False, 0.0)
+    prior_median = prior_vols[len(prior_vols) // 2]
+    if prior_median <= 0:
+        return (False, 0.0)
+    recent_avg = sum(recent_vols) / len(recent_vols)
+    ratio = recent_avg / prior_median
+    return (ratio >= ratio_threshold, round(ratio, 2))
+
+
+def _compute_dynamic_cap(
+    *,
+    base_cap: int,
+    extended_cap: int,
+    floating_pnl: float,
+    profit_threshold: float,
+    tf_alignment_label: str,
+    market_state: str,
+    volume_passes: bool,
+) -> tuple[int, bool, list[str]]:
+    """
+    Decide today's effective position cap (5 normally, up to 10 on confirmed
+    trend continuation past the profit threshold).
+
+    Returns (effective_cap, extended_active, reasons_failed).
+    `reasons_failed` is empty when extended is active; otherwise lists each
+    condition that didn't pass — surfaced in the verdict for transparency.
+    """
+    reasons: list[str] = []
+
+    if floating_pnl < profit_threshold:
+        reasons.append(f"floating P&L ${floating_pnl:+.0f} < ${profit_threshold:.0f} threshold")
+
+    trend_strong = tf_alignment_label in (_TF_STRONG_BULL, _TF_STRONG_BEAR)
+    if not trend_strong:
+        reasons.append(f"TF alignment '{tf_alignment_label}' is not Strong bullish/bearish")
+
+    trending_state = market_state in (_MARKET_STATE_TRENDING_BULL, _MARKET_STATE_TRENDING_BEAR)
+    if not trending_state:
+        reasons.append(f"market state '{market_state}' is not trending")
+
+    if not volume_passes:
+        reasons.append("recent H1 volume below 1.2× prior-20 median")
+
+    if reasons:
+        return (base_cap, False, reasons)
+    return (extended_cap, True, [])
+
+
 def _get_open_positions_snapshot() -> dict:
     """
     Read the MT5 open-position count + ticket list from the bridge heartbeat.
@@ -1145,7 +1210,26 @@ def make_decision(db: Session) -> dict:
 
     # Position-cap snapshot from bridge heartbeat — drives the risk gate
     pos_snap = _get_open_positions_snapshot()
-    max_positions = getattr(settings, "max_concurrent_positions", 5)
+    base_cap = getattr(settings, "max_concurrent_positions", 5)
+    extended_cap = getattr(settings, "max_positions_extended", 10)
+    profit_threshold = getattr(settings, "extended_cap_profit_usd", 300.0)
+    vol_ratio_threshold = getattr(settings, "extended_cap_volume_ratio", 1.2)
+
+    # Volume continuation check — used by the dynamic-cap unlock
+    volume_passes, volume_ratio = _volume_confirms_continuation(
+        h1, ratio_threshold=vol_ratio_threshold,
+    )
+
+    # Dynamic cap — base 5, extends to 10 when trend + profit + volume all confirm
+    effective_cap, extended_active, cap_block_reasons = _compute_dynamic_cap(
+        base_cap=base_cap,
+        extended_cap=extended_cap,
+        floating_pnl=pos_snap["floating_pnl"],
+        profit_threshold=profit_threshold,
+        tf_alignment_label=tf_alignment_mandate,
+        market_state=market_state_mandate,
+        volume_passes=volume_passes,
+    )
 
     execution_status, exec_reason = _decide_execution_status(
         conditions_passed=conditions_passed,
@@ -1158,7 +1242,7 @@ def make_decision(db: Session) -> dict:
         demo_auto_enqueue=demo_auto_enqueue,
         allow_demo=settings.allow_demo_trading,
         open_positions_count=pos_snap["count"],
-        max_concurrent_positions=max_positions,
+        max_concurrent_positions=effective_cap,    # ← dynamic, not static
     )
 
     entry_tolerance = _compute_entry_tolerance(atr_h1)
@@ -1241,11 +1325,18 @@ def make_decision(db: Session) -> dict:
             "sweep_rationale":      sweep.get("rationale"),
             "scanner_state":        scan.get("marketState"),
             "scanner_score":        scan.get("qualityScore"),
-            # Position-cap visibility
+            # Position-cap visibility (dynamic pyramid)
             "open_positions":       pos_snap["count"],
             "open_position_tickets": pos_snap["tickets"],
             "floating_pnl":         pos_snap["floating_pnl"],
-            "max_concurrent_positions": max_positions,
+            "max_concurrent_positions": effective_cap,    # dynamic — actually used
+            "cap_base":             base_cap,
+            "cap_extended":         extended_cap,
+            "cap_extended_active":  extended_active,
+            "cap_profit_threshold": profit_threshold,
+            "cap_volume_ratio":     volume_ratio,
+            "cap_volume_required":  vol_ratio_threshold,
+            "cap_block_reasons":    cap_block_reasons,
         },
         "key_zones": {
             "immediate_supply": [today_high] if today_high else [],

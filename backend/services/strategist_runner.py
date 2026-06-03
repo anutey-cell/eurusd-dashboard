@@ -246,17 +246,43 @@ def _format_position_cap_alert(verdict: dict) -> str:
     """Compose the position-cap review message — concise + actionable."""
     diag = verdict.get("diagnostics") or {}
     tp   = verdict.get("trade_plan") or {}
-    open_n  = diag.get("open_positions", 0)
-    max_n   = diag.get("max_concurrent_positions", 5)
-    tickets = diag.get("open_position_tickets") or []
-    floating = diag.get("floating_pnl", 0.0)
-    decision = verdict.get("decision")
-    cp = verdict.get("conditions_passed", 0)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M GMT")
+    open_n          = diag.get("open_positions", 0)
+    max_n           = diag.get("max_concurrent_positions", 5)
+    base_cap        = diag.get("cap_base", 5)
+    ext_cap         = diag.get("cap_extended", 10)
+    ext_active      = diag.get("cap_extended_active", False)
+    threshold       = diag.get("cap_profit_threshold", 300.0)
+    vol_ratio       = diag.get("cap_volume_ratio", 0.0)
+    vol_required    = diag.get("cap_volume_required", 1.2)
+    block_reasons   = diag.get("cap_block_reasons") or []
+    tickets         = diag.get("open_position_tickets") or []
+    floating        = diag.get("floating_pnl", 0.0)
+    decision        = verdict.get("decision")
+    cp              = verdict.get("conditions_passed", 0)
+    now             = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M GMT")
 
     arrow = "🟢" if decision == "BUY" else "🔴"
     tickets_str = ", ".join(f"#{t}" for t in tickets[:10]) if tickets else "—"
     pnl_color = "🟢" if floating >= 0 else "🔴"
+
+    # Pyramid status block — show whether extended cap is unlocked
+    if ext_active:
+        pyramid_block = (
+            f"📈 PYRAMID UNLOCKED (cap {max_n}, was {base_cap})\n"
+            f"  Trend continues with confirmed volume.\n"
+            f"  Now AT the extended ceiling too — no more adds.\n"
+        )
+    else:
+        pyramid_block = (
+            f"🧱 PYRAMID LOCKED (cap {base_cap}, extended would be {ext_cap})\n"
+            f"  To unlock more positions:\n"
+        )
+        for r in block_reasons:
+            pyramid_block += f"    ✗ {r}\n"
+        pyramid_block += (
+            f"  Current: floating ${floating:+.0f} (need ≥${threshold:.0f}),  "
+            f"volume {vol_ratio:.2f}× (need ≥{vol_required:.2f}×)\n"
+        )
 
     return (
         f"🔒 XAUUSD POSITION CAP REACHED ({open_n}/{max_n})\n"
@@ -265,11 +291,13 @@ def _format_position_cap_alert(verdict: dict) -> str:
         f"  Suggested entry: ${tp.get('entry', '—')}\n"
         f"  SL ${tp.get('stop_loss', '—')}  ·  TP1 ${tp.get('tp1', '—')}  ·  TP2 ${tp.get('tp2', '—')}\n"
         f"\n"
-        f"⚠️ NOT enqueued — at hard cap of {max_n} concurrent positions.\n"
+        f"⚠️ NOT enqueued — at cap.\n"
         f"\n"
         f"📂 Open trades on demo:\n"
         f"  Tickets: {tickets_str}\n"
         f"  Floating P/L: {pnl_color} ${floating:+.2f}\n"
+        f"\n"
+        f"{pyramid_block}"
         f"\n"
         f"🛠 ACTION\n"
         f"  • Review the {open_n} open positions in MT5\n"
