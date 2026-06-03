@@ -180,19 +180,23 @@ def _resolve_broker_symbol() -> Optional[str]:
         return _RESOLVED_SYMBOL
 
     # ── Pass 1: explicit common names (fast) ────────────────────────────
+    # mt5.symbol_select(name, True) is the reliable existence test:
+    #   returns True  → symbol exists, now added to Market Watch
+    #   returns False → symbol doesn't exist on this broker
+    # mt5.symbol_info() can return None for valid symbols that aren't yet
+    # in Market Watch on some MT5 builds, so we lead with symbol_select.
     explicit = [
         "XAUUSD", "XAUUSDm", "XAUUSDc", "XAUUSDz", "XAUUSDt",
         "XAUUSD.r", "XAUUSD.s", "XAUUSD.ecn", "XAUUSD_pro", "XAUUSD-cd",
         "GOLD", "XAU/USD", "XAU.USD", "GOLD#",
     ]
     for name in explicit:
-        info = mt5.symbol_info(name)
-        if info:
-            if not info.visible:
-                mt5.symbol_select(name, True)
-            log.info("Symbol resolved via explicit list: %s", name)
-            _RESOLVED_SYMBOL = name
-            return name
+        if mt5.symbol_select(name, True):
+            info = mt5.symbol_info(name)
+            if info is not None:
+                log.info("Symbol resolved via explicit list: %s", name)
+                _RESOLVED_SYMBOL = name
+                return name
 
     # ── Pass 2: scan all broker symbols, match anything XAU + USD ───────
     log.warning("No explicit XAUUSD match — scanning broker's full symbol list")
@@ -212,13 +216,15 @@ def _resolve_broker_symbol() -> Optional[str]:
         log.info("XAU/USD candidates found on broker: %s", candidates[:10])
         # Prefer the shortest name (usually the canonical one for the account type)
         candidates.sort(key=lambda x: (len(x), x))
-        chosen = candidates[0]
-        info = mt5.symbol_info(chosen)
-        if info and not info.visible:
-            mt5.symbol_select(chosen, True)
-        log.info("Symbol resolved via scan: %s", chosen)
-        _RESOLVED_SYMBOL = chosen
-        return chosen
+        for chosen in candidates:
+            if mt5.symbol_select(chosen, True):
+                info = mt5.symbol_info(chosen)
+                if info is not None:
+                    log.info("Symbol resolved via scan: %s", chosen)
+                    _RESOLVED_SYMBOL = chosen
+                    return chosen
+            else:
+                log.warning("Candidate %s exists in symbols_get but symbol_select rejected", chosen)
 
     # ── Pass 3: nothing matched — dump first 20 symbols for triage ──────
     sample = [s.name for s in all_symbols[:20]]
