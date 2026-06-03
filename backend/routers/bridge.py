@@ -327,6 +327,60 @@ def report_result(
 
 
 @router.get(
+    "/unresolved-fills",
+    response_model=APIResponse[dict],
+    summary="ACCEPTED orders whose trade outcome was never reported back",
+)
+@limiter.limit("60/minute")
+def unresolved_fills(
+    request: Request,
+    max_age_hours: int = 72,
+    _: None = Depends(_require_bridge_secret),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Returns PendingExecution rows where status=ACCEPTED but the linked
+    strategist_verdict still has result=PENDING (no CLOSED writeback).
+    The daemon polls this on startup to find orphaned trades — those
+    whose monitor thread died with a previous daemon process.
+    """
+    from db_models import StrategistVerdict
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    rows = (
+        db.query(PendingExecution)
+        .filter(PendingExecution.status == "ACCEPTED")
+        .filter(PendingExecution.created_at >= cutoff)
+        .order_by(PendingExecution.created_at.desc())
+        .all()
+    )
+    orphans = []
+    for r in rows:
+        sv = (
+            db.query(StrategistVerdict)
+            .filter(StrategistVerdict.pending_execution_id == r.id)
+            .first()
+        )
+        # Skip if outcome already recorded
+        if sv and sv.result and sv.result != "PENDING":
+            continue
+        orphans.append({
+            "id":            r.id,
+            "ticket":        r.ticket,
+            "signal":        r.signal,
+            "entry":         r.entry,
+            "stop_loss":     r.stop_loss,
+            "take_profit":   r.take_profit,
+            "take_profit_2": getattr(r, "take_profit_2", None),
+            "lot_executed":  r.lot_executed,
+            "created_at":    r.created_at.isoformat() if r.created_at else None,
+            "claimed_by":    r.claimed_by,
+            "verdict_id":    sv.id if sv else None,
+        })
+    return APIResponse(data={"count": len(orphans), "orphans": orphans},
+                       source="mt5_bridge")
+
+
+@router.get(
     "/health",
     response_model=APIResponse[dict],
     summary="Bridge daemon heartbeat + MT5 terminal state (laptop pings every minute)",

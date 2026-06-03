@@ -590,6 +590,82 @@ def heartbeat() -> None:
         pass
 
 
+def reconcile_orphaned_trades() -> None:
+    """
+    On startup, find any prior ACCEPTED orders whose monitor thread died
+    with a previous daemon (so result is still PENDING in the backend).
+    For each:
+      • If position still open on MT5 → respawn monitor_position thread
+      • If position closed → look up close deal, POST CLOSED with outcome
+
+    Self-healing: a single restart no longer loses trade outcomes forever.
+    """
+    try:
+        r = session.get(api("/unresolved-fills"), timeout=15)
+        if not r.ok:
+            log.warning("reconcile: /unresolved-fills HTTP %d", r.status_code)
+            return
+        orphans = (r.json().get("data") or {}).get("orphans") or []
+    except Exception as exc:
+        log.warning("reconcile: fetch failed: %s", exc)
+        return
+
+    if not orphans:
+        log.info("reconcile: no orphaned ACCEPTED orders — clean state")
+        return
+
+    log.info("reconcile: %d orphaned ACCEPTED order(s) found", len(orphans))
+    for o in orphans:
+        oid    = o["id"]
+        ticket = o.get("ticket")
+        if not ticket:
+            log.debug("reconcile: order %d has no MT5 ticket, skipping", oid)
+            continue
+
+        direction = o["signal"]
+        entry     = float(o["entry"])
+        sl        = float(o["stop_loss"])
+        tp1       = float(o["take_profit"])
+        tp2       = float(o.get("take_profit_2") or o["take_profit"])
+
+        # Is the position still open on MT5?
+        try:
+            positions = mt5.positions_get(ticket=ticket) or []
+        except Exception as exc:
+            log.warning("reconcile #%d ticket %s: positions_get failed: %s", oid, ticket, exc)
+            continue
+
+        broker_sym = _resolve_broker_symbol() or "XAUUSD"
+
+        if positions:
+            # Open → respawn the monitor thread (recovers MFE/MAE tracking
+            # from this point forward, though peak excursion before restart is lost)
+            log.info("reconcile: ticket %s still OPEN — respawning monitor", ticket)
+            t = threading.Thread(
+                target=monitor_position,
+                kwargs=dict(
+                    order_id=oid, ticket=int(ticket), broker_sym=broker_sym,
+                    direction=direction, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
+                ),
+                name=f"monitor-resumed-{ticket}",
+                daemon=True,
+            )
+            t.start()
+            continue
+
+        # Closed → reconstruct outcome from deal history and report it
+        log.info("reconcile: ticket %s CLOSED — reconstructing outcome", ticket)
+        try:
+            _report_closed(
+                order_id=oid, ticket=int(ticket), broker_sym=broker_sym,
+                direction=direction, entry=entry,
+                mfe_pts=0.0, mae_pts=0.0,    # lost — couldn't track during outage
+                lifetime_exceeded=False,
+            )
+        except Exception as exc:
+            log.warning("reconcile: report_closed for ticket %s failed: %s", ticket, exc)
+
+
 def main():
     log.info("MT5 Bridge Daemon starting")
     log.info("Daemon ID: %s", DAEMON_ID)
@@ -599,6 +675,11 @@ def main():
     if not mt5_init():
         log.error("Fatal: MT5 connect failed. Exiting.")
         sys.exit(1)
+
+    # Self-healing: pick up any orphaned ACCEPTED trades from a prior daemon
+    # whose monitor thread died on restart. Recovers trade outcomes that
+    # would otherwise be lost forever.
+    reconcile_orphaned_trades()
 
     last_heartbeat = 0
     try:
