@@ -564,9 +564,9 @@ def report(order_id: int, result: dict) -> None:
 
 def heartbeat() -> None:
     """
-    Heartbeat with MT5 terminal state. The backend uses trade_allowed and
-    dlls_allowed to surface AutoTrading status on /bridge/status without
-    waiting for an order to fail with retcode=10027.
+    Heartbeat with MT5 terminal state + open-position snapshot. Backend
+    uses trade_allowed/dlls_allowed for AutoTrading visibility, and
+    open-position count for the risk-cap gate.
     """
     headers = {}
     try:
@@ -582,6 +582,16 @@ def heartbeat() -> None:
             headers["X-MT5-Account-Server"] = (acc.server or "")[:40]
             headers["X-MT5-Account-Demo"]   = str(acc.trade_mode == 0).lower()  # 0 = DEMO
             headers["X-MT5-Balance"]        = f"{acc.balance:.2f}"
+            headers["X-MT5-Equity"]         = f"{acc.equity:.2f}"
+        # Open positions — count + ticket list (used by the position-cap gate)
+        positions = mt5.positions_get() or []
+        headers["X-MT5-Open-Positions"] = str(len(positions))
+        if positions:
+            tickets = [str(p.ticket) for p in positions[:20]]  # cap header size
+            headers["X-MT5-Open-Tickets"] = ",".join(tickets)
+            # Aggregate floating P&L across all open positions
+            floating_pnl = sum((p.profit or 0.0) for p in positions)
+            headers["X-MT5-Floating-PnL"] = f"{floating_pnl:.2f}"
     except Exception as exc:
         log.debug("heartbeat terminal_info failed: %s", exc)
     try:

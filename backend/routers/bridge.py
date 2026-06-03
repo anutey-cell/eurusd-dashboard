@@ -399,6 +399,11 @@ def bridge_health(
     mt5_account_server:   str | None = Header(default=None, alias="X-MT5-Account-Server"),
     mt5_account_demo:     str | None = Header(default=None, alias="X-MT5-Account-Demo"),
     mt5_balance:          str | None = Header(default=None, alias="X-MT5-Balance"),
+    mt5_equity:           str | None = Header(default=None, alias="X-MT5-Equity"),
+    # Open-position snapshot — drives the position-cap risk gate
+    mt5_open_positions:   str | None = Header(default=None, alias="X-MT5-Open-Positions"),
+    mt5_open_tickets:     str | None = Header(default=None, alias="X-MT5-Open-Tickets"),
+    mt5_floating_pnl:     str | None = Header(default=None, alias="X-MT5-Floating-PnL"),
     _: None = Depends(_require_bridge_secret),
 ) -> APIResponse[dict]:
     """Records heartbeat + MT5 terminal snapshot. /status endpoint reads both."""
@@ -413,16 +418,30 @@ def bridge_health(
         try: return float(s) if s else None
         except Exception: return None
 
+    def _as_int(s: str | None) -> int | None:
+        try: return int(s) if s else None
+        except Exception: return None
+
+    open_tickets: list[int] = []
+    if mt5_open_tickets:
+        for t in mt5_open_tickets.split(","):
+            try: open_tickets.append(int(t.strip()))
+            except ValueError: pass
+
     _MT5_TERMINAL_STATE[bridge_daemon_id] = {
-        "trade_allowed":   _as_bool(mt5_trade_allowed),
-        "dlls_allowed":    _as_bool(mt5_dlls_allowed),
-        "connected":       _as_bool(mt5_connected),
-        "company":         mt5_company,
-        "account_login":   mt5_account_login,
-        "account_server":  mt5_account_server,
-        "account_demo":    _as_bool(mt5_account_demo),
-        "balance":         _as_float(mt5_balance),
-        "last_seen":       now,
+        "trade_allowed":          _as_bool(mt5_trade_allowed),
+        "dlls_allowed":           _as_bool(mt5_dlls_allowed),
+        "connected":              _as_bool(mt5_connected),
+        "company":                mt5_company,
+        "account_login":          mt5_account_login,
+        "account_server":         mt5_account_server,
+        "account_demo":           _as_bool(mt5_account_demo),
+        "balance":                _as_float(mt5_balance),
+        "equity":                 _as_float(mt5_equity),
+        "open_positions_count":   _as_int(mt5_open_positions),
+        "open_position_tickets":  open_tickets,
+        "floating_pnl":           _as_float(mt5_floating_pnl),
+        "last_seen":              now,
     }
     return APIResponse(data={"ok": True, "now": now.isoformat()})
 
@@ -468,14 +487,18 @@ def bridge_status(
             "ageSeconds": int((now - ts).total_seconds()),
             "isFresh":    (now - ts).total_seconds() < 120,
             "mt5": {
-                "tradeAllowed":   mt5_state.get("trade_allowed"),
-                "dllsAllowed":    mt5_state.get("dlls_allowed"),
-                "connected":      mt5_state.get("connected"),
-                "company":        mt5_state.get("company"),
-                "accountLogin":   mt5_state.get("account_login"),
-                "accountServer":  mt5_state.get("account_server"),
-                "accountDemo":    mt5_state.get("account_demo"),
-                "balance":        mt5_state.get("balance"),
+                "tradeAllowed":         mt5_state.get("trade_allowed"),
+                "dllsAllowed":          mt5_state.get("dlls_allowed"),
+                "connected":            mt5_state.get("connected"),
+                "company":              mt5_state.get("company"),
+                "accountLogin":         mt5_state.get("account_login"),
+                "accountServer":        mt5_state.get("account_server"),
+                "accountDemo":          mt5_state.get("account_demo"),
+                "balance":              mt5_state.get("balance"),
+                "equity":               mt5_state.get("equity"),
+                "openPositionsCount":   mt5_state.get("open_positions_count"),
+                "openPositionTickets":  mt5_state.get("open_position_tickets"),
+                "floatingPnl":          mt5_state.get("floating_pnl"),
             } if mt5_state else None,
         }
 

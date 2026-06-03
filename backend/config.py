@@ -140,6 +140,13 @@ class Settings(BaseSettings):
     #         (5-condition scoring, fixed 0.01 lot, live execution hard-disabled)
     # False = legacy 5-gate auto_executor runs (development / back-compat only)
     use_mandate_strategist:          bool = True
+
+    # ── Position-cap risk gate ────────────────────────────────────────────────
+    # Hard ceiling on concurrent open MT5 positions. When at the cap, the
+    # strategist refuses to enqueue new orders and instead emits a
+    # "POSITION_CAP_REACHED" status — operator gets a Telegram alert listing
+    # the open trades and is asked to review/close before new ones can enter.
+    max_concurrent_positions:        int  = 5
     # Legacy fallback — honoured if TELEGRAM_ENABLED is set in older .env files
     telegram_enabled:                bool = False
 

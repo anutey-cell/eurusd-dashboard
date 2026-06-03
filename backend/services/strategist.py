@@ -365,7 +365,7 @@ def _evaluate_5_conditions(
     ]
 
 
-# Execution-status decider — produces ONE of the 8 mandate enum values
+# Execution-status decider — produces ONE of the mandate enum values
 _EXEC_SIGNAL_ONLY      = "SIGNAL_ONLY"
 _EXEC_DEMO_PLACED      = "DEMO_TRADE_PLACED"
 _EXEC_DEMO_REJECTED    = "DEMO_TRADE_REJECTED"
@@ -374,6 +374,43 @@ _EXEC_BRIDGE_OFFLINE   = "BRIDGE_OFFLINE"
 _EXEC_SPREAD_HIGH      = "SPREAD_TOO_HIGH"
 _EXEC_NEWS_BLOCKED     = "NEWS_RISK_BLOCKED"
 _EXEC_INVALIDATED      = "INVALIDATED_BEFORE_ENTRY"
+_EXEC_POSITION_CAP     = "POSITION_CAP_REACHED"   # ← risk gate: too many open trades
+
+
+def _get_open_positions_snapshot() -> dict:
+    """
+    Read the MT5 open-position count + ticket list from the bridge heartbeat.
+    Counts only fresh daemons (≤120s) so a stale daemon's stale count can't
+    falsely block legitimate signals.
+
+    Returns:
+      count   — int (0 if no fresh daemon)
+      tickets — list[int]
+      floating_pnl — float (sum of unrealized P&L across all positions)
+      source_daemon — daemon id whose snapshot we used (None if no data)
+    """
+    try:
+        from routers.bridge import _BRIDGE_HEARTBEAT, _MT5_TERMINAL_STATE
+        now = datetime.now(timezone.utc)
+        # Pick the freshest fresh daemon (multiple shouldn't happen in practice)
+        best = None
+        best_age = None
+        for did, ts in _BRIDGE_HEARTBEAT.items():
+            age = (now - ts).total_seconds()
+            if age > 120: continue
+            if best_age is None or age < best_age:
+                best, best_age = did, age
+        if not best:
+            return {"count": 0, "tickets": [], "floating_pnl": 0.0, "source_daemon": None}
+        state = _MT5_TERMINAL_STATE.get(best, {}) or {}
+        return {
+            "count":         state.get("open_positions_count") or 0,
+            "tickets":       state.get("open_position_tickets") or [],
+            "floating_pnl":  state.get("floating_pnl") or 0.0,
+            "source_daemon": best,
+        }
+    except Exception:
+        return {"count": 0, "tickets": [], "floating_pnl": 0.0, "source_daemon": None}
 
 
 def _decide_execution_status(
@@ -390,16 +427,19 @@ def _decide_execution_status(
     tp2: float | None,
     demo_auto_enqueue: bool,
     allow_demo: bool,
+    open_positions_count: int = 0,
+    max_concurrent_positions: int = 5,
 ) -> tuple[str, str]:
     """
     Pick the execution_status value. Returns (status, reason).
 
     Mandate precedence:
-      1. STAND_ASIDE  — score below 3/5, or no direction
-      2. NEWS_RISK_BLOCKED / SPREAD_TOO_HIGH / BRIDGE_OFFLINE
-                      — clean setup but execution conditions fail
-      3. SIGNAL_ONLY  — 3/5 watchlist, or 4-5/5 but enqueue disabled / RR<1.5
-      4. DEMO_TRADE_PLACED — all gates pass
+      1. STAND_ASIDE         — score below 3/5, or no direction
+      2. POSITION_CAP_REACHED — at the hard concurrent-position ceiling
+      3. NEWS_RISK_BLOCKED / SPREAD_TOO_HIGH / BRIDGE_OFFLINE
+                             — clean setup but execution conditions fail
+      4. SIGNAL_ONLY         — 3/5 watchlist, or 4-5/5 but enqueue disabled / RR<1.5
+      5. DEMO_TRADE_PLACED   — all gates pass
       (DEMO_TRADE_REJECTED + INVALIDATED_BEFORE_ENTRY are set post-fact
       by the bridge / monitor — not by this function.)
     """
@@ -410,6 +450,16 @@ def _decide_execution_status(
         return _EXEC_SIGNAL_ONLY, "Watchlist — 3/5 (no demo execution)"
 
     # 4-5/5 from here on — check execution gates
+
+    # POSITION-CAP GATE — risk management before anything else for 4/5+
+    # When at the ceiling, the operator must review/close existing trades
+    # before new ones can enter. Prevents overtrading during trending periods.
+    if open_positions_count >= max_concurrent_positions:
+        return _EXEC_POSITION_CAP, (
+            f"At hard cap of {max_concurrent_positions} open positions — "
+            f"review/close existing trades before new entry"
+        )
+
     if not news_clear:
         return _EXEC_NEWS_BLOCKED, "Inside high-impact news window"
     if not spread_acceptable:
@@ -1087,12 +1137,15 @@ def make_decision(db: Session) -> dict:
                     and settings.allow_demo_trading)
     allow_live   = False   # ← MANDATE: live execution is hard-disabled in this engine
 
-    # ── Bridge / spread / news gates for execution_status ───────────────
+    # ── Bridge / spread / news / position-cap gates ─────────────────────
     bridge_alive = _is_bridge_alive(max_age_seconds=120)
-    # Spread acceptable: scanner sets risk.spreadStatus when live data is fresh
     spread_status = ((scan.get("risk") or {}).get("spreadStatus") or "UNKNOWN").upper()
     spread_acceptable = spread_status in ("OK", "NORMAL", "ACCEPTABLE", "UNKNOWN")
     demo_auto_enqueue = getattr(settings, "demo_auto_enqueue", False)
+
+    # Position-cap snapshot from bridge heartbeat — drives the risk gate
+    pos_snap = _get_open_positions_snapshot()
+    max_positions = getattr(settings, "max_concurrent_positions", 5)
 
     execution_status, exec_reason = _decide_execution_status(
         conditions_passed=conditions_passed,
@@ -1104,6 +1157,8 @@ def make_decision(db: Session) -> dict:
         entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2,
         demo_auto_enqueue=demo_auto_enqueue,
         allow_demo=settings.allow_demo_trading,
+        open_positions_count=pos_snap["count"],
+        max_concurrent_positions=max_positions,
     )
 
     entry_tolerance = _compute_entry_tolerance(atr_h1)
@@ -1179,13 +1234,18 @@ def make_decision(db: Session) -> dict:
             "sweep_reclaimed":  sweep.get("reclaimed", False),
         },
         "diagnostics": {
-            "direction_source": direction_source,    # scanner | predictor | strategist_htf | None
-            "plan_source":      plan_source,         # scanner | strategist_atr | None
-            "d1_bias_local":    d1_bias_local,
-            "h4_bias_local":    h4_bias_local,
-            "sweep_rationale":  sweep.get("rationale"),
-            "scanner_state":    scan.get("marketState"),
-            "scanner_score":    scan.get("qualityScore"),
+            "direction_source":     direction_source,
+            "plan_source":          plan_source,
+            "d1_bias_local":        d1_bias_local,
+            "h4_bias_local":        h4_bias_local,
+            "sweep_rationale":      sweep.get("rationale"),
+            "scanner_state":        scan.get("marketState"),
+            "scanner_score":        scan.get("qualityScore"),
+            # Position-cap visibility
+            "open_positions":       pos_snap["count"],
+            "open_position_tickets": pos_snap["tickets"],
+            "floating_pnl":         pos_snap["floating_pnl"],
+            "max_concurrent_positions": max_positions,
         },
         "key_zones": {
             "immediate_supply": [today_high] if today_high else [],

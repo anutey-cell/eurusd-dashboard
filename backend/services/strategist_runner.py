@@ -57,6 +57,8 @@ _COOLDOWN_S_4OF5         = 600.0     # 10 min — actionable
 _COOLDOWN_S_3OF5         = 3600.0    # 60 min — watchlist (was 10 min, too noisy)
 _STANDBY_COOLDOWN_S      = 3600.0    # 60 min for STAND ASIDE info alerts
 _ENQUEUE_COOLDOWN_S      = 600.0     # 10 min for same-plan re-enqueue
+_AT_CAP_COOLDOWN_S       = 3600.0    # 60 min for "position cap reached" review alerts
+_last_at_cap_at:           float = 0.0
 
 
 def is_weekend_quiet_hours() -> bool:
@@ -178,6 +180,15 @@ def _maybe_fire_alert(verdict: dict) -> None:
         if not (verdict.get("execution_permission") or {}).get("allow_alert"):
             return
 
+        # ── Special path: POSITION_CAP_REACHED — review-mode alert ─────
+        # When we're at the hard ceiling, don't emit the usual signal block;
+        # emit a "review what's open" message instead. The would-have-been
+        # signal is logged in strategist_verdicts but operator must act on
+        # existing trades first.
+        if es == "POSITION_CAP_REACHED":
+            _maybe_fire_position_cap_alert(verdict)
+            return
+
         band = _execution_band(es)
         prior_decision = _last_alert["decision"]
         prior_cp       = _last_alert["conditions_passed"] or 0
@@ -209,6 +220,66 @@ def _maybe_fire_alert(verdict: dict) -> None:
         }
     except Exception as exc:
         log.debug("[strategist_runner] alert hook failed (non-fatal): %s", exc)
+
+
+def _maybe_fire_position_cap_alert(verdict: dict) -> None:
+    """
+    Fire the "🔒 POSITION CAP REACHED" review message when the engine would
+    have entered a new trade but the max-positions ceiling is in effect.
+    60-min cooldown so the operator isn't spammed during a trending session
+    where signals keep meeting 4/5+ but no slot opens up.
+    """
+    global _last_at_cap_at
+    elapsed = time.time() - _last_at_cap_at
+    if elapsed < _AT_CAP_COOLDOWN_S:
+        log.debug("[strategist_runner] AT_CAP alert suppressed (cooldown %.0fs/%.0fs)",
+                  elapsed, _AT_CAP_COOLDOWN_S)
+        return
+    msg = _format_position_cap_alert(verdict)
+    _send_plain(msg)
+    _last_at_cap_at = time.time()
+    log.info("[strategist_runner] AT_CAP alert fired — engine wanted %s %s/5 but at cap",
+             verdict.get("decision"), verdict.get("conditions_passed"))
+
+
+def _format_position_cap_alert(verdict: dict) -> str:
+    """Compose the position-cap review message — concise + actionable."""
+    diag = verdict.get("diagnostics") or {}
+    tp   = verdict.get("trade_plan") or {}
+    open_n  = diag.get("open_positions", 0)
+    max_n   = diag.get("max_concurrent_positions", 5)
+    tickets = diag.get("open_position_tickets") or []
+    floating = diag.get("floating_pnl", 0.0)
+    decision = verdict.get("decision")
+    cp = verdict.get("conditions_passed", 0)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M GMT")
+
+    arrow = "🟢" if decision == "BUY" else "🔴"
+    tickets_str = ", ".join(f"#{t}" for t in tickets[:10]) if tickets else "—"
+    pnl_color = "🟢" if floating >= 0 else "🔴"
+
+    return (
+        f"🔒 XAUUSD POSITION CAP REACHED ({open_n}/{max_n})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Engine wanted: {arrow} {decision}  ·  {cp}/5 conditions\n"
+        f"  Suggested entry: ${tp.get('entry', '—')}\n"
+        f"  SL ${tp.get('stop_loss', '—')}  ·  TP1 ${tp.get('tp1', '—')}  ·  TP2 ${tp.get('tp2', '—')}\n"
+        f"\n"
+        f"⚠️ NOT enqueued — at hard cap of {max_n} concurrent positions.\n"
+        f"\n"
+        f"📂 Open trades on demo:\n"
+        f"  Tickets: {tickets_str}\n"
+        f"  Floating P/L: {pnl_color} ${floating:+.2f}\n"
+        f"\n"
+        f"🛠 ACTION\n"
+        f"  • Review the {open_n} open positions in MT5\n"
+        f"  • Close losers / move winners to breakeven\n"
+        f"  • Or wait — TP1 hits will auto-free slots\n"
+        f"\n"
+        f"Time: {now}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Capital preservation > overtrading."
+    )
 
 
 def _format_invalidation(verdict: dict, *, prior: dict) -> str:
@@ -281,6 +352,15 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
         return None
     mt5_obj = verdict.get("mt5_execution_object") or {}
     if not mt5_obj:
+        return None
+
+    # Defence-in-depth: even though _decide_execution_status already gates
+    # on the cap, double-check here so a stale verdict can't slip through.
+    diag = verdict.get("diagnostics") or {}
+    open_n = diag.get("open_positions", 0)
+    max_n  = diag.get("max_concurrent_positions") or getattr(settings, "max_concurrent_positions", 5)
+    if open_n >= max_n:
+        log.warning("[strategist_runner] enqueue refused: at position cap %d/%d", open_n, max_n)
         return None
 
     # Hard mandate guards
