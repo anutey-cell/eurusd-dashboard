@@ -152,14 +152,81 @@ def mt5_shutdown() -> None:
 
 # ── Order execution (mirrors VPS-side validation) ────────────────────────────
 
+# Cache the resolved symbol after first discovery (saves a symbols_get sweep
+# on every order). Resolved once per daemon process; broker symbol names
+# don't change at runtime.
+_RESOLVED_SYMBOL: Optional[str] = None
+
+
 def _resolve_broker_symbol() -> Optional[str]:
-    """Find which XAUUSD symbol name this broker exposes."""
-    for c in ["XAUUSD", "XAUUSDm", "GOLD", "XAU/USD"]:
-        info = mt5.symbol_info(c)
+    """
+    Find which XAUUSD symbol name this broker exposes. Brokers vary widely:
+      Standard accounts:  XAUUSD
+      Micro accounts:     XAUUSDm
+      Cent accounts:      XAUUSDc
+      Exness Trial:       XAUUSDz / XAUUSDt
+      Raw-spread:         XAUUSD.r / XAUUSD.s
+      CFD aliases:        GOLD, XAU/USD, GOLD#
+      ECN suffixes:       XAUUSD.ecn / XAUUSD_pro / XAUUSD-cd
+
+    Strategy:
+      1. Try common literal names first (fast path)
+      2. Fall back to scanning ALL symbols and matching anything that
+         contains "XAU" + a USD anchor
+      3. Log every candidate so the operator can see what's available
+    """
+    global _RESOLVED_SYMBOL
+    if _RESOLVED_SYMBOL is not None:
+        return _RESOLVED_SYMBOL
+
+    # ── Pass 1: explicit common names (fast) ────────────────────────────
+    explicit = [
+        "XAUUSD", "XAUUSDm", "XAUUSDc", "XAUUSDz", "XAUUSDt",
+        "XAUUSD.r", "XAUUSD.s", "XAUUSD.ecn", "XAUUSD_pro", "XAUUSD-cd",
+        "GOLD", "XAU/USD", "XAU.USD", "GOLD#",
+    ]
+    for name in explicit:
+        info = mt5.symbol_info(name)
         if info:
             if not info.visible:
-                mt5.symbol_select(c, True)
-            return c
+                mt5.symbol_select(name, True)
+            log.info("Symbol resolved via explicit list: %s", name)
+            _RESOLVED_SYMBOL = name
+            return name
+
+    # ── Pass 2: scan all broker symbols, match anything XAU + USD ───────
+    log.warning("No explicit XAUUSD match — scanning broker's full symbol list")
+    try:
+        all_symbols = mt5.symbols_get() or []
+    except Exception as exc:
+        log.error("symbols_get failed: %s", exc)
+        return None
+
+    candidates = []
+    for s in all_symbols:
+        n = s.name.upper().replace("/", "").replace(".", "").replace("_", "").replace("-", "")
+        if "XAU" in n and "USD" in n:
+            candidates.append(s.name)
+
+    if candidates:
+        log.info("XAU/USD candidates found on broker: %s", candidates[:10])
+        # Prefer the shortest name (usually the canonical one for the account type)
+        candidates.sort(key=lambda x: (len(x), x))
+        chosen = candidates[0]
+        info = mt5.symbol_info(chosen)
+        if info and not info.visible:
+            mt5.symbol_select(chosen, True)
+        log.info("Symbol resolved via scan: %s", chosen)
+        _RESOLVED_SYMBOL = chosen
+        return chosen
+
+    # ── Pass 3: nothing matched — dump first 20 symbols for triage ──────
+    sample = [s.name for s in all_symbols[:20]]
+    log.error(
+        "No XAU/USD symbol found on broker. First 20 of %d symbols: %s. "
+        "Check Market Watch in MT5 — the gold symbol may need to be added.",
+        len(all_symbols), sample,
+    )
     return None
 
 
