@@ -477,25 +477,47 @@ def _report_closed(
     lifetime_exceeded: bool = False,
 ) -> None:
     """POST the terminal CLOSED status with mandate post-trade fields."""
-    # Try to read the most recent deal to figure out the realized outcome
-    result_str  = "BREAKEVEN"
+    from datetime import datetime as _dt, timedelta as _td
+    # Try to read the most recent deal to figure out the realized outcome.
+    # MT5's history_deals_get(position=...) is inconsistent across builds — some
+    # return empty without a date range. Use date_from/date_to and filter manually.
+    result_str   = "BREAKEVEN"
     pips_outcome = 0.0
+    close_profit = 0.0
     note         = ""
+    closer       = None
     try:
-        history = mt5.history_deals_get(position=ticket) or []
-        # The closing deal is the one with type opposite to the entry
-        closer = next((d for d in reversed(history) if d.position_id == ticket
-                       and d.entry == mt5.DEAL_ENTRY_OUT), None)
-        if closer:
-            close_price = closer.price
+        # Pull 30 days of deal history (covers all our orphaned trades) and
+        # filter by position_id ourselves. Far more reliable than the
+        # position= kwarg which silently returns [] on some MT5 builds.
+        date_from = _dt.now() - _td(days=30)
+        date_to   = _dt.now() + _td(hours=1)   # +1h cushion for clock skew
+        history = mt5.history_deals_get(date_from, date_to) or []
+        log.info("[monitor %d] history sweep: %d deals in last 30d", ticket, len(history))
+
+        position_deals = [d for d in history if d.position_id == ticket]
+        log.info("[monitor %d] %d deals match position_id", ticket, len(position_deals))
+
+        # Closing deal = DEAL_ENTRY_OUT for this position
+        closer = next((d for d in reversed(position_deals)
+                       if d.entry == mt5.DEAL_ENTRY_OUT), None)
+
+        if closer is not None:
+            close_price  = closer.price
+            close_profit = closer.profit or 0.0
             move = (close_price - entry) if direction == "BUY" else (entry - close_price)
             pips_outcome = round(move, 2)
-            if move > 0.5:    result_str = "WIN"
-            elif move < -0.5: result_str = "LOSS"
-            else:             result_str = "BREAKEVEN"
-            note = f"closed at {close_price:.2f}, move={pips_outcome:+.2f} pts"
+            if   close_profit > 0.05:  result_str = "WIN"
+            elif close_profit < -0.05: result_str = "LOSS"
+            else:                       result_str = "BREAKEVEN"
+            note = f"closed @ {close_price:.2f}  move={pips_outcome:+.2f}pts  profit=${close_profit:+.2f}"
+            log.info("[monitor %d] resolved: %s %s", ticket, result_str, note)
+        else:
+            note = f"position_id={ticket} not in deal history — may still be open or out of window"
+            log.warning("[monitor %d] %s", ticket, note)
     except Exception as exc:
-        log.debug("[monitor %d] history lookup failed: %s", ticket, exc)
+        log.warning("[monitor %d] history lookup failed: %s", ticket, exc)
+        note = f"history lookup error: {exc}"
 
     if lifetime_exceeded:
         note = (note + " · lifetime cap exceeded").strip(" ·")
@@ -542,6 +564,27 @@ def fetch_pending() -> list[dict]:
     except Exception as exc:
         log.warning("fetch_pending error: %s", exc)
         return []
+
+
+def maybe_periodic_reconcile() -> None:
+    """
+    Run reconcile_orphaned_trades every 15 min (in addition to startup).
+    Picks up any orphans that accumulated since the last sweep — useful when
+    monitor threads die mid-run for any reason (network blips etc.).
+    """
+    global _last_periodic_reconcile_at
+    import time as _time
+    now = _time.time()
+    if now - _last_periodic_reconcile_at < 15 * 60:
+        return
+    _last_periodic_reconcile_at = now
+    try:
+        reconcile_orphaned_trades()
+    except Exception as exc:
+        log.warning("periodic reconcile error: %s", exc)
+
+
+_last_periodic_reconcile_at: float = 0.0
 
 
 def claim(order_id: int) -> bool:
@@ -700,6 +743,10 @@ def main():
             if now - last_heartbeat >= HEARTBEAT_SEC:
                 heartbeat()
                 last_heartbeat = now
+
+            # Periodic reconcile sweep (every 15 min) — catches orphans
+            # that monitor threads dropped mid-run.
+            maybe_periodic_reconcile()
 
             # Pull pending orders
             orders = fetch_pending()
