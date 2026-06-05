@@ -202,11 +202,6 @@ def report_result(
     row = db.query(PendingExecution).filter(PendingExecution.id == order_id).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Order not found")
-    if row.status not in ("EXECUTING", "PENDING"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot report result on {row.status} order",
-        )
 
     # CLOSED = the daemon is reporting the position's terminal outcome (post-fill)
     # ACCEPTED = order was filled by MT5 but trade is still open (initial fill report)
@@ -214,8 +209,13 @@ def report_result(
     if result.status not in valid:
         raise HTTPException(status_code=422, detail=f"status must be one of {valid}")
 
-    # Don't overwrite a terminal status with another partial. CLOSED can transition
-    # from ACCEPTED; everything else is one-shot.
+    # Allowed transitions:
+    #   PENDING/EXECUTING → any of {ACCEPTED, REJECTED, FAILED}   (initial outcome)
+    #   ACCEPTED          → CLOSED                                  (post-fill close)
+    # Anything else rejects with 409. The two-stage check below is the
+    # ONLY place that decides whether to accept the report — there was a
+    # redundant earlier check here that blocked ACCEPTED→CLOSED before
+    # this logic ran.
     if row.status == "ACCEPTED" and result.status == "CLOSED":
         pass    # legitimate transition to terminal outcome
     elif row.status not in ("EXECUTING", "PENDING"):
