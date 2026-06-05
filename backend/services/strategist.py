@@ -297,6 +297,17 @@ def _is_bridge_alive(max_age_seconds: int = 120) -> bool:
         return False
 
 
+# Sessions where C4 must refuse regardless of what kz_posture says.
+# Empirically derived: late_SELL n=3 WR=0% expectancy -1.00R (every late-session
+# trade hit full SL during the 2026-05 / 2026-06 data sample). Low-volume
+# windows have wider spreads and thin order books — stops get tagged easily.
+_NEVER_TRADE_SESSIONS = {
+    "Late-session low-quality liquidity",
+    "Post-news disorder",
+    "Asian range formation",      # Asian = directional moves usually faded by London
+}
+
+
 # 5-condition evaluator
 def _evaluate_5_conditions(
     *,
@@ -309,6 +320,7 @@ def _evaluate_5_conditions(
     macro_alignment: str,
     news_clear: bool,
     kz_posture: str | None,
+    session_label: str | None,
     rr: float,
     entry: float | None,
     stop_loss: float | None,
@@ -338,10 +350,18 @@ def _evaluate_5_conditions(
     c3_ok = (scan_market_state == "SIGNAL_READY") or (ict_score >= 60)
 
     # C4: Macro / session does not conflict
+    # Two-layer session check:
+    #   1. kz_posture must be TRADE or PRESS (analyzer's recent-data view)
+    #   2. session_label must NOT be in the empirically-bad session list
+    # Either layer can veto. The session_label check catches cases where
+    # the kz_analyzer hasn't yet learned a session is unprofitable —
+    # e.g., the 3 late_SELL losses in our first 18-trade sample.
+    session_ok = (session_label or "") not in _NEVER_TRADE_SESSIONS
     c4_ok = (
         macro_alignment != "Conflicted"
         and news_clear
         and kz_posture in ("TRADE", "PRESS")
+        and session_ok
     )
 
     # C5: RR + invalidation acceptable
@@ -359,7 +379,10 @@ def _evaluate_5_conditions(
         {"name": "C3 Structure / momentum confirms direction", "passed": c3_ok,
          "detail": f"scanner={scan_market_state} · ict={ict_score}/100"},
         {"name": "C4 Macro / session does not conflict",        "passed": c4_ok,
-         "detail": f"macro={macro_alignment} · news={'CLEAR' if news_clear else 'BLOCK'} · kz={kz_posture or '—'}"},
+         "detail": (
+             f"macro={macro_alignment} · news={'CLEAR' if news_clear else 'BLOCK'} · "
+             f"kz={kz_posture or '—'} · session={'OK' if session_ok else 'BLOCKED('+ (session_label or '')[:30] +')'}"
+         )},
         {"name": "C5 RR + invalidation acceptable",             "passed": c5_ok,
          "detail": f"rr={rr or 0:.2f} · SL={stop_loss} · TP1={tp1} · TP2={tp2}"},
     ]
@@ -1159,6 +1182,7 @@ def make_decision(db: Session) -> dict:
         macro_alignment=macro_aligned,
         news_clear=news_clear,
         kz_posture=kz.get("posture"),
+        session_label=session_mandate,         # ← NEW: catches bad-session windows
         rr=rr or 0,
         entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2,
     )
