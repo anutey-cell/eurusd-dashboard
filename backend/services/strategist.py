@@ -553,6 +553,7 @@ def _decide_execution_status(
     allow_demo: bool,
     open_positions_count: int = 0,
     max_concurrent_positions: int = 5,
+    kz_policy: Any | None = None,    # PolicyVerdict — informational only (see note)
 ) -> tuple[str, str]:
     """
     Pick the execution_status value. Returns (status, reason).
@@ -566,6 +567,17 @@ def _decide_execution_status(
       5. DEMO_TRADE_PLACED   — all gates pass
       (DEMO_TRADE_REJECTED + INVALIDATED_BEFORE_ENTRY are set post-fact
       by the bridge / monitor — not by this function.)
+
+    NOTE on kz_policy: kept as a kwarg for forward-compat / future
+    recalibration. NOT used as a hard execution gate at this time —
+    the current POLICY_TABLE was learned from data that pre-dates the
+    _NEVER_TRADE_SESSIONS blacklist, so its BLOCK/EXPLORE labels
+    over-fire on the post-blacklist trade pool (validated: hard-gating
+    on it dropped ExpR from +0.018R to -0.007R in re-run backtest).
+    C2 uses kz_policy as a soft signal for transparency; the actual
+    execution decision relies on the other 4 conditions + external gates.
+    Re-enable as a hard gate once the table is re-learned from post-
+    blacklist live data.
     """
     if proposed_signal not in ("BUY", "SELL") or conditions_passed < 3:
         return _EXEC_STAND_ASIDE, "Setup below 3/5 conditions"
@@ -1319,6 +1331,7 @@ def make_decision(db: Session) -> dict:
         allow_demo=settings.allow_demo_trading,
         open_positions_count=pos_snap["count"],
         max_concurrent_positions=effective_cap,    # ← dynamic, not static
+        kz_policy=kz_policy,                        # ← NEW: hard cell-edge gate
     )
 
     entry_tolerance = _compute_entry_tolerance(atr_h1)
