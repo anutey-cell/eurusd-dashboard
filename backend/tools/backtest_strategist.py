@@ -59,6 +59,20 @@ from services.strategist import (
     _htf_bias_label,
     _NEVER_TRADE_SESSIONS,
 )
+from services.killzone_policy import evaluate as eval_kz_policy
+
+
+# UTC hour → killzone_key (mirrors KILLZONES table in killzone_analyzer.py)
+# Used to compute kz_policy per bar so the backtest exercises the new C2.
+def _kz_key_for_hour(hour_utc: float) -> str:
+    h = int(hour_utc)
+    if   h >= 22:  return "asian_early"
+    elif h < 6:    return "asian"
+    elif h < 7:    return "london_pre"
+    elif h < 10:   return "london_kz"
+    elif h < 13:   return "overlap"
+    elif h < 16:   return "ny_kz"
+    else:          return "ny_pm"   # 16-22
 
 
 # ── A minimal Bar that mimics what get_candles returns ──────────────────────
@@ -249,6 +263,13 @@ def main(min_bars_history: int = 50, forward_horizon: int = 24):
         if plan["entry"] is None:
             continue
 
+        # kz_policy verdict — used as C2 (empirical edge filter)
+        kz_key = _kz_key_for_hour(hour_utc)
+        kz_pol = eval_kz_policy(
+            killzone_key=kz_key, direction=direction,
+            engine_id="trend_pullback",   # match live engine — bypass=swing only
+        )
+
         # 5-condition evaluation
         conditions = _evaluate_5_conditions(
             proposed_signal=direction,
@@ -264,6 +285,7 @@ def main(min_bars_history: int = 50, forward_horizon: int = 24):
             rr=plan["rr"],
             entry=plan["entry"], stop_loss=plan["stop_loss"],
             tp1=plan["tp1"], tp2=plan["tp2"],
+            kz_policy=kz_pol,                   # ← exercises new empirical C2
         )
         cp = sum(1 for c in conditions if c["passed"])
 
@@ -322,14 +344,15 @@ def main(min_bars_history: int = 50, forward_horizon: int = 24):
     exp_r = mean(all_rs) if all_rs else 0
     print(f"\n  Overall: {len(all_rs)}t  {wins}W/{losses}L/{bes}BE  WR={wr:.1f}%  exp={exp_r:+.3f}R")
 
-    MANDATE_WR = {5: (78, 85), 4: (70, 80)}
+    # Empirical bands from prior 893-trade run (replaced mandate's optimistic 70-85%)
+    EMPIRICAL = {5: "~19% WR · +0.09R", 4: "~19% WR · +0.05R"}
     print("\n-- By conditions_passed --")
     for cp in sorted(by_cp.keys(), reverse=True):
         rs = by_cp[cp]
         w = sum(1 for r in rs if r > 0)
         wr = 100.0 * w / len(rs)
         exp_r = mean(rs)
-        band = f"mandate: {MANDATE_WR[cp][0]}-{MANDATE_WR[cp][1]}%" if cp in MANDATE_WR else ""
+        band = f"prior: {EMPIRICAL[cp]}" if cp in EMPIRICAL else ""
         print(f"  {cp}/5  n={len(rs):>4}  WR={wr:5.1f}%  exp={exp_r:+.3f}R   {band}")
 
     print("\n-- By session --")
