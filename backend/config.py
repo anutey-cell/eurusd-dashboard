@@ -141,6 +141,14 @@ class Settings(BaseSettings):
     # False = legacy 5-gate auto_executor runs (development / back-compat only)
     use_mandate_strategist:          bool = True
 
+    # ── Monday observation mode ───────────────────────────────────────────────
+    # Per operator risk plan: Monday is observation-only. Signal alerts still
+    # fire (so the operator can study Monday's setups + assess weekly direction)
+    # but no MT5 order is enqueued. Execution resumes Tuesday 00:00 UTC.
+    # Rationale: Mondays carry over Friday positioning + open with gap risk;
+    # Tuesday onward gives cleaner institutional flow.
+    monday_observation_mode:         bool = True
+
     # ── Position-cap risk gate (dynamic pyramid) ──────────────────────────────
     # Base cap: 5 concurrent positions of 0.01 lot each.
     # When floating P&L crosses the threshold AND HTF trend continues AND

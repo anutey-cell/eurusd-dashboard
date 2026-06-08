@@ -398,6 +398,7 @@ _EXEC_SPREAD_HIGH      = "SPREAD_TOO_HIGH"
 _EXEC_NEWS_BLOCKED     = "NEWS_RISK_BLOCKED"
 _EXEC_INVALIDATED      = "INVALIDATED_BEFORE_ENTRY"
 _EXEC_POSITION_CAP     = "POSITION_CAP_REACHED"   # ← risk gate: too many open trades
+_EXEC_MONDAY_OBSERVE   = "MONDAY_OBSERVE"         # ← Monday is observation-only per operator risk plan
 
 
 def _volume_confirms_continuation(h1_candles, window: int = 20, recent: int = 3,
@@ -538,6 +539,16 @@ def _decide_execution_status(
         return _EXEC_SIGNAL_ONLY, "Watchlist — 3/5 (no demo execution)"
 
     # 4-5/5 from here on — check execution gates
+
+    # MONDAY OBSERVATION GATE — checked FIRST so it's the clearest signal in
+    # the verdict. Signal alert still fires (decision = BUY/SELL); just no
+    # MT5 enqueue. Operator studies Monday for weekly direction; trades from
+    # Tuesday onward.
+    from services.strategist_runner import is_monday_observation
+    if is_monday_observation():
+        return _EXEC_MONDAY_OBSERVE, (
+            "Monday observation only — execution resumes Tuesday 00:00 UTC"
+        )
 
     # POSITION-CAP GATE — risk management before anything else for 4/5+
     # When at the ceiling, the operator must review/close existing trades

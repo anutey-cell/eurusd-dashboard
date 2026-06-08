@@ -83,6 +83,23 @@ def is_weekend_quiet_hours() -> bool:
     return False
 
 
+def is_monday_observation() -> bool:
+    """
+    True during all of Monday UTC. Per operator risk plan, Monday is
+    observation-only: signals fire so the operator can study setups, but
+    no MT5 order is enqueued. Execution resumes Tuesday 00:00 UTC.
+
+    Sunday 22:00 → Monday 23:59 UTC is the full no-trade window. Sunday
+    evening (post-reopen) is already covered by is_weekend_quiet_hours
+    until 22:00; from 22:00 onward we check this Monday gate.
+    """
+    from config import settings
+    if not getattr(settings, "monday_observation_mode", True):
+        return False
+    now = datetime.now(timezone.utc)
+    return now.weekday() == 0   # Monday
+
+
 # ── Public entry point ───────────────────────────────────────────────────────
 
 def run_once(db: Session) -> dict:
@@ -447,7 +464,10 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
         return None
 
     # Defence-in-depth: even though _decide_execution_status already gates
-    # on the cap, double-check here so a stale verdict can't slip through.
+    # on these, double-check here so a stale verdict can't slip through.
+    if is_monday_observation():
+        log.warning("[strategist_runner] enqueue refused: Monday observation mode")
+        return None
     diag = verdict.get("diagnostics") or {}
     open_n = diag.get("open_positions", 0)
     max_n  = diag.get("max_concurrent_positions") or getattr(settings, "max_concurrent_positions", 5)
