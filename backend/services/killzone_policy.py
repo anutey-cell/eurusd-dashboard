@@ -54,48 +54,62 @@ class PolicyRow:
 
 
 POLICY_TABLE: list[PolicyRow] = [
-    # ── London KZ (07:00-10:00 UTC) — best-edge session ─────────────────────
-    # 84 BUYs at 26.2% WR with 4.5R targets = clear edge.
-    PolicyRow("london_kz", "BUY",  "ALLOW",  84, 26.2, +0.46,
-              "Largest sample, robust positive edge."),
-    # 40 SELLs at 5.0% WR — measured loser. Block.
-    PolicyRow("london_kz", "SELL", "BLOCK",  40,  5.0, -0.50,
-              "Counter-trend SELLs in London consistently fail."),
+    # ─────────────────────────────────────────────────────────────────────────
+    # 893-trade backtest (2025-11-19 → 2026-05-26, real TradingView H1) replaced
+    # the prior 245-paper-observation table. Some directions FLIPPED — e.g.
+    # london_kz SELL was BLOCK in v1 (n=40, -0.50R) but is ALLOW (and the
+    # single best cell) in v2 (n=146, +0.20R). The larger sample is more
+    # trustworthy.
+    #
+    # WR values are around 18-24% across the board — the engine's edge is
+    # R-multiple driven (2.5R reward / 1R risk), not high accuracy. ExpR is
+    # the meaningful metric.
+    # ─────────────────────────────────────────────────────────────────────────
 
-    # ── NY PM (16:00-22:00 UTC) — small but profitable SELL edge ────────────
-    PolicyRow("ny_pm",     "SELL", "ALLOW",  10, 40.0, +0.80,
-              "Small sample (n=10), 40% WR — afternoon mean-reversion edge."),
-    PolicyRow("ny_pm",     "BUY",  "BLOCK",  12, 16.7, -0.10,
-              "BUYs at NY PM fade consistently — late-day momentum dies."),
+    # ── London KZ (07:00-10:00 UTC) — BOTH directions positive ──────────────
+    # Covers mandate "London open sweep" + "London continuation".
+    # SELL was BLOCKED in v1 — turned out to be wrong; v2 shows it's the best cell.
+    PolicyRow("london_kz", "BUY",  "ALLOW",  260, 19.0, +0.077,
+              "London open + continuation BUY — modest +0.08R edge."),
+    PolicyRow("london_kz", "SELL", "ALLOW",  146, 22.0, +0.200,
+              "London open + continuation SELL — best cell at +0.20R."),
 
-    # ── NY KZ (13:00-16:00 UTC) — SURPRISE LOSER ────────────────────────────
-    # Price-action features said this would be best; outcomes proved otherwise.
-    PolicyRow("ny_kz",     "BUY",  "BLOCK",  17, 23.5, -0.10,
-              "Apparent edge in features but trade outcomes negative."),
-    PolicyRow("ny_kz",     "SELL", "BLOCK",  26,  0.0, -0.30,
-              "26 trades, 0 wins. Strong negative cell."),
+    # ── NY KZ (13:00-16:00 UTC) — both modest edges, allow ─────────────────
+    # Covers mandate "New York open sweep".
+    PolicyRow("ny_kz",     "BUY",  "ALLOW",  103, 23.3, +0.078,
+              "NY open BUY — solid +0.08R edge with high relative WR."),
+    PolicyRow("ny_kz",     "SELL", "ALLOW",   57, 17.5, +0.035,
+              "NY open SELL — small but positive edge."),
 
-    # ── Pre-Overlap (10:00-13:00 UTC) — chop window ─────────────────────────
-    PolicyRow("overlap",   "BUY",  "BLOCK",  30, 16.7, -0.20,
-              "Mid-range chop — no follow-through."),
-    PolicyRow("overlap",   "SELL", "BLOCK",  24,  8.3, -0.27,
-              "Mid-range chop — no follow-through."),
+    # ── Overlap / Lunch (10:00-13:00 UTC) — neutral, EXPLORE only ──────────
+    # Covers mandate "London lunch chop". Backtest expectancy ~+0.02R.
+    PolicyRow("overlap",   "BUY",  "EXPLORE", 50, 20.0, +0.020,
+              "Lunch chop BUY — near-zero edge, allow exploratory."),
+    PolicyRow("overlap",   "SELL", "EXPLORE", 30, 16.7, +0.017,
+              "Lunch chop SELL — near-zero edge, allow exploratory."),
 
-    # ── Asian Range — too thin to judge, allow as exploratory ──────────────
+    # ── NY PM (16:00-22:00 UTC) — overlap expansion, MEASURED LOSER ────────
+    # Covers mandate "London/NY overlap expansion". Both directions losing.
+    PolicyRow("ny_pm",     "BUY",  "BLOCK",  163, 16.6, -0.015,
+              "Overlap expansion BUY — small negative edge, block."),
+    PolicyRow("ny_pm",     "SELL", "BLOCK",   84, 13.1, -0.042,
+              "Overlap expansion SELL — worst cell, hard block."),
+
+    # ── Asian range — backtest skipped; legacy table had n=2, EXPLORE ──────
     PolicyRow("asian",     "BUY",  "EXPLORE", 2, 50.0, +4.79,
-              "Only 2 trades. Allow to gather more data."),
+              "Pre-mandate sample only (n=2). Allow to gather data."),
     PolicyRow("asian",     "SELL", "EXPLORE", 0,  0.0,  0.00,
               "No samples. Allow to discover behavior."),
 
-    # ── Sessions with zero historical data — block by default ──────────────
+    # ── Off-session — never trade ──────────────────────────────────────────
     PolicyRow("asian_early","BUY", "BLOCK",  0,  0.0,  0.00,
-              "Off-session — no historical edge measured."),
+              "Off-session — Monday observation + low liquidity."),
     PolicyRow("asian_early","SELL","BLOCK",  0,  0.0,  0.00,
-              "Off-session — no historical edge measured."),
+              "Off-session — Monday observation + low liquidity."),
     PolicyRow("london_pre", "BUY", "BLOCK",  0,  0.0,  0.00,
-              "Pre-session — no historical edge measured."),
+              "Pre-session — wait for London open."),
     PolicyRow("london_pre", "SELL","BLOCK",  0,  0.0,  0.00,
-              "Pre-session — no historical edge measured."),
+              "Pre-session — wait for London open."),
 ]
 
 

@@ -17,15 +17,21 @@ OPERATING MODE
 
 5-CONDITION SCORING MODEL
   C1  Timeframe alignment supports direction
-  C2  Liquidity sweep or liquidity target is confirmed
+  C2  Killzone × direction has positive empirical expectancy
+       (replaces v1's "liquidity sweep confirmed" check, which had ZERO
+        predictive value in the 893-trade backtest. The empirical edge
+        filter is what actually separates winning cells from losers.)
   C3  Structure / momentum confirms direction
   C4  Macro & session context does not conflict
   C5  Risk-reward + invalidation are acceptable
 
-  5/5 → A-grade demo execution allowed   (est WR 78-85%)
-  4/5 → Valid demo execution allowed     (est WR 70-80%)
-  3/5 → Watchlist only, no execution     (est WR 58-68%)
+  5/5 → A-grade demo execution allowed   (~19% WR · +0.09R asymmetric)
+  4/5 → Valid demo execution allowed     (~19% WR · +0.05R asymmetric)
+  3/5 → Watchlist only, no execution
  ≤2/5 → STAND ASIDE
+
+  Edge is R-multiple driven (2.5R reward / 1R risk), not high accuracy.
+  Expect long losing streaks; expectancy is positive over many trades.
 
 EXECUTION STATUS ENUM (always set on every verdict)
   SIGNAL_ONLY · DEMO_TRADE_PLACED · DEMO_TRADE_REJECTED · STAND_ASIDE
@@ -273,11 +279,16 @@ def _classify_liquidity_behaviour(*, scan: dict, model_letter: str, model_confir
     return _LIQ_CHOPPING
 
 
-# Estimated win-rate ranges — mandate values
+# Estimated expectancy strings — replaced the mandate's predicted WR bands
+# with empirical values from the 893-trade backtest (2025-11 → 2026-05).
+# The engine's edge is R-multiple driven (2.5R reward / 1R risk), not high
+# accuracy — observed WR clusters around 18-22% regardless of N/5 band,
+# but positive expectancy per trade. Honest framing matters for operator
+# psychology (long losing streaks are NORMAL).
 def _estimate_win_rate(passed: int) -> str:
-    if passed >= 5: return "78-85%"
-    if passed >= 4: return "70-80%"
-    if passed >= 3: return "58-68%"
+    if passed >= 5: return "~19% WR · +0.09R (asymmetric R · 2.5R reward / 1R risk)"
+    if passed >= 4: return "~19% WR · +0.05R (asymmetric R · 2.5R reward / 1R risk)"
+    if passed >= 3: return "watchlist · no exec"
     return "no trade"
 
 
@@ -326,6 +337,7 @@ def _evaluate_5_conditions(
     stop_loss: float | None,
     tp1: float | None,
     tp2: float | None,
+    kz_policy: Any | None = None,    # PolicyVerdict from killzone_policy.evaluate()
 ) -> list[dict]:
     """
     Score the 5 mandate conditions. Each entry: {name, passed, detail}.
@@ -343,8 +355,31 @@ def _evaluate_5_conditions(
     elif is_sell and tf_alignment_label in (_TF_STRONG_BEAR, _TF_BEAR_EXTENDED):
         c1_ok = True
 
-    # C2: Liquidity sweep / target confirmed
-    c2_ok = model_confirmed and model_letter in ("A", "B", "C", "D")
+    # C2: Empirical (killzone × direction) edge filter
+    # ────────────────────────────────────────────────
+    # Replaces the legacy "model_letter in A/B/C/D" check which in the
+    # 893-trade backtest had ZERO predictive value (5/5 and 4/5 produced
+    # identical WR because model_confirmed never differentiates winners
+    # from losers in this engine's structure).
+    #
+    # The new C2 asks: in this specific killzone, has this direction
+    # produced positive expectancy historically? That's the question that
+    # actually matters for whether the next firing is likely to print
+    # green. ALLOW or EXPLORE pass; BLOCK fails.
+    #
+    # Fallback: if kz_policy is None (no current killzone or upstream
+    # failure), keep the legacy model-letter check so we don't go dark.
+    if kz_policy is not None:
+        c2_ok = kz_policy.decision in ("ALLOW", "EXPLORE")
+        c2_detail = (
+            f"kz-policy {kz_policy.decision} · {kz_policy.killzone} "
+            f"{kz_policy.direction} · n={kz_policy.sample_size} · "
+            f"WR={kz_policy.historical_wr:.1f}% · "
+            f"ExpR={kz_policy.historical_exp_r:+.2f}"
+        )
+    else:
+        c2_ok = model_confirmed and model_letter in ("A", "B", "C", "D")
+        c2_detail = f"Model {model_letter} · confirmed={model_confirmed} (fallback)"
 
     # C3: Structure or momentum confirms direction
     c3_ok = (scan_market_state == "SIGNAL_READY") or (ict_score >= 60)
@@ -374,8 +409,8 @@ def _evaluate_5_conditions(
     return [
         {"name": "C1 Timeframe alignment supports direction",  "passed": c1_ok,
          "detail": tf_alignment_label},
-        {"name": "C2 Liquidity sweep / target confirmed",      "passed": c2_ok,
-         "detail": f"Model {model_letter} · confirmed={model_confirmed}"},
+        {"name": "C2 Killzone × direction edge (empirical)",   "passed": c2_ok,
+         "detail": c2_detail},
         {"name": "C3 Structure / momentum confirms direction", "passed": c3_ok,
          "detail": f"scanner={scan_market_state} · ict={ict_score}/100"},
         {"name": "C4 Macro / session does not conflict",        "passed": c4_ok,
@@ -955,10 +990,15 @@ def make_decision(db: Session) -> dict:
 
     try:
         if proposed_signal in ("BUY", "SELL") and kz.get("current_kz"):
+            # IMPORTANT: engine_id was "swing" which auto-bypasses the policy
+            # table — making kz_policy.allow always True. Switch to
+            # "trend_pullback" so the actual learned (killzone × direction)
+            # row is consulted. This is the empirical edge filter that
+            # backed C2's replacement in the 5-condition gate.
             kz_policy = eval_kz_policy(
                 killzone_key=kz.get("current_kz", "unknown"),
                 direction=proposed_signal,
-                engine_id="swing",
+                engine_id="trend_pullback",
             )
         else:
             kz_policy = None
@@ -1193,9 +1233,10 @@ def make_decision(db: Session) -> dict:
         macro_alignment=macro_aligned,
         news_clear=news_clear,
         kz_posture=kz.get("posture"),
-        session_label=session_mandate,         # ← NEW: catches bad-session windows
+        session_label=session_mandate,         # ← catches bad-session windows
         rr=rr or 0,
         entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2,
+        kz_policy=kz_policy,                    # ← NEW: empirical edge as C2
     )
     conditions_passed = sum(1 for c in conditions if c["passed"])
     est_win_rate = _estimate_win_rate(conditions_passed)
