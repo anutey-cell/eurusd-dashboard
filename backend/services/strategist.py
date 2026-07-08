@@ -286,9 +286,9 @@ def _classify_liquidity_behaviour(*, scan: dict, model_letter: str, model_confir
 # but positive expectancy per trade. Honest framing matters for operator
 # psychology (long losing streaks are NORMAL).
 def _estimate_win_rate(passed: int) -> str:
-    if passed >= 5: return "~19% WR · +0.09R (asymmetric R · 2.5R reward / 1R risk)"
-    if passed >= 4: return "~19% WR · +0.05R (asymmetric R · 2.5R reward / 1R risk)"
-    if passed >= 3: return "watchlist · no exec"
+    if passed >= 5: return "~21% WR · +0.11R (STRONG-TF only · asymmetric R)"
+    if passed >= 4: return "~14% WR · -0.07R (extended-TF drag; signal only)"
+    if passed >= 3: return "watchlist · no exec · no alert"
     return "no trade"
 
 
@@ -346,13 +346,17 @@ def _evaluate_5_conditions(
     is_sell = proposed_signal == "SELL"
 
     # C1: Timeframe alignment supports direction.
-    # STRONG aligned = clean pass. "But extended" (overbought/oversold) is
-    # accepted as a pass too — the trade may still work but with reduced
-    # margin. C4 + C2 will catch when the extended setup is actually unsafe.
+    # STRONG aligned only. "Extended" was previously accepted as a pass
+    # (with the rationalisation that C2/C4 would catch bad setups) — in
+    # practice, "Bullish but extended" = D1+H4 bull AND H1 EMA20>50 AND
+    # RSI≥70. That is a textbook overbought reading; entering long there
+    # is chasing. Same for "Bearish but extended" (oversold). Empirical
+    # noise-reduction pass: fewer 4/5 fires from stretched setups, and
+    # the ones that remain are aligned trends, not late entries.
     c1_ok = False
-    if is_buy  and tf_alignment_label in (_TF_STRONG_BULL,  _TF_BULL_EXTENDED):
+    if is_buy  and tf_alignment_label == _TF_STRONG_BULL:
         c1_ok = True
-    elif is_sell and tf_alignment_label in (_TF_STRONG_BEAR, _TF_BEAR_EXTENDED):
+    elif is_sell and tf_alignment_label == _TF_STRONG_BEAR:
         c1_ok = True
 
     # C2: Empirical (killzone × direction) edge filter
@@ -974,20 +978,16 @@ def make_decision(db: Session) -> dict:
     sweep = _detect_liquidity_sweep(candles_m15=m15, candles_d1=d1)
     log.debug("[strategist] sweep detection: %s", sweep.get("rationale"))
 
-    # ── Direction proposal — scanner > predictor > strategist HTF fallback ─
+    # ── Direction proposal — scanner > predictor. NO HTF FALLBACK. ──────
+    # Previously, when both scanner and predictor abstained (WAIT), the
+    # strategist derived a direction from raw HTF EMA gaps. That was a
+    # major noise source: it fired signals in low-conviction chop where
+    # neither upstream engine had a view. Now we respect the abstention —
+    # no confluence, no proposal, no alert.
     proposed_signal = scan.get("signal") or pred.get("direction") or "WAIT"
-    direction_source = "scanner" if scan.get("signal") in ("BUY", "SELL") else \
-                       "predictor" if pred.get("direction") in ("BUY", "SELL") else None
-    if proposed_signal not in ("BUY", "SELL"):
-        # Both upstream engines abstain. Use HTF EMA alignment as the courage gate.
-        derived, rationale = _derive_direction_from_htf(
-            d1_bias=d1_bias_local, h4_bias=h4_bias_local,
-            h1_ema20=ema20_h1, h1_ema50=ema50_h1,
-        )
-        if derived in ("BUY", "SELL"):
-            proposed_signal = derived
-            direction_source = "strategist_htf"
-            log.info("[strategist] direction derived from HTF: %s (%s)", derived, rationale)
+    direction_source = ("scanner"   if scan.get("signal")   in ("BUY", "SELL")
+                        else "predictor" if pred.get("direction") in ("BUY", "SELL")
+                        else None)
 
     try:
         ict = compute_ict_alignment(
@@ -1285,7 +1285,12 @@ def make_decision(db: Session) -> dict:
 
     # ── Execution permissions ───────────────────────────────────────────
     from config import settings
-    allow_alert  = (decision != "STAND ASIDE")
+    # allow_alert now requires cp>=4. The mandate says 3/5 is "Watchlist
+    # only — no execution"; Telegram alerts on 3/5 have been noise-heavy
+    # for the operator (setup on the cusp, not actionable). 3/5 still
+    # appears on the dashboard and in the strategist_verdicts log; it
+    # just doesn't ping the phone.
+    allow_alert  = (decision != "STAND ASIDE" and conditions_passed >= 4)
     allow_demo   = (decision != "STAND ASIDE" and total_setup_score >= 85
                     and settings.allow_demo_trading)
     allow_live   = False   # ← MANDATE: live execution is hard-disabled in this engine

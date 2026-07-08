@@ -57,6 +57,7 @@ from services.strategist import (
     _evaluate_5_conditions,
     _generate_trade_plan,
     _htf_bias_label,
+    _rsi,
     _NEVER_TRADE_SESSIONS,
 )
 from services.killzone_policy import evaluate as eval_kz_policy
@@ -199,6 +200,7 @@ def main(min_bars_history: int = 50, forward_horizon: int = 24):
         h1_closes = [b.close for b in h1_window]
         ema20_h1  = _ema(h1_closes, 20)
         ema50_h1  = _ema(h1_closes, 50)
+        rsi_h1_val = _rsi(h1_closes)   # real RSI so C1 STRONG-vs-Extended distinction works
 
         d1_bias = _htf_bias_label([b.close for b in d1_window], lookback=20)
         h4_bias = _htf_bias_label([b.close for b in h4_window], lookback=50)
@@ -215,11 +217,11 @@ def main(min_bars_history: int = 50, forward_horizon: int = 24):
         sweep = _detect_liquidity_sweep(candles_m15=h1_window, candles_d1=d1_window,
                                         lookback_m15_bars=8)
 
-        # TF alignment label
+        # TF alignment label — real RSI now feeds Extended detection
         tf_label = _classify_tf_alignment_mandate(
             d1_bias=d1_bias, h4_bias=h4_bias,
             h1_ema20=ema20_h1, h1_ema50=ema50_h1,
-            rsi_h1=50,  # unused by classifier
+            rsi_h1=rsi_h1_val,
         )
 
         # Session — pure function of UTC hour
