@@ -257,10 +257,12 @@ def main(min_bars_history: int = 50, forward_horizon: int = 24):
         )
 
         # Generate trade plan using the live function — ATR-anchored
+        # h1_ema20 wires in the pullback-zone gate (chase-entry rejection)
         current_price = bar.close
         plan = _generate_trade_plan(
             direction=direction, current_price=current_price, atr_h1=atr_h1,
             candles_m15=h1_window,    # use H1 as proxy
+            h1_ema20=ema20_h1,
         )
         if plan["entry"] is None:
             continue
@@ -287,7 +289,8 @@ def main(min_bars_history: int = 50, forward_horizon: int = 24):
             rr=plan["rr"],
             entry=plan["entry"], stop_loss=plan["stop_loss"],
             tp1=plan["tp1"], tp2=plan["tp2"],
-            kz_policy=kz_pol,                   # ← exercises new empirical C2
+            kz_policy=kz_pol,                   # exercises empirical C2
+            candles_m15=h1_window,              # ← NEW: micro-momentum in C3 (H1 proxy)
         )
         cp = sum(1 for c in conditions if c["passed"])
 
