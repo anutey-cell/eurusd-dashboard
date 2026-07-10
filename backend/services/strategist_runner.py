@@ -65,6 +65,28 @@ _last_at_cap_at:           float = 0.0
 # is fine (e.g. SELL → STAND ASIDE → BUY counts as one flip).
 _last_signaled_direction: str | None = None
 
+# ── Pre-formation alerts — 1 hour before each major killzone opens ──────────
+# Operator wants a heads-up when a setup window is APPROACHING so they can get
+# eyes on the screen. These are scheduled by UTC hour: London KZ opens at 07:00
+# UTC → fires at 06:00 UTC; NY KZ opens at 13:00 UTC → fires at 12:00 UTC.
+# Each alert reports current bias / conditions / what to watch. Fires once per
+# window per day (deduped by date string).
+_PRE_FORMATION_WINDOWS = [
+    {
+        "kz_name":         "London KZ",
+        "trigger_utc_hour": 6,     # 1 h before 07:00 UTC (London KZ open)
+        "opens_utc":       "07:00 UTC (10:00 EAT)",
+        "why":             "Highest-probability killzone. Asian range raid + reversal.",
+    },
+    {
+        "kz_name":         "NY KZ",
+        "trigger_utc_hour": 12,    # 1 h before 13:00 UTC (NY KZ open)
+        "opens_utc":       "13:00 UTC (16:00 EAT)",
+        "why":             "NY open raid + reversal. London continuation extension.",
+    },
+]
+_last_preformation_alerts: dict[str, str] = {}   # kz_name → date-string it last fired for
+
 
 def is_weekend_quiet_hours() -> bool:
     """
@@ -113,6 +135,7 @@ def run_once(db: Session) -> dict:
     # Side-effects — order matters: enqueue first so the log can back-link it
     pending_id = _maybe_enqueue_demo_order(db, verdict)
     _maybe_fire_alert(verdict)
+    _maybe_fire_preformation_alert(verdict)   # 1-hour-before-KZ heads-up
 
     try:
         persist_verdict(db, verdict, pending_execution_id=pending_id)
@@ -427,6 +450,125 @@ def _fetch_sentiment() -> tuple[float | None, float | None]:
     except Exception as exc:
         log.debug("[strategist_runner] sentiment fetch failed: %s", exc)
         return (None, None)
+
+
+def _format_preformation_message(verdict: dict, kz_name: str, opens_utc: str, why: str) -> str:
+    """
+    Build the "SETUP FORMING" heads-up message. Uses the current verdict as
+    the state snapshot -- HTF alignment, current price, sweep detection,
+    which conditions are already satisfied.
+    """
+    decision       = verdict.get("decision") or "STAND ASIDE"
+    tf_alignment   = verdict.get("timeframe_alignment") or "—"
+    current_price  = verdict.get("current_price") or 0
+    proposed       = verdict.get("proposed_signal") or verdict.get("decision") or "WAIT"
+
+    diag = verdict.get("diagnostics") or {}
+    d1_bias  = diag.get("d1_bias_local")  or "—"
+    h4_bias  = diag.get("h4_bias_local")  or "—"
+    sweep_rat = diag.get("sweep_rationale") or "no sweep detected"
+    cisd_ok   = diag.get("cisd_confirmed")
+    is_rev    = diag.get("is_reversal_setup", False)
+
+    lm = verdict.get("liquidity_map") or {}
+    prev_day_high = lm.get("prev_day_high", "—")
+    prev_day_low  = lm.get("prev_day_low",  "—")
+
+    # Conditions status (simplified)
+    conds = verdict.get("conditions") or []
+    conds_summary = " · ".join(
+        f"{'✓' if c.get('passed') else '✗'} {c['name'].split()[0]}"   # e.g. "✓ C1"
+        for c in conds
+    )
+    cp = verdict.get("conditions_passed", 0)
+
+    # Trigger criteria (what to watch)
+    watch_lines = []
+    if proposed == "BUY":
+        watch_lines.append(f"• Watch for pullback into H1 EMA20 zone")
+        watch_lines.append(f"• Prev-day LOW sweep + CISD close for reversal BUY")
+        watch_lines.append(f"• Last 3 M15 majority ▲ for micro-momentum agree")
+    elif proposed == "SELL":
+        watch_lines.append(f"• Watch for pullback into H1 EMA20 zone")
+        watch_lines.append(f"• Prev-day HIGH sweep + CISD close for reversal SELL")
+        watch_lines.append(f"• Last 3 M15 majority ▼ for micro-momentum agree")
+    else:
+        watch_lines.append(f"• D1/H4 both need aligned bias (currently {tf_alignment})")
+        watch_lines.append(f"• Scanner or predictor needs a directional read")
+
+    obs_mode = is_monday_observation()
+
+    lines = [
+        f"🔭 SETUP FORMING — {kz_name} opens in 1 hour",
+        f"⏰ {opens_utc}",
+        f"",
+        f"📊 CURRENT STATE",
+        f"Price:     ${current_price}",
+        f"D1 / H4:   {d1_bias} / {h4_bias}",
+        f"TF align:  {tf_alignment}",
+        f"Sweep:     {sweep_rat[:60]}",
+    ]
+    if is_rev and cisd_ok is not None:
+        lines.append(f"CISD:      {'✓ confirmed' if cisd_ok else '✗ awaiting'}")
+    lines.extend([
+        f"",
+        f"🎯 CONDITIONS SO FAR   {cp}/5",
+        f"{conds_summary}",
+        f"",
+        f"👁 WHAT TO WATCH FOR",
+        *watch_lines,
+        f"",
+        f"📍 KEY LEVELS",
+        f"Prev-day high: ${prev_day_high}",
+        f"Prev-day low:  ${prev_day_low}",
+        f"",
+        f"💡 {why}",
+    ])
+    if obs_mode:
+        lines.extend([f"", f"📗 Monday observation — signals fire, no MT5 exec until Tuesday."])
+
+    lines.append(f"")
+    lines.append(f"— Sniper mode active. Get eyes on the screen.")
+    return "\n".join(lines)
+
+
+def _maybe_fire_preformation_alert(verdict: dict) -> None:
+    """
+    Fire a one-per-day "SETUP FORMING" heads-up for each configured killzone
+    when we're within the first 5 minutes of the trigger hour. Dedupe by
+    (kz_name, YYYY-MM-DD).
+    """
+    global _last_preformation_alerts
+
+    if not getattr(settings, "telegram_preformation_alerts", True):
+        return
+    if is_weekend_quiet_hours():
+        return
+
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+
+    for cfg in _PRE_FORMATION_WINDOWS:
+        # Fire within the first 5 minutes of the trigger hour to allow for
+        # scheduler drift, but only once per day.
+        if now.hour != cfg["trigger_utc_hour"] or now.minute >= 5:
+            continue
+        if _last_preformation_alerts.get(cfg["kz_name"]) == today:
+            continue
+
+        try:
+            msg = _format_preformation_message(
+                verdict,
+                kz_name=cfg["kz_name"],
+                opens_utc=cfg["opens_utc"],
+                why=cfg["why"],
+            )
+            _send_plain(msg)
+            _last_preformation_alerts[cfg["kz_name"]] = today
+            log.info("[strategist_runner] pre-formation alert fired for %s", cfg["kz_name"])
+        except Exception as exc:
+            log.warning("[strategist_runner] pre-formation alert failed for %s: %s",
+                        cfg["kz_name"], exc)
 
 
 def _send_plain(text: str) -> None:
