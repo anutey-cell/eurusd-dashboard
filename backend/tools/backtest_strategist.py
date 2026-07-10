@@ -290,7 +290,8 @@ def main(min_bars_history: int = 50, forward_horizon: int = 24):
             entry=plan["entry"], stop_loss=plan["stop_loss"],
             tp1=plan["tp1"], tp2=plan["tp2"],
             kz_policy=kz_pol,                   # exercises empirical C2
-            candles_m15=h1_window,              # ← NEW: micro-momentum in C3 (H1 proxy)
+            candles_m15=h1_window,              # micro-momentum in C3 (H1 proxy)
+            sweep=sweep,                        # ← NEW: CISD reversal gate in C3
         )
         cp = sum(1 for c in conditions if c["passed"])
 

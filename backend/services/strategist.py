@@ -319,6 +319,59 @@ _NEVER_TRADE_SESSIONS = {
 }
 
 
+def _detect_cisd(direction: str, candles_m15, lookback: int = 8) -> tuple[bool, str]:
+    """
+    Change in State of Delivery detection (ICT sniper confirmation).
+
+    Bullish CISD (BUY): find the most recent M15 bar that CLOSED bearish
+    (close < open). Then check whether any subsequent bar within the
+    lookback window CLOSED ABOVE that bar's HIGH. A body-close through
+    the last down-candle's high = decisive break of bearish delivery =
+    sniper confirmation to buy.
+
+    Bearish CISD (SELL): mirror. Find the last bullish M15 (close > open),
+    check for any subsequent CLOSE BELOW its LOW.
+
+    Why this matters: our current sweep+reclaim check is loose — any
+    close back inside prev-day range counts. CISD is tighter: it requires
+    the confirming candle to CLOSE through opposing structure, not just
+    wick or partially retrace. This is what disciplined ICT/SMC snipers
+    (Nephew Sam, Michael Fanning) wait for before pulling the trigger on
+    a reversal.
+
+    Returns (confirmed, rationale).
+    """
+    if not candles_m15 or len(candles_m15) < 3:
+        return (False, "insufficient M15 bars")
+
+    recent = candles_m15[-lookback:]
+    n = len(recent)
+
+    if direction == "BUY":
+        # Walk backwards, find most recent bearish close, then check if any
+        # bar after it closed above its high.
+        for i in range(n - 2, -1, -1):
+            if recent[i].close < recent[i].open:
+                pivot_high = recent[i].high
+                for j in range(i + 1, n):
+                    if recent[j].close > pivot_high:
+                        return (True, f"CISD ✓ close {recent[j].close:.2f} > pivot high {pivot_high:.2f}")
+                return (False, f"CISD ✗ no close above pivot high {pivot_high:.2f}")
+        return (False, "CISD ✗ no recent bearish pivot in window")
+
+    if direction == "SELL":
+        for i in range(n - 2, -1, -1):
+            if recent[i].close > recent[i].open:
+                pivot_low = recent[i].low
+                for j in range(i + 1, n):
+                    if recent[j].close < pivot_low:
+                        return (True, f"CISD ✓ close {recent[j].close:.2f} < pivot low {pivot_low:.2f}")
+                return (False, f"CISD ✗ no close below pivot low {pivot_low:.2f}")
+        return (False, "CISD ✗ no recent bullish pivot in window")
+
+    return (False, "no direction")
+
+
 def _micro_momentum_aligned(direction: str, candles_m15, lookback: int = 3) -> tuple[bool, str]:
     """
     Bob Volman signal-bar rule: for a BUY, the majority of the last N M15
@@ -363,7 +416,8 @@ def _evaluate_5_conditions(
     tp1: float | None,
     tp2: float | None,
     kz_policy: Any | None = None,    # PolicyVerdict from killzone_policy.evaluate()
-    candles_m15: list | None = None, # NEW: for micro-momentum check in C3
+    candles_m15: list | None = None, # for micro-momentum check in C3
+    sweep: dict | None = None,       # NEW: sweep dict for CISD reversal gate in C3
 ) -> list[dict]:
     """
     Score the 5 mandate conditions. Each entry: {name, passed, detail}.
@@ -411,18 +465,32 @@ def _evaluate_5_conditions(
         c2_ok = model_confirmed and model_letter in ("A", "B", "C", "D")
         c2_detail = f"Model {model_letter} · confirmed={model_confirmed} (fallback)"
 
-    # C3: Structure confluence AND micro-momentum agrees
-    # ────────────────────────────────────────────────
-    # Was: (SIGNAL_READY) OR (ict>=60). Now adds a Bob Volman signal-bar
-    # rule as an AND: the last 3 M15 bars must have majority direction
-    # aligned with the trade. Blocks entries against short-term momentum
-    # — the immediate cause of the 42% LOSS rate in backtest.
+    # C3: Structure confluence AND micro-momentum AND (CISD if reversal)
+    # ────────────────────────────────────────────────────────────────
+    # Three-layer check:
+    #   1. structure_ok  — SIGNAL_READY OR ict>=60 (setup type recognized)
+    #   2. momentum_ok   — Bob Volman: last 3 M15 majority in trade direction
+    #   3. cisd_ok       — ICT sniper: if a sweep was reclaimed (reversal
+    #                       setup), require CISD confirmation (body-close
+    #                       through last opposing candle's structure).
+    #                       Continuation setups (no sweep) skip this check.
+    #
+    # CISD gates ONLY reversal setups because that's what it was designed
+    # for. Applying it to trend continuations would over-fire — there's
+    # no reversal to confirm.
     structure_ok = (scan_market_state == "SIGNAL_READY") or (ict_score >= 60)
     if candles_m15 is not None:
         momentum_ok, momentum_detail = _micro_momentum_aligned(proposed_signal, candles_m15, lookback=3)
     else:
         momentum_ok, momentum_detail = (True, "M15 unavailable — skipped")
-    c3_ok = structure_ok and momentum_ok
+
+    is_reversal = bool(sweep and sweep.get("swept") and sweep.get("reclaimed"))
+    if is_reversal and candles_m15 is not None:
+        cisd_ok, cisd_detail = _detect_cisd(proposed_signal, candles_m15, lookback=8)
+    else:
+        cisd_ok, cisd_detail = (True, "continuation setup — CISD n/a" if not is_reversal else "M15 unavailable")
+
+    c3_ok = structure_ok and momentum_ok and cisd_ok
 
     # C4: Macro / session does not conflict
     # Two-layer session check:
@@ -451,8 +519,8 @@ def _evaluate_5_conditions(
          "detail": tf_alignment_label},
         {"name": "C2 Killzone × direction edge (empirical)",   "passed": c2_ok,
          "detail": c2_detail},
-        {"name": "C3 Structure + micro-momentum confirms direction", "passed": c3_ok,
-         "detail": f"scanner={scan_market_state} · ict={ict_score}/100 · {momentum_detail}"},
+        {"name": "C3 Structure + momentum + CISD (reversal-gated)", "passed": c3_ok,
+         "detail": f"scanner={scan_market_state} · ict={ict_score}/100 · {momentum_detail} · {cisd_detail}"},
         {"name": "C4 Macro / session does not conflict",        "passed": c4_ok,
          "detail": (
              f"macro={macro_alignment} · news={'CLEAR' if news_clear else 'BLOCK'} · "
@@ -1314,10 +1382,22 @@ def make_decision(db: Session) -> dict:
         rr=rr or 0,
         entry=entry, stop_loss=stop_loss, tp1=tp1, tp2=tp2,
         kz_policy=kz_policy,                    # ← empirical edge as C2
-        candles_m15=m15,                        # ← NEW: micro-momentum in C3
+        candles_m15=m15,                        # ← micro-momentum in C3
+        sweep=sweep,                            # ← NEW: CISD reversal gate in C3
     )
     conditions_passed = sum(1 for c in conditions if c["passed"])
     est_win_rate = _estimate_win_rate(conditions_passed)
+
+    # CISD status for verdict readout (recomputed cheaply; matches C3 logic)
+    _is_reversal = bool(sweep and sweep.get("swept") and sweep.get("reclaimed"))
+    if _is_reversal and proposed_signal in ("BUY", "SELL"):
+        _cisd_ok, _cisd_detail = _detect_cisd(proposed_signal, m15, lookback=8)
+        _verdict_cisd_status = {"confirmed": _cisd_ok, "detail": _cisd_detail,
+                                "is_reversal": True}
+    else:
+        _verdict_cisd_status = {"confirmed": None,
+                                "detail": "continuation setup — CISD n/a",
+                                "is_reversal": False}
 
     # ── MANDATE DECISION ────────────────────────────────────────────────
     # Per the mandate:
@@ -1476,6 +1556,13 @@ def make_decision(db: Session) -> dict:
             "sweep_side":       sweep.get("side"),
             "sweep_level":      sweep.get("level"),
             "sweep_reclaimed":  sweep.get("reclaimed", False),
+            # CISD (Change in State of Delivery) — sniper confirmation for reversals.
+            # Only meaningful when a reversal setup is in play (sweep + reclaim).
+            # For continuation setups (no sweep), cisd_confirmed is reported as
+            # None (n/a) so downstream consumers can distinguish.
+            "cisd_confirmed":   _verdict_cisd_status["confirmed"],
+            "cisd_detail":      _verdict_cisd_status["detail"],
+            "is_reversal_setup": _verdict_cisd_status["is_reversal"],
         },
         "diagnostics": {
             "direction_source":     direction_source,
