@@ -122,6 +122,21 @@ def is_monday_observation() -> bool:
     return now.weekday() == 0   # Monday
 
 
+# ── Momentum-continuation state (secondary signal source) ───────────────────
+# The mandate strategist is designed for MEAN-REVERSION setups (pullback →
+# CISD reclaim). It systematically misses EXTENSION moves — clean momentum
+# breakouts where price never retraces. The momentum-continuation engine
+# (services.intraday_strategies.analyze_momentum_breakout) fills that gap
+# as a SECONDARY signal source: signal-only, no MT5 execution, tagged
+# clearly so the operator can distinguish sniper vs momentum trades.
+_last_momentum_alert: dict = {
+    "direction":  None,     # "BUY" | "SELL" | None
+    "bar_time":   None,     # ISO string of the breakout bar
+    "sent_at":    0.0,
+}
+_MOMENTUM_COOLDOWN_S = 900.0     # 15 min between momentum alerts (same direction)
+
+
 # ── Public entry point ───────────────────────────────────────────────────────
 
 def run_once(db: Session) -> dict:
@@ -136,6 +151,7 @@ def run_once(db: Session) -> dict:
     pending_id = _maybe_enqueue_demo_order(db, verdict)
     _maybe_fire_alert(verdict)
     _maybe_fire_preformation_alert(verdict)   # 1-hour-before-KZ heads-up
+    _maybe_fire_momentum_alert(db, verdict)   # secondary momentum-continuation source
 
     try:
         persist_verdict(db, verdict, pending_execution_id=pending_id)
@@ -569,6 +585,116 @@ def _maybe_fire_preformation_alert(verdict: dict) -> None:
         except Exception as exc:
             log.warning("[strategist_runner] pre-formation alert failed for %s: %s",
                         cfg["kz_name"], exc)
+
+
+def _maybe_fire_momentum_alert(db: Session, verdict: dict) -> None:
+    """
+    Secondary signal source: momentum-continuation.
+
+    The mandate strategist is designed for pullback/reversal setups. This
+    hook complements it by firing alerts on clean momentum breakouts the
+    mandate misses. Signal-only — no MT5 execution, no PendingExecution
+    enqueue. Operator judges whether to take it manually.
+
+    Fires ONLY when:
+      - mandate verdict is STAND_ASIDE or SIGNAL_ONLY (not competing)
+      - momentum_breakout returns BUY or SELL on the latest M15 close
+      - not weekend + not Monday-observation-with-toggle-off
+      - not within cooldown for the same-direction previous momentum alert
+      - not on the same M15 bar we already alerted on
+    """
+    global _last_momentum_alert
+    if is_weekend_quiet_hours():
+        return
+
+    # Only compete-when-mandate-is-quiet
+    mandate_es = verdict.get("execution_status") or ""
+    if mandate_es not in ("STAND_ASIDE", "SIGNAL_ONLY", "MONDAY_OBSERVE"):
+        return
+
+    try:
+        from services.intraday_strategies import analyze_momentum_breakout
+        from data.candles import get_candles
+        from data.calendar import get_calendar
+
+        m15 = get_candles(interval="M15", limit=200, pair="xauusd")
+        if not m15 or not m15.candles:
+            return
+        candles = m15.candles
+        latest_bar = candles[-1]
+        bar_time_iso = (latest_bar.time.isoformat() if hasattr(latest_bar.time, "isoformat")
+                        else str(latest_bar.time))
+
+        # Same-bar dedupe: don't re-alert on the same breakout bar
+        if _last_momentum_alert.get("bar_time") == bar_time_iso:
+            return
+
+        # Pull macro events for news filter
+        try:
+            cal = get_calendar()
+            macro_events = [e.model_dump() for e in (cal.events or [])] if cal else []
+        except Exception:
+            macro_events = []
+
+        now = datetime.now(timezone.utc)
+        result = analyze_momentum_breakout(
+            candles=candles, at=now, macro_events=macro_events, pip_size=1.0,
+        )
+
+        if result.signal not in ("BUY", "SELL"):
+            return
+
+        # Direction-cooldown dedupe (same-direction within window)
+        elapsed = time.time() - _last_momentum_alert.get("sent_at", 0)
+        if (_last_momentum_alert.get("direction") == result.signal
+                and elapsed < _MOMENTUM_COOLDOWN_S):
+            return
+
+        msg = _format_momentum_message(result, verdict)
+        _send_plain(msg)
+        _last_momentum_alert = {
+            "direction":  result.signal,
+            "bar_time":   bar_time_iso,
+            "sent_at":    time.time(),
+        }
+        log.info("[strategist_runner] momentum alert fired: %s @ %s (bar %s)",
+                 result.signal, result.entry, bar_time_iso[:16])
+    except Exception as exc:
+        log.warning("[strategist_runner] momentum alert failed: %s", exc)
+
+
+def _format_momentum_message(result, verdict: dict) -> str:
+    """Momentum-continuation signal — clearly distinguished from mandate signals."""
+    direction   = result.signal
+    icon        = "🟢" if direction == "BUY" else "🔴"
+    entry       = f"${result.entry:.2f}" if result.entry else "—"
+    sl          = f"${result.stop_loss:.2f}" if result.stop_loss else "—"
+    tp          = f"${result.take_profit:.2f}" if result.take_profit else "—"
+    rr          = f"{result.rr:.2f}" if result.rr else "—"
+    reason      = (result.reason or "—")[:120]
+
+    mandate_state = verdict.get("execution_status", "STAND_ASIDE")
+    tf_align      = verdict.get("tf_alignment_label", "—")
+
+    return (
+        f"⚡ MOMENTUM CONTINUATION — secondary signal\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{icon} {direction} · momentum_breakout\n"
+        f"\n"
+        f"Entry:     {entry}\n"
+        f"SL:        {sl}\n"
+        f"TP:        {tp}\n"
+        f"RR:        {rr}\n"
+        f"\n"
+        f"Setup:     {reason}\n"
+        f"HTF align: {tf_align}\n"
+        f"Mandate:   {mandate_state}  (this is a SECONDARY signal,\n"
+        f"           mandate stayed quiet on this move)\n"
+        f"\n"
+        f"⚠ Signal-only. No MT5 execution. Operator judgement.\n"
+        f"    Momentum trades have different edge profile than\n"
+        f"    the 5/5 sniper mandate — use tighter stops."
+    )
 
 
 def _send_plain(text: str) -> None:
