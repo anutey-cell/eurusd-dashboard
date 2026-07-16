@@ -79,6 +79,9 @@ def _build_summary(db: Session) -> dict:
         "verdict":        _safe(lambda: _verdict_section(db)),
         "trade_plan":     _safe(lambda: _trade_plan_section(db)),
         "liquidity_model":_safe(lambda: _liquidity_section(db)),
+        # Engineered-liquidity map (7 zone types, magnetism-ranked). Consumed by
+        # the dashboard's liquidity pool visualization + external AI cross-ref.
+        "liquidity_map":  _safe(lambda: _liquidity_map_section(db)),
         "macro":          _safe(lambda: _macro_section(db)),
         "calendar":       _safe(_calendar_section),
         "killzone":       _safe(lambda: _killzone_section(db)),
@@ -201,6 +204,42 @@ def _liquidity_section(db: Session) -> dict:
         "sweep_level":      lm.get("sweep_level"),
         "sweep_reclaimed":  lm.get("sweep_reclaimed", False),
         "key_zones":        v.get("key_zones", {}),
+    }
+
+
+def _liquidity_map_section(db: Session) -> dict:
+    """Engineered-liquidity map + sniper playbook. The dashboard's pool
+    visualization consumes this; external AI cross-reference also reads it."""
+    from services.liquidity_map import sniper_playbook
+    from types import SimpleNamespace
+
+    v  = _cached_verdict(db)
+    lm = v.get("liquidity_map")
+    if not lm:
+        return {"available": False, "reason": "map not built (upstream data failure)"}
+
+    # Build a lightweight object for sniper_playbook() (expects attribute access)
+    def _z(d): return SimpleNamespace(**d) if d else None
+    lm_obj = SimpleNamespace(
+        current_price=lm.get("current_price"),
+        atr_h1=lm.get("atr_h1"),
+        buy_side_pools=[_z(z) for z in (lm.get("buy_side_pools") or [])],
+        sell_side_pools=[_z(z) for z in (lm.get("sell_side_pools") or [])],
+        nearest_above=_z(lm.get("nearest_above")),
+        nearest_below=_z(lm.get("nearest_below")),
+        highest_magnetism=_z(lm.get("highest_magnetism")),
+    )
+    playbook = sniper_playbook(lm_obj, htf_bias=v.get("tf_alignment_label") or "")
+    return {
+        "available":       True,
+        "current_price":   lm.get("current_price"),
+        "atr_h1":          lm.get("atr_h1"),
+        "buy_side_pools":  lm.get("buy_side_pools"),
+        "sell_side_pools": lm.get("sell_side_pools"),
+        "nearest_above":   lm.get("nearest_above"),
+        "nearest_below":   lm.get("nearest_below"),
+        "highest_magnetism": lm.get("highest_magnetism"),
+        "playbook":        playbook,
     }
 
 

@@ -35,11 +35,17 @@ log = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────────────────
 
 def build_briefing(db: Session) -> Optional[str]:
-    """Compose the daily briefing. Returns text or None on failure. Never raises."""
+    """Compose the daily briefing. Returns text or None on failure. Never raises.
+
+    The strategist verdict already carries the engineered-liquidity map as
+    `verdict["liquidity_map"]`. We reconstruct a lightweight object here from
+    that dict so we can call the same `render_zones_for_brief` / `sniper_playbook`
+    helpers without rebuilding the map (avoiding a double-compute per cycle).
+    """
     try:
         verdict = _pull_strategist_verdict(db)
         market  = _pull_market_snapshot()
-        liquidity_map = _pull_liquidity_map(verdict, market)
+        liquidity_map = _rehydrate_liquidity_map(verdict)
         try:
             from services.regime_stability import compute_regime_stability, format_regime_stability_block
             regime_block = format_regime_stability_block(compute_regime_stability(db))
@@ -112,31 +118,29 @@ def _pull_market_snapshot() -> dict:
     }
 
 
-def _pull_liquidity_map(verdict: dict, market: dict):
-    """Build the engineered-liquidity map from the same candles the strategist used."""
-    from services.liquidity_map import build_liquidity_map
-
-    current = market.get("current")
-    if current is None:
+def _rehydrate_liquidity_map(verdict: dict):
+    """Reconstruct a LiquidityMap-like object from the verdict's `liquidity_map`
+    dict so we can reuse render_zones_for_brief / sniper_playbook without a
+    double compute. Returns None if the verdict didn't carry a map (e.g. on
+    upstream failure)."""
+    lm_dict = verdict.get("liquidity_map")
+    if not lm_dict:
         return None
-    # ATR from the verdict — the strategist already computed it. Fall back to 30
-    # if not exposed (safe default for gold noise floor).
-    diag = verdict.get("diagnostics") or {}
-    atr  = float(diag.get("atr_h1") or verdict.get("atr_h1") or 30.0)
-    htf_bias = verdict.get("tf_alignment_label") or ""
+    from types import SimpleNamespace
 
-    try:
-        return build_liquidity_map(
-            candles_m15=market.get("candles_m15") or [],
-            candles_h1=market.get("candles_h1")  or [],
-            candles_d1=market.get("candles_d1")  or [],
-            current_price=current,
-            atr_h1=atr,
-            htf_bias=htf_bias,
-        )
-    except Exception as exc:
-        log.warning("[briefing] liquidity map build failed: %s", exc)
-        return None
+    def _to_zone(d: dict):
+        return SimpleNamespace(**d)
+
+    return SimpleNamespace(
+        current_price=lm_dict.get("current_price"),
+        atr_h1=lm_dict.get("atr_h1"),
+        generated_at=None,
+        buy_side_pools=[_to_zone(z) for z in (lm_dict.get("buy_side_pools") or [])],
+        sell_side_pools=[_to_zone(z) for z in (lm_dict.get("sell_side_pools") or [])],
+        nearest_above=_to_zone(lm_dict["nearest_above"]) if lm_dict.get("nearest_above") else None,
+        nearest_below=_to_zone(lm_dict["nearest_below"]) if lm_dict.get("nearest_below") else None,
+        highest_magnetism=_to_zone(lm_dict["highest_magnetism"]) if lm_dict.get("highest_magnetism") else None,
+    )
 
 
 # ────────────────────────────────────────────────────────────────────────────

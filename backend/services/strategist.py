@@ -1107,6 +1107,20 @@ def make_decision(db: Session) -> dict:
     sweep = _detect_liquidity_sweep(candles_m15=m15, candles_d1=d1)
     log.debug("[strategist] sweep detection: %s", sweep.get("rationale"))
 
+    # ── Engineered liquidity map — 7 zone types, ranked by magnetism ────
+    # Single source of truth: brief, dashboard, /api/summary and pre-formation
+    # alerts all consume the SAME map. Built once here per decision cycle.
+    try:
+        from services.liquidity_map import build_liquidity_map
+        liquidity_map_obj = build_liquidity_map(
+            candles_m15=m15, candles_h1=h1, candles_d1=d1,
+            current_price=current_price, atr_h1=atr_h1,
+            htf_bias=d1_bias_local + " " + h4_bias_local,
+        )
+    except Exception as exc:
+        log.warning("[strategist] liquidity_map build failed: %s", exc)
+        liquidity_map_obj = None
+
     # ── Direction proposal — scanner > predictor. NO HTF FALLBACK. ──────
     # Previously, when both scanner and predictor abstained (WAIT), the
     # strategist derived a direction from raw HTF EMA gaps. That was a
@@ -1585,6 +1599,9 @@ def make_decision(db: Session) -> dict:
             "cap_volume_required":  vol_ratio_threshold,
             "cap_block_reasons":    cap_block_reasons,
         },
+        # Engineered liquidity map — the sniper's playbook data. Consumed by
+        # daily brief, dashboard, pre-formation alerts. Single source of truth.
+        "liquidity_map": (liquidity_map_obj.to_dict() if liquidity_map_obj else None),
         "key_zones": {
             "immediate_supply": [today_high] if today_high else [],
             "immediate_demand": [today_low]  if today_low  else [],
