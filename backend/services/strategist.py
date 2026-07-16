@@ -1121,16 +1121,36 @@ def make_decision(db: Session) -> dict:
         log.warning("[strategist] liquidity_map build failed: %s", exc)
         liquidity_map_obj = None
 
-    # ── Direction proposal — scanner > predictor. NO HTF FALLBACK. ──────
-    # Previously, when both scanner and predictor abstained (WAIT), the
-    # strategist derived a direction from raw HTF EMA gaps. That was a
-    # major noise source: it fired signals in low-conviction chop where
-    # neither upstream engine had a view. Now we respect the abstention —
-    # no confluence, no proposal, no alert.
+    # ── Direction proposal — scanner > predictor > STRONG-only HTF fallback ─
+    # v1: HTF fallback fired even on weak/extended alignment → chop noise.
+    # v2: killed the fallback entirely → silent when scanner stalls (as it
+    #     did during the DATA_STALE incident). Missed clear trends.
+    # v3 (current): fallback ONLY when TF alignment is STRONG bullish or
+    #     STRONG bearish. Extended (RSI stretched) or Conflicted → still
+    #     respect the abstention. This is the Al Brooks rule: "in an obvious
+    #     strong trend, trade WITH it even without a clean signal."
     proposed_signal = scan.get("signal") or pred.get("direction") or "WAIT"
     direction_source = ("scanner"   if scan.get("signal")   in ("BUY", "SELL")
                         else "predictor" if pred.get("direction") in ("BUY", "SELL")
                         else None)
+
+    if proposed_signal not in ("BUY", "SELL"):
+        # Both upstream engines abstained. Check if HTF alignment is STRONG.
+        # Compute the mandate label first so we have the STRONG classifier.
+        _tf_label_probe = _classify_tf_alignment_mandate(
+            d1_bias=d1_bias_local, h4_bias=h4_bias_local,
+            h1_ema20=ema20_h1, h1_ema50=ema50_h1,
+            rsi_h1=rsi_h1,
+        )
+        if _tf_label_probe == _TF_STRONG_BULL:
+            proposed_signal = "BUY"
+            direction_source = "strategist_htf_strong"
+            log.info("[strategist] STRONG-bull HTF fallback: proposing BUY")
+        elif _tf_label_probe == _TF_STRONG_BEAR:
+            proposed_signal = "SELL"
+            direction_source = "strategist_htf_strong"
+            log.info("[strategist] STRONG-bear HTF fallback: proposing SELL")
+        # Weak/Extended/Conflicted → stay silent (no fallback)
 
     try:
         ict = compute_ict_alignment(
