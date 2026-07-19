@@ -466,3 +466,84 @@ def compute_current_prev_day_profile(
     except Exception as exc:
         log.warning("[vp_trap] compute_current_prev_day_profile failed: %s", exc)
         return None
+
+
+# ── Phase 2: Zone scan orchestrator ─────────────────────────────────────────
+
+def _bars_since(candles: list, since: datetime) -> list:
+    """Return bars whose time is >= since (UTC)."""
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    out = []
+    for c in candles:
+        t = c.time if c.time.tzinfo else c.time.replace(tzinfo=timezone.utc)
+        t = t.astimezone(timezone.utc)
+        if t >= since:
+            out.append(c)
+    return out
+
+
+def scan_and_persist_zones(db, expiry_hours: int = 48,
+                           min_displacement_pts: float = 5.0,
+                           retest_tolerance_pts:  float = 3.0,
+                           max_retests:           int   = 3) -> list[dict]:
+    """
+    Full zone scan cycle: build profile → create 4 candidate zones → walk
+    bars → advance state → persist to DB → return zone dicts.
+
+    Called from the strategist runner background loop (Phase 2 has no
+    alerts yet — just state tracking + endpoint exposure).
+
+    Deterministic and idempotent — running twice yields identical DB state.
+    """
+    from services.vp_trap_state import (
+        zones_from_profile, scan_zone, upsert_zone,
+    )
+    profile = compute_current_prev_day_profile()
+    if profile is None:
+        log.debug("[vp_trap] scan: no profile — skip")
+        return []
+
+    try:
+        from data.candles import get_candles
+        m15_resp = get_candles(interval="M15", limit=500, pair="xauusd")
+        candles = m15_resp.candles if m15_resp and m15_resp.candles else []
+    except Exception as exc:
+        log.warning("[vp_trap] scan: candle fetch failed: %s", exc)
+        return []
+
+    since = profile.computed_at
+    bars_window = _bars_since(candles, since)
+    # Fallback: if profile was computed_at just now, "since" == now-ish and
+    # there'll be no bars. Use the profile's day-end as the reference instead
+    # so we always have SOME bars since the day the profile represents.
+    if not bars_window:
+        try:
+            day_end = datetime.strptime(profile.profile_date, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc) + timedelta(days=1)
+            bars_window = _bars_since(candles, day_end)
+        except Exception:
+            pass
+
+    zones = zones_from_profile(profile, expiry_hours=expiry_hours)
+    out: list[dict] = []
+    for z in zones:
+        scan_zone(
+            z, bars_window,
+            min_displacement_pts=min_displacement_pts,
+            retest_tolerance_pts=retest_tolerance_pts,
+            max_retests=max_retests,
+        )
+        try:
+            upsert_zone(db, z)
+        except Exception as exc:
+            log.warning("[vp_trap] upsert failed for %s: %s", z.zone_id, exc)
+        out.append(z.to_dict())
+
+    try:
+        db.commit()
+    except Exception as exc:
+        log.warning("[vp_trap] commit failed: %s", exc)
+        db.rollback()
+
+    return out

@@ -18,9 +18,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
 
 from config import settings
+from database import get_db
 from models.common import APIResponse
 
 router = APIRouter(prefix="/vp-trap", tags=["vp_trap"])
@@ -138,3 +140,54 @@ def get_profile_for_date(
         raise HTTPException(status_code=422,
                             detail=f"Profile computation returned None (degenerate day?)")
     return APIResponse(data=profile.to_dict(), source=f"vp_trap:profile:historical:{date}")
+
+
+# ── Phase 2: zone endpoints ────────────────────────────────────────────────
+
+@router.get("/zones")
+def get_active_zones(
+    include_terminal: bool = Query(False,
+        description="Include EXPIRED/INVALIDATED zones as well as active ones"),
+    db: Session = Depends(get_db),
+) -> APIResponse:
+    """Return the currently persisted trap zones with their states.
+
+    Reads from the vp_trap_zones table. Populated by scan_and_persist_zones()
+    which runs from the strategist runner background loop (Phase 2) OR the
+    /scan endpoint below (manual trigger).
+    """
+    from services.vp_trap_state import load_active_zones
+    try:
+        zones = load_active_zones(db, exclude_terminal=(not include_terminal))
+    except Exception as exc:
+        log.exception("[vp-trap] zone load failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"zone load failed: {exc}")
+    return APIResponse(
+        data={
+            "count":            len(zones),
+            "include_terminal": include_terminal,
+            "zones":            zones,
+        },
+        source="vp_trap:zones",
+    )
+
+
+@router.post("/scan")
+def force_scan(db: Session = Depends(get_db)) -> APIResponse:
+    """Force a full scan cycle: rebuild profile + candidate zones + advance
+    state + persist. Ops endpoint for testing.
+
+    In steady-state, the strategist runner's background loop calls
+    scan_and_persist_zones() automatically. This route lets you re-run on
+    demand without waiting for the next tick.
+    """
+    from services.vp_trap_strategy import scan_and_persist_zones
+    try:
+        zones = scan_and_persist_zones(db)
+    except Exception as exc:
+        log.exception("[vp-trap] force scan failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"scan failed: {exc}")
+    return APIResponse(
+        data={"scanned": len(zones), "zones": zones},
+        source="vp_trap:scan:forced",
+    )

@@ -152,6 +152,7 @@ def run_once(db: Session) -> dict:
     _maybe_fire_alert(verdict)
     _maybe_fire_preformation_alert(verdict)   # 1-hour-before-KZ heads-up
     _maybe_fire_momentum_alert(db, verdict)   # secondary momentum-continuation source
+    _maybe_scan_vp_trap_zones(db)             # Phase 2 — advance state, no alerts yet
 
     try:
         persist_verdict(db, verdict, pending_execution_id=pending_id)
@@ -585,6 +586,34 @@ def _maybe_fire_preformation_alert(verdict: dict) -> None:
         except Exception as exc:
             log.warning("[strategist_runner] pre-formation alert failed for %s: %s",
                         cfg["kz_name"], exc)
+
+
+def _maybe_scan_vp_trap_zones(db: Session) -> None:
+    """
+    Phase 2 hook: advance vp_trap zone states. NO alerts yet.
+
+    Runs the profile → 4 candidate zones → state machine → DB upsert cycle
+    once per runner tick. Cheap (few dozen bars, no heavy compute). If the
+    feature is disabled or scan fails, silently skip — never affects the
+    mandate path.
+    """
+    if not getattr(settings, "vp_trap_enabled", False):
+        return
+    try:
+        from services.vp_trap_strategy import scan_and_persist_zones
+        expiry_hours       = getattr(settings, "vp_trap_zone_expiry_hours", 48)
+        max_retests        = getattr(settings, "vp_trap_max_retests", 3)
+        zones = scan_and_persist_zones(
+            db,
+            expiry_hours=expiry_hours,
+            max_retests=max_retests,
+        )
+        # Trace-level state counter — helps confirm the scan is running
+        if zones:
+            states = [z.get("state") for z in zones]
+            log.debug("[vp_trap] scanned %d zones: %s", len(zones), ",".join(states))
+    except Exception as exc:
+        log.warning("[vp_trap] scan hook failed: %s", exc)
 
 
 def _maybe_fire_momentum_alert(db: Session, verdict: dict) -> None:
