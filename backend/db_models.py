@@ -456,3 +456,118 @@ class EngineWeightsRecord(Base):
     overall_win_rate = Column(Float,   nullable=False, default=0.0)
     maturity_score   = Column(Integer, nullable=False, default=0)    # 0–100
     calibrated       = Column(Boolean, nullable=False, default=False) # True if any weight adjusted
+
+
+# ── vp_trap_zones ─────────────────────────────────────────────────────────────
+
+class VpTrapZone(Base):
+    """
+    A candidate "trapped trader" zone derived from the previous day's volume
+    profile. One row per (date, level_type, level_side). The zone progresses
+    through states as price interacts with the level. Persistent so it survives
+    container restart.
+    """
+    __tablename__ = "vp_trap_zones"
+
+    id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    created_at        = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    updated_at        = Column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+
+    # Identity
+    instrument        = Column(String(16), nullable=False, default="XAU/USD", index=True)
+    zone_id           = Column(String(32), nullable=False, unique=True, index=True)   # SHA hash
+    profile_date      = Column(String(10), nullable=False, index=True)                # YYYY-MM-DD (the prev day)
+    level_type        = Column(String(16), nullable=False)   # PDH | PDL | VAH | VAL | POC
+    level_side        = Column(String(4),  nullable=False)   # BUY (trapped-seller zone, below price)
+                                                              # or SELL (trapped-buyer zone, above price)
+    reference_price   = Column(Float,      nullable=False)   # the exact prev-day level
+
+    # State machine
+    state             = Column(String(24), nullable=False, default="LEVEL_DETECTED", index=True)
+      # LEVEL_DETECTED | BREAKOUT_SEEN | TRAP_ARMED | WAITING_RETEST | RETEST_ACTIVE
+      # | TRIGGERED | INVALIDATED | EXPIRED
+    state_reason      = Column(String(255), nullable=True)   # human-readable why in current state
+
+    # Trap evidence (populated as state advances)
+    breakout_time     = Column(DateTime(timezone=True), nullable=True)
+    breakout_extreme  = Column(Float, nullable=True)          # furthest point beyond level
+    reclaim_time      = Column(DateTime(timezone=True), nullable=True)
+    reclaim_price     = Column(Float, nullable=True)          # price when it closed back through
+    displacement_pts  = Column(Float, nullable=True)          # magnitude of counter-move
+    retest_count      = Column(Integer, nullable=False, default=0)
+    last_touched_at   = Column(DateTime(timezone=True), nullable=True)
+
+    # Volume data quality
+    volume_source     = Column(String(16), nullable=False, default="tick_proxy")
+      # comex_gc | broker_real | tick_proxy
+    volume_at_level   = Column(Float, nullable=True)          # observed vol at the breakout wick
+
+    # Expiry
+    expires_at        = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    # Diagnostics
+    profile_json      = Column(Text, nullable=True)          # snapshot of the day's full profile
+
+
+# ── vp_trap_signals ───────────────────────────────────────────────────────────
+
+class VpTrapSignal(Base):
+    """
+    A tradable BUY/SELL signal produced by the vp_trap strategy when a zone
+    reaches TRIGGERED state and the composite score passes the live threshold.
+    Linked back to its parent VpTrapZone for full audit trail.
+    """
+    __tablename__ = "vp_trap_signals"
+
+    id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    created_at        = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    instrument        = Column(String(16), nullable=False, default="XAU/USD", index=True)
+
+    # Link to parent zone
+    zone_id           = Column(String(32), nullable=False, index=True)          # matches VpTrapZone.zone_id
+    zone_row_id       = Column(Integer, nullable=True)                          # FK-style (soft link)
+
+    # Signal core
+    signal            = Column(String(4), nullable=False)    # BUY | SELL
+    entry             = Column(Float, nullable=False)
+    stop_loss         = Column(Float, nullable=False)
+    tp1               = Column(Float, nullable=True)
+    tp2               = Column(Float, nullable=True)
+    tp3               = Column(Float, nullable=True)
+    rr                = Column(Float, nullable=True)
+    risk_points       = Column(Float, nullable=True)
+
+    # Score breakdown
+    score_total       = Column(Integer, nullable=False)      # 0-100
+    score_breakdown_json = Column(Text, nullable=True)       # per-factor points
+
+    # Setup context
+    trap_side         = Column(String(16), nullable=False)   # trapped_buyers | trapped_sellers
+    setup_type        = Column(String(32), nullable=False)   # PDH_fail | PDL_fail | VAH_fail | VAL_fail
+    session           = Column(String(32), nullable=True)
+    market_regime     = Column(String(32), nullable=True)    # trending | balanced | expansion | transition
+    htf_context       = Column(String(64), nullable=True)
+    is_countertrend   = Column(Boolean, nullable=False, default=False)
+    volume_source     = Column(String(16), nullable=False, default="tick_proxy")
+
+    # Confluence with other engines
+    mandate_agrees        = Column(Boolean, nullable=False, default=False)
+    momentum_agrees       = Column(Boolean, nullable=False, default=False)
+    liquidity_map_agrees  = Column(Boolean, nullable=False, default=False)
+
+    # Dedupe / lifecycle
+    fingerprint       = Column(String(32), nullable=False, unique=True, index=True)
+    state             = Column(String(16), nullable=False, default="ALERTED", index=True)
+      # ALERTED | ENQUEUED | ACCEPTED | TP1_HIT | TP2_HIT | STOPPED | EXPIRED | INVALIDATED
+    expires_at        = Column(DateTime(timezone=True), nullable=True)
+
+    # Outcome (forward-resolved)
+    resolved_at       = Column(DateTime(timezone=True), nullable=True)
+    outcome           = Column(String(16), nullable=True)    # WIN | LOSS | BE | TIMEOUT
+    r_realized        = Column(Float, nullable=True)
+
+    # Rationale (human-readable)
+    reason_qualifies    = Column(Text, nullable=True)
+    reason_invalidates  = Column(Text, nullable=True)
+    conditions_met_json = Column(Text, nullable=True)
+    conditions_missing_json = Column(Text, nullable=True)

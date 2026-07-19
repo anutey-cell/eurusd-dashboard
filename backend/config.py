@@ -130,6 +130,25 @@ class Settings(BaseSettings):
     telegram_hourly_briefing:        bool = False  # hourly structured market briefing on NN:00 UTC
     telegram_preformation_alerts:    bool = True   # heads-up 1 hour before each major killzone opens
 
+    # ── VP Trap strategy (Previous-Day Volume Profile + Trapped Traders) ─────
+    # Independent secondary strategy that identifies failed breakouts of prev-day
+    # PDH/PDL/VAH/VAL and generates high-conviction reversal signals only when
+    # a full trap → displacement → retest → rejection sequence completes.
+    # Default is signal-only, independent mode. Never affects existing engines.
+    vp_trap_enabled:                 bool  = False   # master toggle
+    vp_trap_mode:                    str   = "independent"  # independent | confirmation | confluence
+    vp_trap_live_threshold:          int   = 80      # score >= X → live BUY/SELL alert
+    vp_trap_watch_threshold:         int   = 60      # score >= X → dashboard "monitoring"
+    vp_trap_countertrend_bonus:      int   = 10      # extra threshold for countertrend setups
+    vp_trap_value_area_pct:          float = 0.70    # standard TPO 70%
+    vp_trap_min_rr:                  float = 1.8     # minimum RR to fire
+    vp_trap_zone_expiry_hours:       int   = 48      # armed zone expiry
+    vp_trap_max_retests:             int   = 3       # max retests before zone stales
+    vp_trap_alert_cooldown_s:        int   = 1800    # 30 min per zone_id
+    vp_trap_auto_execute:            bool  = False   # OFF initially — validate live first
+    vp_trap_penalize_tick_volume:    int   = 15      # score penalty when only tick-volume proxy
+    vp_trap_telegram_alerts:         bool  = True    # send Telegram alerts (when enabled)
+
     # ── Mandate demo-execution opt-in ─────────────────────────────────────────
     # When True, the strategist will enqueue a 0.01-lot MT5 PendingExecution row
     # every time execution_status == DEMO_TRADE_PLACED. Operator opts in
