@@ -621,6 +621,7 @@ def scan_and_persist_zones(db, expiry_hours: int = 48,
         zone_dict = z.to_dict()
 
         # ── Phase 3: score TRIGGERED zones ─────────────────────────
+        # ── Phase 4: dispatch alert + persist signal when would_fire
         if enable_scoring and ctx is not None and z.state == STATE_TRIGGERED:
             try:
                 from services.vp_trap_scoring import score_zone
@@ -639,6 +640,22 @@ def scan_and_persist_zones(db, expiry_hours: int = 48,
                     breakdown.total, 100, breakdown.band,
                     " → WOULD FIRE" if breakdown.would_fire else "",
                 )
+                # Phase 4: dispatch alert if would_fire (module respects its own
+                # gates: cooldown, dedupe, weekend, config toggle)
+                if breakdown.would_fire:
+                    try:
+                        from services.vp_trap_alerts import maybe_dispatch_alert
+                        signal_id = maybe_dispatch_alert(
+                            db,
+                            zone=zone_dict,
+                            breakdown=breakdown.to_dict(),
+                            plan=plan,
+                            profile=profile.to_dict(),
+                        )
+                        zone_dict["signal_id"] = signal_id
+                    except Exception as exc:
+                        log.warning("[vp_trap] alert dispatch failed for %s: %s",
+                                    z.zone_id, exc)
             except Exception as exc:
                 log.warning("[vp_trap] scoring failed for %s: %s", z.zone_id, exc)
                 zone_dict["score"] = None

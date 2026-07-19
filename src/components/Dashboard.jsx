@@ -39,6 +39,7 @@ import TraderMindsetPanel     from './TraderMindsetPanel';
 import TraderDevelopmentPanel from './TraderDevelopmentPanel';
 import IntermarketCorrelationPanel from './IntermarketCorrelationPanel';
 import InstitutionalStrategistPanel from './InstitutionalStrategistPanel';
+import VpTrapPanel                   from './VpTrapPanel';
 import { formatKenyaTime, KENYA_LABEL } from '../utils/time';
 
 // ─── Tab system — groups 18+ panels into 5 task-oriented tabs ───────────────
@@ -301,6 +302,8 @@ export default function Dashboard({ instrument = INSTRUMENT }) {
           <>
             {/* ★ Headline card — institutional strategist verdict */}
             <InstitutionalStrategistPanel />
+            {/* 🪤 VP Trap strategy — prev-day profile + trapped traders */}
+            <VpTrapPanel />
             {/* Pre-trade checklist (local) */}
             <PreTradeChecklist />
             {/* Engine diagnostics — why no signal RIGHT NOW */}

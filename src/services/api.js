@@ -733,3 +733,33 @@ function adaptCalendar(res) {
     recentNews: res.data.news,
   };
 }
+
+// ─── VP Trap strategy ────────────────────────────────────────────────────────
+
+export async function getVpTrapStatus() {
+  const res = await apiFetch('/vp-trap/status');
+  return res.data;
+}
+
+export async function getVpTrapProfile() {
+  const res = await apiFetch('/vp-trap/profile');
+  return res.data;
+}
+
+/** Full diagnostics with per-zone scoring + trade plan */
+export async function getVpTrapDiagnostics() {
+  const res = await apiFetch('/vp-trap/diagnostics');
+  return res.data;
+}
+
+export async function getVpTrapZones({ includeTerminal = false } = {}) {
+  const params = new URLSearchParams({ include_terminal: String(includeTerminal) });
+  const res = await apiFetch(`/vp-trap/zones?${params}`);
+  return res.data;
+}
+
+export async function getVpTrapSignals({ limit = 20 } = {}) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  const res = await apiFetch(`/vp-trap/signals?${params}`);
+  return res.data;
+}

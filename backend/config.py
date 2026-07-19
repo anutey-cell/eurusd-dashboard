@@ -135,7 +135,7 @@ class Settings(BaseSettings):
     # PDH/PDL/VAH/VAL and generates high-conviction reversal signals only when
     # a full trap → displacement → retest → rejection sequence completes.
     # Default is signal-only, independent mode. Never affects existing engines.
-    vp_trap_enabled:                 bool  = False   # master toggle
+    vp_trap_enabled:                 bool  = True    # master toggle (Phase 4 ships enabled)
     vp_trap_mode:                    str   = "independent"  # independent | confirmation | confluence
     vp_trap_live_threshold:          int   = 80      # score >= X → live BUY/SELL alert
     vp_trap_watch_threshold:         int   = 60      # score >= X → dashboard "monitoring"

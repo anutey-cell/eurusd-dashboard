@@ -250,6 +250,62 @@ def get_diagnostics(db: Session = Depends(get_db)) -> APIResponse:
     )
 
 
+@router.get("/signals")
+def get_signals(
+    limit: int = Query(20, ge=1, le=200,
+                       description="Max signals to return, newest first"),
+    include_terminal: bool = Query(True,
+        description="Include signals with terminal state (STOPPED/EXPIRED/etc)"),
+    db: Session = Depends(get_db),
+) -> APIResponse:
+    """Fired VP Trap signals (Phase 4 output). Newest first.
+
+    Every alert dispatched via Telegram writes a VpTrapSignal row here.
+    Dashboard consumes for the signals list; ops uses for audit.
+    """
+    from db_models import VpTrapSignal as SM
+    import json as _json
+
+    q = db.query(SM).order_by(SM.created_at.desc()).limit(limit)
+    rows = q.all()
+    out = []
+    for r in rows:
+        if not include_terminal and r.state in ("STOPPED", "EXPIRED", "INVALIDATED"):
+            continue
+        try:
+            breakdown = _json.loads(r.score_breakdown_json) if r.score_breakdown_json else None
+        except Exception:
+            breakdown = None
+        out.append({
+            "id":             r.id,
+            "created_at":     r.created_at.isoformat() if r.created_at else None,
+            "zone_id":        r.zone_id,
+            "signal":         r.signal,
+            "entry":          r.entry,
+            "stop_loss":      r.stop_loss,
+            "tp1":            r.tp1, "tp2": r.tp2, "tp3": r.tp3,
+            "rr":             r.rr,
+            "risk_points":    r.risk_points,
+            "score_total":    r.score_total,
+            "score_breakdown": breakdown,
+            "trap_side":      r.trap_side,
+            "setup_type":     r.setup_type,
+            "session":        r.session,
+            "is_countertrend": r.is_countertrend,
+            "volume_source":  r.volume_source,
+            "mandate_agrees": r.mandate_agrees,
+            "momentum_agrees": r.momentum_agrees,
+            "state":          r.state,
+            "outcome":        r.outcome,
+            "r_realized":     r.r_realized,
+            "reason_qualifies": r.reason_qualifies,
+        })
+    return APIResponse(
+        data={"count": len(out), "signals": out},
+        source="vp_trap:signals",
+    )
+
+
 @router.post("/scan")
 def force_scan(db: Session = Depends(get_db)) -> APIResponse:
     """Force a full scan cycle: rebuild profile + candidate zones + advance
