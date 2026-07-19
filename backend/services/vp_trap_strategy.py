@@ -483,21 +483,86 @@ def _bars_since(candles: list, since: datetime) -> list:
     return out
 
 
+def _build_market_context(profile):
+    """
+    Build the MarketContext scorer needs. Pulls fresh candles + HTF biases
+    + liquidity_map (when strategist verdict is cached). Best-effort;
+    every field has a safe default.
+    """
+    from services.vp_trap_scoring import MarketContext
+    from data.candles import get_candles
+
+    h1_resp  = get_candles(interval="H1",  limit=100, pair="xauusd")
+    m15_resp = get_candles(interval="M15", limit=100, pair="xauusd")
+    d1_resp  = get_candles(interval="D1",  limit=30,  pair="xauusd")
+    h4_resp  = get_candles(interval="H4",  limit=100, pair="xauusd")
+
+    h1_bars  = h1_resp.candles  if h1_resp  else []
+    m15_bars = m15_resp.candles if m15_resp else []
+    d1_bars  = d1_resp.candles  if d1_resp  else []
+    h4_bars  = h4_resp.candles  if h4_resp  else []
+
+    current_price = m15_bars[-1].close if m15_bars else 0.0
+
+    # ATR from H1
+    from services.strategist import _atr, _htf_bias_label
+    atr_h1 = _atr(
+        [b.high for b in h1_bars], [b.low for b in h1_bars],
+        [b.close for b in h1_bars],
+    ) if h1_bars else 0.0
+
+    d1_bias = _htf_bias_label([b.close for b in d1_bars], lookback=20) if d1_bars else ""
+    h4_bias = _htf_bias_label([b.close for b in h4_bars], lookback=50) if h4_bars else ""
+
+    # Liquidity map — from cached strategist verdict if available
+    lm = None
+    try:
+        from routers import strategist as st_router
+        cache = getattr(st_router, "_cache", None)
+        if cache and cache.get("verdict"):
+            lm = (cache["verdict"] or {}).get("liquidity_map")
+    except Exception:
+        lm = None
+
+    # News gate — from cached verdict too if available
+    news_clear = True
+    try:
+        if cache and cache.get("verdict"):
+            mc = cache["verdict"].get("macro_context") or {}
+            news_clear = (mc.get("news_risk", "CLEAR") == "CLEAR")
+    except Exception:
+        pass
+
+    return MarketContext(
+        now_utc=datetime.now(timezone.utc),
+        current_price=current_price,
+        atr_h1=atr_h1,
+        h1_bars=h1_bars,
+        m15_bars=m15_bars,
+        d1_bias=d1_bias,
+        h4_bias=h4_bias,
+        liquidity_map=lm,
+        news_clear=news_clear,
+        volume_source=profile.volume_source,
+    )
+
+
 def scan_and_persist_zones(db, expiry_hours: int = 48,
                            min_displacement_pts: float = 5.0,
                            retest_tolerance_pts:  float = 3.0,
-                           max_retests:           int   = 3) -> list[dict]:
+                           max_retests:           int   = 3,
+                           enable_scoring:        bool  = True) -> list[dict]:
     """
     Full zone scan cycle: build profile → create 4 candidate zones → walk
-    bars → advance state → persist to DB → return zone dicts.
-
-    Called from the strategist runner background loop (Phase 2 has no
-    alerts yet — just state tracking + endpoint exposure).
+    bars → advance state → score TRIGGERED zones → persist to DB.
 
     Deterministic and idempotent — running twice yields identical DB state.
+    When enable_scoring=True, TRIGGERED zones get a scoring pass and the
+    returned dicts include `score` and `trade_plan` fields.
     """
     from services.vp_trap_state import (
         zones_from_profile, scan_zone, upsert_zone,
+        STATE_TRIGGERED,
     )
     profile = compute_current_prev_day_profile()
     if profile is None:
@@ -514,9 +579,6 @@ def scan_and_persist_zones(db, expiry_hours: int = 48,
 
     since = profile.computed_at
     bars_window = _bars_since(candles, since)
-    # Fallback: if profile was computed_at just now, "since" == now-ish and
-    # there'll be no bars. Use the profile's day-end as the reference instead
-    # so we always have SOME bars since the day the profile represents.
     if not bars_window:
         try:
             day_end = datetime.strptime(profile.profile_date, "%Y-%m-%d").replace(
@@ -525,8 +587,25 @@ def scan_and_persist_zones(db, expiry_hours: int = 48,
         except Exception:
             pass
 
+    # Market context for scoring — built once, reused for every triggered zone
+    ctx = None
+    if enable_scoring:
+        try:
+            ctx = _build_market_context(profile)
+        except Exception as exc:
+            log.warning("[vp_trap] market context build failed: %s", exc)
+            enable_scoring = False
+
     zones = zones_from_profile(profile, expiry_hours=expiry_hours)
     out: list[dict] = []
+
+    # Score-related config
+    from config import settings
+    live_threshold      = getattr(settings, "vp_trap_live_threshold", 80)
+    countertrend_bonus  = getattr(settings, "vp_trap_countertrend_bonus", 10)
+    tick_volume_penalty = getattr(settings, "vp_trap_penalize_tick_volume", 15)
+    min_rr              = getattr(settings, "vp_trap_min_rr", 1.8)
+
     for z in zones:
         scan_zone(
             z, bars_window,
@@ -538,7 +617,33 @@ def scan_and_persist_zones(db, expiry_hours: int = 48,
             upsert_zone(db, z)
         except Exception as exc:
             log.warning("[vp_trap] upsert failed for %s: %s", z.zone_id, exc)
-        out.append(z.to_dict())
+
+        zone_dict = z.to_dict()
+
+        # ── Phase 3: score TRIGGERED zones ─────────────────────────
+        if enable_scoring and ctx is not None and z.state == STATE_TRIGGERED:
+            try:
+                from services.vp_trap_scoring import score_zone
+                breakdown, plan = score_zone(
+                    z, profile, ctx,
+                    countertrend_bonus=countertrend_bonus,
+                    tick_volume_penalty=tick_volume_penalty,
+                    min_rr=min_rr,
+                    live_threshold=live_threshold,
+                )
+                zone_dict["score"] = breakdown.to_dict()
+                zone_dict["trade_plan"] = plan
+                log.info(
+                    "[vp_trap] TRIGGERED zone %s (%s %s @ %.2f): score %d/%d %s%s",
+                    z.zone_id[:8], z.level_type, z.level_side, z.reference_price,
+                    breakdown.total, 100, breakdown.band,
+                    " → WOULD FIRE" if breakdown.would_fire else "",
+                )
+            except Exception as exc:
+                log.warning("[vp_trap] scoring failed for %s: %s", z.zone_id, exc)
+                zone_dict["score"] = None
+
+        out.append(zone_dict)
 
     try:
         db.commit()

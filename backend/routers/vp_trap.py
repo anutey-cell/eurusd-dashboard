@@ -172,6 +172,84 @@ def get_active_zones(
     )
 
 
+@router.get("/diagnostics")
+def get_diagnostics(db: Session = Depends(get_db)) -> APIResponse:
+    """Phase 3 diagnostics — for every zone in the current profile, run the
+    state machine AND the scorer (regardless of TRIGGERED state).
+
+    Lets the operator see partial scores + which factors are pulling weight
+    even before a zone reaches TRIGGERED. Purely diagnostic; does NOT persist
+    scores to DB (VpTrapSignal rows are only written in Phase 4 when alerts
+    actually fire).
+    """
+    from services.vp_trap_strategy import (
+        compute_current_prev_day_profile, _bars_since, _build_market_context,
+    )
+    from services.vp_trap_state import zones_from_profile, scan_zone
+    from services.vp_trap_scoring import score_zone
+    from data.candles import get_candles
+    from datetime import timedelta
+
+    profile = compute_current_prev_day_profile()
+    if profile is None:
+        raise HTTPException(status_code=503, detail="No prev-day profile available")
+
+    try:
+        m15_resp = get_candles(interval="M15", limit=500, pair="xauusd")
+        candles = m15_resp.candles if m15_resp and m15_resp.candles else []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"candle fetch failed: {exc}")
+
+    bars_window = _bars_since(candles, profile.computed_at)
+    if not bars_window:
+        try:
+            day_end = datetime.strptime(profile.profile_date, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc) + timedelta(days=1)
+            bars_window = _bars_since(candles, day_end)
+        except Exception:
+            pass
+
+    ctx = _build_market_context(profile)
+
+    live_threshold      = getattr(settings, "vp_trap_live_threshold", 80)
+    countertrend_bonus  = getattr(settings, "vp_trap_countertrend_bonus", 10)
+    tick_volume_penalty = getattr(settings, "vp_trap_penalize_tick_volume", 15)
+    min_rr              = getattr(settings, "vp_trap_min_rr", 1.8)
+
+    zones = zones_from_profile(profile, expiry_hours=48)
+    diagnostics = []
+    for z in zones:
+        scan_zone(z, bars_window,
+                  min_displacement_pts=5.0, retest_tolerance_pts=3.0, max_retests=3)
+        breakdown, plan = score_zone(
+            z, profile, ctx,
+            countertrend_bonus=countertrend_bonus,
+            tick_volume_penalty=tick_volume_penalty,
+            min_rr=min_rr,
+            live_threshold=live_threshold,
+        )
+        diagnostics.append({
+            "zone":         z.to_dict(),
+            "score":        breakdown.to_dict(),
+            "trade_plan":   plan,
+        })
+
+    return APIResponse(
+        data={
+            "profile_date":  profile.profile_date,
+            "current_price": ctx.current_price,
+            "atr_h1":        round(ctx.atr_h1, 2),
+            "d1_bias":       ctx.d1_bias,
+            "h4_bias":       ctx.h4_bias,
+            "volume_source": ctx.volume_source,
+            "news_clear":    ctx.news_clear,
+            "live_threshold": live_threshold,
+            "zone_scores":   diagnostics,
+        },
+        source="vp_trap:diagnostics",
+    )
+
+
 @router.post("/scan")
 def force_scan(db: Session = Depends(get_db)) -> APIResponse:
     """Force a full scan cycle: rebuild profile + candidate zones + advance
