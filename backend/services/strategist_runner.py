@@ -284,6 +284,26 @@ def _maybe_fire_alert(verdict: dict) -> None:
         # ── Fire ───────────────────────────────────────────────────────
         long_pct, short_pct = _fetch_sentiment()
         msg = format_mandate_signal_message(verdict, long_pct=long_pct, short_pct=short_pct)
+
+        # ── VP Trap confirmation-mode enrichment ──────────────────────
+        # When vp_trap_mode == "confirmation" AND we have an active VP Trap
+        # zone matching the mandate's direction, append a small context line
+        # to this mandate alert. Never suppresses the mandate alert; never
+        # affects mandate scoring. Pure additive information.
+        try:
+            from services.vp_trap_alerts import (
+                get_vp_trap_context_for_mandate, format_vp_trap_context_line,
+            )
+            from database import SessionLocal
+            with SessionLocal() as _db:
+                vp_ctx = get_vp_trap_context_for_mandate(decision, _db)
+            if vp_ctx:
+                ctx_line = format_vp_trap_context_line(vp_ctx)
+                if ctx_line:
+                    msg = msg + f"\n\n🪤 VP TRAP context:\n   {ctx_line}"
+        except Exception as exc:
+            log.debug("[strategist_runner] VP Trap context enrichment failed: %s", exc)
+
         _send_plain(msg)
         reason = ("flip" if bypass_flip else "escalate" if bypass_escalate else "cooldown_expired")
         log.info("[strategist_runner] alert fired %s/%d (band=%s, reason=%s)",

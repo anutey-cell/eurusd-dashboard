@@ -288,6 +288,136 @@ def _send_plain(text: str) -> bool:
 
 # ── Public entry point ─────────────────────────────────────────────────────
 
+def _recent_mandate_alert_direction(within_seconds: int = 300) -> Optional[str]:
+    """Returns the mandate's most-recent alert direction if fired within the
+    window. Used by confluence mode to detect same-direction agreement between
+    mandate and vp_trap. Reads strategist_runner's module state (no DB query).
+    """
+    try:
+        from services import strategist_runner as sr
+        rec = getattr(sr, "_last_alert", None) or {}
+        elapsed = time.time() - (rec.get("sent_at") or 0)
+        if elapsed <= within_seconds:
+            d = rec.get("decision")
+            if d in ("BUY", "SELL"):
+                return d
+    except Exception:
+        pass
+    return None
+
+
+def _format_consolidated_alert(*, zone: dict, breakdown: dict, plan: dict,
+                                profile: dict, mandate_direction: str) -> str:
+    """
+    Consolidated alert format for CONFLUENCE mode when mandate AND vp_trap
+    agree on direction. One message instead of two — clearly labelled so the
+    operator sees the confluence at a glance.
+    """
+    direction = zone.get("level_side", "?")
+    icon      = "🟢" if direction == "BUY" else "🔴"
+    band_emoji = {
+        "EXCEPTIONAL": "🌟", "VALID": "✨",
+        "DEVELOPING": "•", "WATCH": "·",
+    }.get(breakdown.get("band", ""), "")
+
+    trap_side = "Trapped buyers" if direction == "SELL" else "Trapped sellers"
+    entry = plan.get("entry"); sl = plan.get("sl")
+    tp1 = plan.get("tp1"); tp2 = plan.get("tp2"); rr = plan.get("rr", 0)
+
+    # Pull mandate's cached conditions_passed for the confluence header
+    mandate_cp = "?"
+    try:
+        from routers import strategist as st_router
+        cache = getattr(st_router, "_cache", None) or {}
+        v = cache.get("verdict") or {}
+        mandate_cp = f"{v.get('conditions_passed', '?')}/5"
+    except Exception:
+        pass
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        f"🎯🪤 MANDATE + VP TRAP AGREE — {direction}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{icon} HIGHEST CONVICTION  ·  both engines aligned\n"
+        f"\n"
+        f"Mandate:  {mandate_direction}  ·  {mandate_cp} conditions\n"
+        f"VP Trap:  {band_emoji} {breakdown.get('band', '')}  ·  "
+        f"score {breakdown.get('total', 0)}/100\n"
+        f"\n"
+        f"Setup:      {zone.get('level_type', '')} failed breakout @ "
+        f"${zone.get('reference_price', 0):.2f}\n"
+        f"Trap side:  {trap_side}\n"
+        f"Entry:      ${entry:.2f}\n"
+        f"SL:         ${sl:.2f}\n"
+        f"TP1 (POC):  ${tp1:.2f}\n"
+        f"TP2 (VA):   ${tp2:.2f}  ·  RR {rr:.1f}\n"
+        f"\n"
+        f"⚠ Signal-only. No MT5 execution.\n"
+        f"⏰ Detected: {now}\n"
+    )
+
+
+def get_vp_trap_context_for_mandate(direction: str, db: Session) -> Optional[dict]:
+    """
+    Confirmation mode helper: called from the mandate alert path. Returns
+    the current best-matching VP Trap zone context (if any) so the mandate
+    alert can append a "🪤 VP TRAP context" section. Returns None if no
+    active zone matches the mandate's direction, or if the mode isn't set
+    for confirmation/confluence.
+
+    Never raises. Fast DB read (one row).
+    """
+    if direction not in ("BUY", "SELL"):
+        return None
+    mode = getattr(settings, "vp_trap_mode", "independent")
+    if mode not in ("confirmation", "confluence"):
+        return None
+
+    try:
+        from db_models import VpTrapZone as ZM
+        # Only zones that MATCH mandate direction (both are BUY, or both SELL)
+        # Prefer zones with state in {RETEST_ACTIVE, TRIGGERED, WAITING_RETEST}
+        # ordered by how "hot" they are
+        active_states = ("TRIGGERED", "RETEST_ACTIVE", "WAITING_RETEST", "TRAP_ARMED")
+        row = (db.query(ZM)
+                 .filter(ZM.instrument == "XAU/USD")
+                 .filter(ZM.level_side == direction)
+                 .filter(ZM.state.in_(active_states))
+                 .order_by(ZM.updated_at.desc())
+                 .first())
+        if not row:
+            return None
+        return {
+            "zone_id":         row.zone_id,
+            "level_type":      row.level_type,
+            "reference_price": row.reference_price,
+            "state":           row.state,
+            "state_reason":    row.state_reason or "",
+            "displacement_pts": row.displacement_pts or 0,
+            "retest_count":    row.retest_count or 0,
+        }
+    except Exception as exc:
+        log.debug("[vp_trap_alerts] context lookup failed: %s", exc)
+        return None
+
+
+def format_vp_trap_context_line(ctx: dict) -> str:
+    """Short human-readable line for embedding in a mandate Telegram alert."""
+    if not ctx:
+        return ""
+    lt   = ctx.get("level_type", "?")
+    ref  = ctx.get("reference_price", 0)
+    st   = ctx.get("state", "?")
+    disp = ctx.get("displacement_pts") or 0
+    retests = ctx.get("retest_count") or 0
+    parts = [f"{lt} @ ${ref:.2f}", st.replace("_", " ")]
+    if disp:
+        parts.append(f"disp {disp:.0f}pt")
+    if retests:
+        parts.append(f"{retests}x retest")
+    return " · ".join(parts)
+
+
 def maybe_dispatch_alert(
     db: Session,
     zone: dict, breakdown: dict, plan: dict, profile: dict,
@@ -298,7 +428,16 @@ def maybe_dispatch_alert(
     observation gates, formats the alert, sends Telegram, and persists the
     VpTrapSignal row.
 
-    Returns the persisted signal row id, or None if no alert was fired.
+    Mode-aware:
+      independent (default) — send own 🪤 alert
+      confirmation           — persist signal, DO NOT send own alert; the
+                                mandate alert path will read our context
+                                via get_vp_trap_context_for_mandate()
+      confluence             — check for recent mandate alert same direction;
+                                if match, send CONSOLIDATED 🎯🪤 alert;
+                                if no match, send normal 🪤 alert
+
+    Returns the persisted signal row id, or None if no signal was persisted.
     """
     if not getattr(settings, "vp_trap_telegram_alerts", True):
         return None
@@ -313,13 +452,10 @@ def maybe_dispatch_alert(
 
     # Weekend + Monday-observation respect (share the strategist_runner gates)
     try:
-        from services.strategist_runner import is_weekend_quiet_hours, is_monday_observation
+        from services.strategist_runner import is_weekend_quiet_hours
         if is_weekend_quiet_hours():
             log.debug("[vp_trap_alerts] suppressed — weekend quiet hours")
             return None
-        # Monday observation: STILL fire the signal alert (mirroring how the
-        # mandate handles Monday — signals allowed, execution blocked)
-        # (Phase 4 is signal-only anyway, so Monday is fine)
     except Exception:
         pass
 
@@ -331,6 +467,43 @@ def maybe_dispatch_alert(
         return None
 
     confluence = _check_confluence(direction)
+    mode = getattr(settings, "vp_trap_mode", "independent")
+
+    # ── Confirmation mode: no Telegram alert; persist for audit only ───
+    if mode == "confirmation":
+        signal_id = _persist_signal(db, zone=zone, breakdown=breakdown, plan=plan,
+                                     profile=profile, confluence=confluence,
+                                     fingerprint=fingerprint)
+        _last_alerts[zone_id] = {
+            "fingerprint": fingerprint, "sent_at": time.time(),
+        }
+        log.info("[vp_trap_alerts] CONFIRMATION mode — persisted signal %d "
+                 "for %s %s (no own alert)", signal_id or -1, direction, level_type)
+        return signal_id
+
+    # ── Confluence mode: check for mandate agreement, consolidate if match ─
+    if mode == "confluence":
+        mandate_dir = _recent_mandate_alert_direction(within_seconds=300)
+        if mandate_dir == direction:
+            text = _format_consolidated_alert(
+                zone=zone, breakdown=breakdown, plan=plan,
+                profile=profile, mandate_direction=mandate_dir,
+            )
+            if not _send_plain(text):
+                return None
+            signal_id = _persist_signal(db, zone=zone, breakdown=breakdown, plan=plan,
+                                         profile=profile, confluence=confluence,
+                                         fingerprint=fingerprint)
+            _last_alerts[zone_id] = {
+                "fingerprint": fingerprint, "sent_at": time.time(),
+            }
+            log.info("[vp_trap_alerts] CONFLUENCE consolidated alert fired "
+                     "%s (mandate agrees) score=%d id=%s",
+                     direction, breakdown.get("total", 0), signal_id)
+            return signal_id
+        # Confluence mode but no mandate agreement — fall through to independent
+
+    # ── Independent mode (default) OR confluence with no mandate match ──
     text = _format_alert(zone=zone, breakdown=breakdown, plan=plan,
                          profile=profile, confluence=confluence)
     if not _send_plain(text):
@@ -345,6 +518,6 @@ def maybe_dispatch_alert(
         "fingerprint": fingerprint,
         "sent_at":     time.time(),
     }
-    log.info("[vp_trap_alerts] fired %s %s score=%d id=%s",
-             direction, level_type, breakdown.get("total", 0), signal_id)
+    log.info("[vp_trap_alerts] fired %s %s score=%d id=%s mode=%s",
+             direction, level_type, breakdown.get("total", 0), signal_id, mode)
     return signal_id

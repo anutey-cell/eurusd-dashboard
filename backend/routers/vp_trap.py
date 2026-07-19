@@ -32,9 +32,17 @@ log = logging.getLogger(__name__)
 @router.get("/status")
 def get_status() -> APIResponse:
     """Config + capabilities snapshot. Cheap; safe to poll."""
+    mode = getattr(settings, "vp_trap_mode", "independent")
+    mode_desc = {
+        "independent":  "Fires own 🪤 alerts. Never touches mandate.",
+        "confirmation": "No own alerts. Mandate alerts gain a 🪤 VP TRAP context section when a matching zone is active.",
+        "confluence":   "Fires 🪤 alerts. If mandate agreed direction within 5 min, sends CONSOLIDATED 🎯🪤 alert instead of two.",
+    }.get(mode, f"unknown mode {mode!r}")
     data = {
         "enabled":              getattr(settings, "vp_trap_enabled", False),
-        "mode":                 getattr(settings, "vp_trap_mode", "independent"),
+        "mode":                 mode,
+        "mode_description":     mode_desc,
+        "modes_available":      ["independent", "confirmation", "confluence"],
         "live_threshold":       getattr(settings, "vp_trap_live_threshold", 80),
         "watch_threshold":      getattr(settings, "vp_trap_watch_threshold", 60),
         "value_area_pct":       getattr(settings, "vp_trap_value_area_pct", 0.70),
@@ -45,7 +53,7 @@ def get_status() -> APIResponse:
         "tick_volume_penalty":  getattr(settings, "vp_trap_penalize_tick_volume", 15),
         # Volume-source capability (Phase 1 = tick_proxy only)
         "volume_sources_available": ["tick_proxy"],
-        "phase": "1 — profile computation only. No signals yet.",
+        "phase": "5 — all modes live (independent | confirmation | confluence)",
     }
     return APIResponse(data=data, source="vp_trap:status")
 

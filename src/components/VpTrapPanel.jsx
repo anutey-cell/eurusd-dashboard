@@ -16,7 +16,7 @@ import {
   TrendingUp, TrendingDown, RefreshCw, AlertTriangle, Activity,
   Target, Zap, Eye, Clock,
 } from 'lucide-react';
-import { getVpTrapDiagnostics, getVpTrapSignals } from '../services/api';
+import { getVpTrapDiagnostics, getVpTrapSignals, getVpTrapStatus } from '../services/api';
 import { usePollInterval } from '../hooks/usePollInterval';
 
 const POLL_MS = 30_000;
@@ -202,9 +202,16 @@ function SignalRow({ sig }) {
   );
 }
 
+const MODE_CLS = {
+  independent:  'bg-gray-500/15   border-gray-500/40   text-gray-300',
+  confirmation: 'bg-blue-500/15   border-blue-500/50   text-blue-300',
+  confluence:   'bg-purple-500/15 border-purple-500/50 text-purple-300',
+};
+
 export default function VpTrapPanel() {
   const [data, setData] = useState(null);
   const [signals, setSignals] = useState([]);
+  const [status, setStatus] = useState(null);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(false);
   const [lastFetch, setLastFetch] = useState(null);
@@ -213,12 +220,14 @@ export default function VpTrapPanel() {
     setLoading(true);
     setErr(null);
     try {
-      const [diag, sig] = await Promise.all([
+      const [diag, sig, st] = await Promise.all([
         getVpTrapDiagnostics(),
         getVpTrapSignals({ limit: 8 }),
+        getVpTrapStatus(),
       ]);
       setData(diag);
       setSignals(sig.signals || []);
+      setStatus(st);
       setLastFetch(new Date());
     } catch (e) {
       setErr(e.message || 'Failed to load VP Trap data');
@@ -242,6 +251,12 @@ export default function VpTrapPanel() {
         <div className="flex items-center gap-2">
           <span className="text-lg">🪤</span>
           <span className="card-title">Volume Profile Trap Strategy</span>
+          {status?.mode && (
+            <Pill cls={MODE_CLS[status.mode] || MODE_CLS.independent}
+                  title={status.mode_description || ''}>
+              {status.mode}
+            </Pill>
+          )}
           {data && (
             <Pill cls="bg-gray-500/15 border-gray-500/40 text-gray-400">
               tick_proxy
