@@ -153,6 +153,7 @@ def run_once(db: Session) -> dict:
     _maybe_fire_preformation_alert(verdict)   # 1-hour-before-KZ heads-up
     _maybe_fire_momentum_alert(db, verdict)   # secondary momentum-continuation source
     _maybe_scan_vp_trap_zones(db)             # Phase 2 — advance state, no alerts yet
+    _maybe_fire_kz_magnet_alert(db, verdict)  # KZ Magnet (cross-KZ POC + Flux)
 
     try:
         persist_verdict(db, verdict, pending_execution_id=pending_id)
@@ -606,6 +607,93 @@ def _maybe_fire_preformation_alert(verdict: dict) -> None:
         except Exception as exc:
             log.warning("[strategist_runner] pre-formation alert failed for %s: %s",
                         cfg["kz_name"], exc)
+
+
+_last_kz_magnet_alert: dict = {"direction": None, "sent_at": 0.0, "prior_kz": None}
+_KZ_MAGNET_COOLDOWN_S = 1800.0   # default 30 min
+
+
+def _maybe_fire_kz_magnet_alert(db: Session, verdict: dict) -> None:
+    """
+    KZ Magnet secondary signal — trades price toward prior-killzone POC
+    magnets (60-85% touch rates per backtest). Signal-only. Never affects
+    mandate. Skipped entirely when kz_magnet_enabled=False (default).
+    """
+    global _last_kz_magnet_alert
+    if not getattr(settings, "kz_magnet_enabled", False):
+        return
+    if is_weekend_quiet_hours():
+        return
+
+    try:
+        from services.kz_magnet_strategy import scan_for_magnet
+
+        # ATR from verdict diagnostics if available
+        diag = verdict.get("diagnostics") or {}
+        atr_h1 = float(diag.get("atr_h1") or 20.0)
+
+        # News clear check
+        mc = verdict.get("macro_context") or {}
+        news_clear = (mc.get("news_risk", "CLEAR") == "CLEAR")
+
+        setup = scan_for_magnet(atr_h1=atr_h1, news_clear=news_clear)
+        if setup is None:
+            return
+
+        # Cooldown per direction+prior_kz (avoid re-firing same magnet)
+        cooldown_s = float(getattr(settings, "kz_magnet_alert_cooldown_s", _KZ_MAGNET_COOLDOWN_S))
+        elapsed = time.time() - _last_kz_magnet_alert.get("sent_at", 0)
+        if (_last_kz_magnet_alert.get("direction") == setup.direction
+                and _last_kz_magnet_alert.get("prior_kz") == setup.prior_kz
+                and elapsed < cooldown_s):
+            return
+
+        if not getattr(settings, "kz_magnet_telegram_alerts", True):
+            return
+
+        msg = _format_kz_magnet_message(setup, verdict)
+        _send_plain(msg)
+        _last_kz_magnet_alert = {
+            "direction": setup.direction,
+            "prior_kz":  setup.prior_kz,
+            "sent_at":   time.time(),
+        }
+        log.info("[kz_magnet] fired %s %s→%s POC=$%.2f dist=%.1fpt score=%.0f%%",
+                 setup.direction, setup.prior_kz, setup.target_kz,
+                 setup.prior_poc, setup.distance_pts, setup.expected_touch)
+    except Exception as exc:
+        log.warning("[kz_magnet] alert hook failed: %s", exc)
+
+
+def _format_kz_magnet_message(setup, verdict: dict) -> str:
+    """Telegram alert format — clearly labelled 🧲 KZ MAGNET."""
+    icon = "🔴" if setup.direction == "SELL" else "🟢"
+    mandate_state = verdict.get("execution_status", "STAND_ASIDE")
+    tp2_line = ""
+    if setup.tp2:
+        tp2_line = f"TP2 (VWAP):  ${setup.tp2:.2f}  ·  RR {setup.rr_tp2:.2f}\n"
+    return (
+        f"🧲 KZ MAGNET — {setup.direction}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{icon} {setup.prior_kz} → {setup.target_kz}\n"
+        f"Expected touch rate: {setup.expected_touch:.0f}%\n"
+        f"\n"
+        f"Prior KZ POC:  ${setup.prior_poc:.2f}  ← magnet target\n"
+        f"Current price: ${setup.current_price:.2f}\n"
+        f"Distance:      {abs(setup.distance_pts):.1f} pts  ({setup.distance_atr:.1f}× ATR)\n"
+        f"\n"
+        f"Flux bias:     {setup.flux_bias:+.2f}  ({setup.flux_label})\n"
+        f"\n"
+        f"Entry:      ${setup.entry:.2f}\n"
+        f"SL:         ${setup.sl:.2f}  ({setup.risk_pts:.1f}pt risk)\n"
+        f"TP1 (POC):  ${setup.tp1:.2f}  ·  RR {setup.rr_tp1:.2f}\n"
+        f"{tp2_line}"
+        f"\n"
+        f"Mandate:    {mandate_state}\n"
+        f"⚠ Signal-only. No MT5 execution. Operator judgement.\n"
+        f"   Backtest edge: prior-KZ POC magnetizes next-KZ price\n"
+        f"   {setup.expected_touch:.0f}% of the time (n=55 weekdays)."
+    )
 
 
 def _maybe_scan_vp_trap_zones(db: Session) -> None:

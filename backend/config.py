@@ -149,6 +149,15 @@ class Settings(BaseSettings):
     vp_trap_penalize_tick_volume:    int   = 15      # score penalty when only tick-volume proxy
     vp_trap_telegram_alerts:         bool  = True    # send Telegram alerts (when enabled)
 
+    # ── KZ Magnet strategy (Killzone POC magnet + Flux directional bias) ────
+    # Uses backtest-validated cross-KZ POC touch rates (60-85%) as tradeable
+    # magnets. Signal-only initially — validate live before enabling execution.
+    kz_magnet_enabled:               bool  = True    # ships enabled (signal-only, no exec)
+    kz_magnet_telegram_alerts:       bool  = True    # Telegram alerts when enabled
+    kz_magnet_min_distance_atr:      float = 0.6     # min distance from POC to trigger
+    kz_magnet_max_va_width_atr:      float = 2.0     # skip prior KZ if VA too wide
+    kz_magnet_alert_cooldown_s:      int   = 1800    # 30 min between same-direction alerts
+
     # ── Mandate demo-execution opt-in ─────────────────────────────────────────
     # When True, the strategist will enqueue a 0.01-lot MT5 PendingExecution row
     # every time execution_status == DEMO_TRADE_PLACED. Operator opts in
