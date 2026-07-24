@@ -208,6 +208,13 @@ class Settings(BaseSettings):
     scan_interval_seconds:      int  = 60    # frontend auto-refresh interval hint
     telegram_watchlist_alerts:  bool = False  # send WATCHLIST state alerts
 
+    # ── Telegram bot (command-handler poller) ─────────────────────────────────
+    # When True AND telegram_bot_token is set, a background thread long-polls
+    # getUpdates and dispatches slash-commands (/status, /signals, /mute, ...).
+    # Only chats explicitly marked is_admin in TelegramChatPreference may run
+    # privileged commands (/mute, /unmute, /mode).
+    telegram_bot_enabled: bool = True
+
     # ── Canonical notification layer (unified Telegram pipeline) ─────────────
     # Runs alongside the legacy Telegram path. When shadow_mode is True the
     # canonical layer only writes audit rows (TelegramNotification with

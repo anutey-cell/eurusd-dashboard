@@ -709,3 +709,60 @@ class TelegramNotification(Base):
 
     # Suppression rationale — populated when delivery_result == "suppressed"
     suppression_reason = Column(String(255), nullable=True)
+
+
+# ── Telegram bot state (P9) ────────────────────────────────────────────────
+
+class TelegramBotState(Base):
+    """
+    Single-row cache of the getUpdates offset so the poller doesn't
+    re-process the same command on restart.
+    """
+    __tablename__ = "telegram_bot_state"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    updated_at     = Column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+    last_update_id = Column(Integer, nullable=False, default=0)
+
+
+class TelegramChatPreference(Base):
+    """
+    Per-chat preferences persisted across restarts. `chat_id` is the
+    Telegram chat_id (stored as string). Only chats registered here
+    receive notifications from the router (once P5 cutover flips
+    shadow_mode off).
+
+    Admin chats can run privileged commands (/mute, /unmute, /mode).
+    """
+    __tablename__ = "telegram_chat_preferences"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    created_at      = Column(DateTime(timezone=True), default=_now, nullable=False)
+    updated_at      = Column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+
+    chat_id         = Column(String(32), nullable=False, unique=True, index=True)
+    chat_type       = Column(String(16), nullable=False, default="private")  # private|group|channel
+    is_admin        = Column(Boolean, nullable=False, default=False)
+    is_muted        = Column(Boolean, nullable=False, default=False)
+    verbosity_mode  = Column(String(16), nullable=False, default="standard")  # minimal|standard|detailed
+
+    # JSON list of strategy_ids muted just for this chat
+    strategy_mutes_json = Column(Text, nullable=True)
+
+    # Display-only
+    label           = Column(String(64), nullable=True)   # e.g. "Owner", "Ops group"
+
+
+class TelegramCommandLog(Base):
+    """Append-only log of received bot commands — for audit + debug."""
+    __tablename__ = "telegram_command_log"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    at           = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    update_id    = Column(Integer, nullable=False, index=True)
+    chat_id_hash = Column(String(32), nullable=False, default="")
+    command      = Column(String(64), nullable=False)
+    args         = Column(String(255), nullable=True)
+    accepted     = Column(Boolean, nullable=False, default=True)
+    reject_reason = Column(String(255), nullable=True)
+    response_bytes = Column(Integer, nullable=True)

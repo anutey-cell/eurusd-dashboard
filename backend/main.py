@@ -91,9 +91,25 @@ async def lifespan(app: FastAPI):
         from services.background_scheduler import start_background_loops, stop_background_loops
         await start_background_loops()
         log.info("Background scheduler started — autonomous 2-week live testing mode")
+
+        # ── P9: Telegram bot command handler (long-poll) ────────────────
+        try:
+            from services.telegram_bot_poller import (
+                start_background_poller, stop_background_poller,
+            )
+            if start_background_poller():
+                log.info("Telegram bot poller started")
+        except Exception as _bot_exc:
+            log.warning("Telegram bot poller failed to start: %s", _bot_exc)
+
         try:
             yield
         finally:
+            try:
+                from services.telegram_bot_poller import stop_background_poller
+                stop_background_poller()
+            except Exception:
+                pass
             await stop_background_loops()
     except Exception as _sched_exc:
         log.warning("Background scheduler failed to start: %s", _sched_exc)
