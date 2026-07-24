@@ -571,3 +571,141 @@ class VpTrapSignal(Base):
     reason_invalidates  = Column(Text, nullable=True)
     conditions_met_json = Column(Text, nullable=True)
     conditions_missing_json = Column(Text, nullable=True)
+
+
+# ── canonical signals (Telegram Notification P1) ─────────────────────────────
+
+class Signal(Base):
+    """
+    Canonical persistent signal — single source of truth for the
+    Telegram notification layer + future dashboard v2 consumers.
+
+    One row per unique fingerprint. `state` mutates via the registry;
+    every transition also writes a SignalStateTransition row for audit.
+    """
+    __tablename__ = "signals_canonical"
+
+    id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    created_at        = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    updated_at        = Column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+
+    # Identity
+    signal_id         = Column(String(48), nullable=False, unique=True, index=True)
+      # e.g. MDT-XAU-20260723-001
+    fingerprint       = Column(String(32), nullable=False, unique=True, index=True)
+    strategy_id       = Column(String(24), nullable=False, index=True)
+      # mandate | vp_trap | momentum | kz_magnet | aggregated
+    strategy_name     = Column(String(64), nullable=False)
+    instrument        = Column(String(16), nullable=False, default="XAUUSD", index=True)
+
+    # Direction + confidence
+    direction         = Column(String(4),  nullable=False)    # BUY | SELL | NONE
+    confidence        = Column(Integer,    nullable=False, default=0)
+
+    # Entry / stop / invalidation
+    entry_zone_low    = Column(Float, nullable=False)
+    entry_zone_high   = Column(Float, nullable=False)
+    stop_loss         = Column(Float, nullable=False)
+    current_stop      = Column(Float, nullable=False)   # mutated by risk engine
+    invalidation      = Column(String(255), nullable=False, default="")
+    no_chase_price    = Column(Float, nullable=True)
+
+    # Targets
+    tp1               = Column(Float, nullable=True)
+    tp2               = Column(Float, nullable=True)
+    tp3               = Column(Float, nullable=True)
+    tp1_label         = Column(String(64), nullable=True)
+    tp2_label         = Column(String(64), nullable=True)
+    tp3_label         = Column(String(64), nullable=True)
+    rr_tp1            = Column(Float, nullable=True)
+    rr_tp2            = Column(Float, nullable=True)
+    rr_tp3            = Column(Float, nullable=True)
+
+    # Setup context
+    session           = Column(String(64), nullable=False, default="")
+    market_regime     = Column(String(64), nullable=True)
+    htf_bias          = Column(String(64), nullable=True)
+    trap_side         = Column(String(32), nullable=True)
+    reference_zone_low  = Column(Float, nullable=True)
+    reference_zone_high = Column(Float, nullable=True)
+
+    # Rationale (JSON-encoded lists)
+    conditions_met_json     = Column(Text, nullable=True)
+    conditions_missing_json = Column(Text, nullable=True)
+    rationale               = Column(Text, nullable=True)
+    data_source             = Column(String(32), nullable=False, default="tick_proxy")
+    confluence_json         = Column(Text, nullable=True)
+      # JSON array of {"strategy_name":..., "confidence":...}
+
+    # State machine
+    state             = Column(String(24), nullable=False, default="DETECTED", index=True)
+    previous_state    = Column(String(24), nullable=True)
+
+    # Timestamps
+    valid_until       = Column(DateTime(timezone=True), nullable=True, index=True)
+    triggered_at      = Column(DateTime(timezone=True), nullable=True)
+    closed_at         = Column(DateTime(timezone=True), nullable=True)
+
+    # Execution
+    is_broker_confirmed = Column(Boolean, nullable=False, default=False)
+    r_realized        = Column(Float, nullable=True)
+    partial_taken     = Column(Boolean, nullable=False, default=False)
+
+    # Aggregation — when this signal was absorbed into a high-confluence agg
+    absorbed_into     = Column(String(48), nullable=True, index=True)
+
+
+class SignalStateTransition(Base):
+    """Append-only audit log — every state change of every signal."""
+    __tablename__ = "signal_state_transitions"
+
+    id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    at                = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    signal_id         = Column(String(48), nullable=False, index=True)   # references Signal.signal_id
+    from_state        = Column(String(24), nullable=False)
+    to_state          = Column(String(24), nullable=False)
+    reason            = Column(String(255), nullable=True)   # human-readable trigger
+    price_at_transition = Column(Float, nullable=True)
+    payload_json      = Column(Text, nullable=True)          # optional structured extras
+
+
+class TelegramNotification(Base):
+    """
+    Audit trail for every Telegram message the notification layer emits
+    (or SUPPRESSES). Idempotency: (signal_id, message_fingerprint) is unique
+    per attempt — repeat sends detect and no-op.
+    """
+    __tablename__ = "telegram_notifications"
+
+    id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    created_at        = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+
+    # Signal + transition context
+    signal_id         = Column(String(48), nullable=False, index=True)
+    strategy_id       = Column(String(24), nullable=False, index=True)
+    message_type      = Column(String(32), nullable=False, index=True)
+      # monitoring | actionable | entry_triggered | tp1_hit | ... | high_confluence
+    from_state        = Column(String(24), nullable=True)
+    to_state          = Column(String(24), nullable=False)
+
+    # Idempotency
+    message_fingerprint = Column(String(32), nullable=False, unique=True, index=True)
+
+    # Delivery
+    delivered         = Column(Boolean, nullable=False, default=False)
+    delivery_result   = Column(String(24), nullable=False, default="pending")
+      # pending | delivered | failed | suppressed | dry_run
+    retry_count       = Column(Integer, nullable=False, default=0)
+    error_message     = Column(String(255), nullable=True)
+    delivered_at      = Column(DateTime(timezone=True), nullable=True)
+
+    # Recipient (masked in logs; full stored here for audit)
+    chat_id_hash      = Column(String(32), nullable=False, default="")
+      # SHA(chat_id)[:16] — never store raw chat ID in logs
+
+    # Rendered content (for post-hoc inspection / regression testing)
+    message_text      = Column(Text, nullable=True)
+    message_bytes     = Column(Integer, nullable=True)
+
+    # Suppression rationale — populated when delivery_result == "suppressed"
+    suppression_reason = Column(String(255), nullable=True)
