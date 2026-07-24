@@ -155,12 +155,41 @@ def run_once(db: Session) -> dict:
     _maybe_scan_vp_trap_zones(db)             # Phase 2 — advance state, no alerts yet
     _maybe_fire_kz_magnet_alert(db, verdict)  # KZ Magnet (cross-KZ POC + Flux)
 
+    # Canonical notification layer — runs in shadow mode alongside legacy
+    _shadow_run_canonical_mandate(db, verdict)
+
     try:
         persist_verdict(db, verdict, pending_execution_id=pending_id)
     except Exception as exc:
         log.debug("[strategist_runner] persistence skipped: %s", exc)
 
     return verdict
+
+
+def _shadow_run_canonical_mandate(db: Session, verdict: dict) -> None:
+    """
+    P3 shadow-mode hook: routes every verdict through the canonical adapter
+    so we build a parallel audit trail. Legacy Telegram path is unchanged.
+
+    Cutover flips settings.notification_shadow_mode → False. Only then does
+    the canonical path actually send. `notification_canonical_enabled` is
+    the master off-switch (useful if the new pipeline misbehaves live).
+    """
+    if not getattr(settings, "notification_canonical_enabled", True):
+        return
+    try:
+        from services.signal_adapters import on_mandate_verdict
+        result = on_mandate_verdict(
+            db, verdict,
+            force_dry_run=bool(getattr(settings, "notification_shadow_mode", True)),
+            mode=getattr(settings, "notification_mode", "standard"),
+        )
+        if result.get("action") not in (None, "skipped", "unchanged"):
+            log.info("[canonical/mandate] %s · %s · state=%s",
+                     result.get("action"), result.get("signal_id"),
+                     result.get("state"))
+    except Exception as exc:
+        log.warning("[canonical/mandate] shadow run failed: %s", exc)
 
 
 # ── Telegram side-effect ─────────────────────────────────────────────────────

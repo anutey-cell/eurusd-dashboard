@@ -208,6 +208,17 @@ class Settings(BaseSettings):
     scan_interval_seconds:      int  = 60    # frontend auto-refresh interval hint
     telegram_watchlist_alerts:  bool = False  # send WATCHLIST state alerts
 
+    # ── Canonical notification layer (unified Telegram pipeline) ─────────────
+    # Runs alongside the legacy Telegram path. When shadow_mode is True the
+    # canonical layer only writes audit rows (TelegramNotification with
+    # delivery_result='suppressed' + reason='shadow_mode_dry_run'), so we can
+    # compare against the legacy alert_log without double-firing. Once the two
+    # agree on all shipped signals, flip shadow_mode → False and disable the
+    # matching legacy path for the same strategy.
+    notification_canonical_enabled: bool = True    # master switch for the new layer
+    notification_shadow_mode:       bool = True    # canonical is dry-run parallel to legacy
+    notification_mode:              str  = "standard"  # minimal | standard | detailed
+
     # ── Auth (optional API key protection) ───────────────────────────────────
     auth_enabled: bool = False
     api_key:      str  = "change_me"
