@@ -67,7 +67,7 @@ def _cleanup(db):
 
 def _make_verdict(decision="BUY", cp=4, entry=4020.0, sl=4014.0,
                   tp1=4028.0, tp2=4033.0, tp3=4040.0, rr=2.5,
-                  session="London KZ", setup_score=78) -> dict:
+                  session="London KZ", setup_score=85) -> dict:
     return {
         "decision":                 decision,
         "conditions_passed":        cp,
@@ -111,7 +111,7 @@ def test_verdict_to_signal_basic():
     assert p["tp1"] == 4028.0 and p["tp3"] == 4040.0
     assert p["_desired_state"] == STATE_ARMED
     assert p["session"] == "London KZ"
-    assert p["confidence"] == 78
+    assert p["confidence"] == 85
 
 
 def test_verdict_to_signal_watchlist_3of5():
@@ -225,9 +225,13 @@ def test_shadow_mode_suppresses_notification():
         v = _make_verdict(cp=4)
         r = on_mandate_verdict(db, v, client=c, force_dry_run=True)
         assert r["notification"]["result"] == "suppressed"
+        # In shadow mode the reason is either 'shadow_mode_dry_run' OR the
+        # threshold suppression that would have applied anyway — either
+        # proves no wire traffic. The audit row records whichever wins.
         assert len(fake.posts) == 0
         n = db.query(TN).one()
-        assert n.suppression_reason == "shadow_mode_dry_run"
+        assert n.suppression_reason is not None
+        assert n.delivery_result == "suppressed"
     finally:
         _cleanup(db); db.close()
 

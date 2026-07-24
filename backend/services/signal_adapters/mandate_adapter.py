@@ -39,15 +39,13 @@ from services.canonical_signal import (
     STATE_DETECTED,
     DIRECTION_BUY, DIRECTION_SELL,
     STRATEGY_MANDATE,
-    message_type_for,
 )
 from services.signal_registry import (
     upsert as reg_upsert,
     transition as reg_transition,
     active_signals,
 )
-from services.telegram_templates import render as render_template, MODE_STANDARD
-from services.telegram_client import get_client, TelegramClient
+from services.telegram_client import TelegramClient
 
 log = logging.getLogger(__name__)
 
@@ -195,7 +193,7 @@ def on_mandate_verdict(
     *,
     client: Optional[TelegramClient] = None,
     force_dry_run: bool = False,
-    mode: str = MODE_STANDARD,
+    mode: Optional[str] = None,   # kept for back-compat; router owns the choice now
     now: Optional[datetime] = None,
 ) -> dict:
     """
@@ -256,7 +254,7 @@ def on_mandate_verdict(
         # ── 5. Dispatch notification if this transition has a template ──────
         notif = _maybe_dispatch(db, sig, from_state, desired_state,
                                  client=client, force_dry_run=force_dry_run,
-                                 mode=mode, now=now)
+                                 now=now)
 
         return {
             "action":       action,
@@ -280,44 +278,31 @@ def on_mandate_verdict(
 def _maybe_dispatch(
     db: Session, sig, from_state: str, to_state: str,
     *, client: Optional[TelegramClient], force_dry_run: bool,
-    mode: str, now: datetime,
+    now: datetime,
 ) -> Optional[dict]:
-    """Render template + send via client. Silent transitions → None."""
-    msg_type = message_type_for(from_state, to_state)
-    if msg_type is None:
-        return None
-    try:
-        payload = render_template(msg_type, sig, mode=mode, now=now)
-    except Exception as exc:
-        log.warning("[mandate_adapter] template render failed for %s: %s",
-                    msg_type, exc)
-        return None
+    """Route via the notification policy layer. Silent transitions → None.
 
-    c = client or get_client()
-    # Shadow-mode gate: caller can force dry-run even if client is live.
-    # We temporarily set the client's dry_run attr for THIS call by using
-    # a suppression_reason instead — cleaner than mutating shared state.
-    suppression = "shadow_mode_dry_run" if force_dry_run else None
-
+    All policy (thresholds, mute rules, verbosity mode, quiet hours) lives
+    in services.notification_router — this adapter just tells the router
+    what happened.
+    """
     try:
-        return c.send_notification(
-            db,
-            signal_id=sig.signal_id,
-            strategy_id=sig.strategy_id,
-            from_state=from_state,
-            to_state=to_state,
-            payload=payload,
-            suppression_reason=suppression,
+        from services.notification_router import route
+        return route(
+            db, sig, from_state, to_state,
+            client=client,
+            force_dry_run=force_dry_run,
+            now=now,
         )
     except Exception as exc:
-        log.warning("[mandate_adapter] send failed: %s", exc)
+        log.warning("[mandate_adapter] router dispatch failed: %s", exc)
         return {"delivered": False, "result": "error", "error": str(exc)}
 
 
 def _maybe_invalidate_prior(
     db: Session, verdict: dict,
     client: Optional[TelegramClient], force_dry_run: bool,
-    mode: str, now: datetime,
+    mode, now: datetime,   # `mode` unused — kept positional for existing callers
 ) -> dict:
     """When current tick says no-trade, invalidate any still-active mandate
     signal from a prior tick (so we emit a clean 'invalidated' message)."""
@@ -343,7 +328,7 @@ def _maybe_invalidate_prior(
             )
             notif = _maybe_dispatch(db, new_sig, prior.state, STATE_INVALIDATED,
                                      client=client, force_dry_run=force_dry_run,
-                                     mode=mode, now=now)
+                                     now=now)
             results.append({"signal_id": new_sig.signal_id, "notif": notif})
         except Exception as exc:
             log.warning("[mandate_adapter] invalidate transition failed %s: %s",
