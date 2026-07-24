@@ -73,12 +73,30 @@ def _to_eat(dt: Optional[datetime]) -> str:
 # ── Preferences ─────────────────────────────────────────────────────────────
 
 def get_or_create_chat_pref(db: Session, chat_id: str, chat_type: str = "private"):
-    """Return the TelegramChatPreference row, creating on first sight."""
+    """Return the TelegramChatPreference row, creating on first sight.
+
+    The chat matching settings.telegram_chat_id (the operator's owner chat
+    from .env) is auto-flagged as admin — otherwise no chat would ever be
+    able to run admin commands without manual DB surgery.
+    """
     from db_models import TelegramChatPreference as CP
+    try:
+        from config import settings
+        owner_chat_id = str(getattr(settings, "telegram_chat_id", "") or "")
+    except Exception:
+        owner_chat_id = ""
+
     row = db.query(CP).filter(CP.chat_id == str(chat_id)).one_or_none()
     if row is not None:
+        # Idempotent: if the owner chat exists but isn't admin, promote it.
+        if owner_chat_id and str(chat_id) == owner_chat_id and not row.is_admin:
+            row.is_admin = True
+            db.commit()
         return row
-    row = CP(chat_id=str(chat_id), chat_type=chat_type)
+    is_admin = bool(owner_chat_id and str(chat_id) == owner_chat_id)
+    row = CP(chat_id=str(chat_id), chat_type=chat_type,
+             is_admin=is_admin,
+             label="Owner" if is_admin else None)
     db.add(row)
     db.commit()
     db.refresh(row)
