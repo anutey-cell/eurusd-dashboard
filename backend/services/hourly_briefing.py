@@ -282,7 +282,12 @@ _last_briefing_date_key: str = ""
 
 
 def send_briefing_if_due(db: Session) -> bool:
-    """Called by the scheduler. Sends once per calendar day (UTC)."""
+    """Called by the scheduler. Sends once per calendar day (UTC).
+
+    Suppressed when tomorrow's session is closed — Friday's "Tomorrow's
+    Playbook" for Saturday is misleading (market shut all day). The
+    Saturday recap + Sunday forecast newsletters cover the weekend.
+    """
     global _last_briefing_date_key
     from config import settings
     from services.strategist_runner import is_weekend_quiet_hours
@@ -293,7 +298,14 @@ def send_briefing_if_due(db: Session) -> bool:
         log.debug("[briefing] suppressed — weekend quiet hours")
         return False
 
-    date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now = datetime.now(timezone.utc)
+    tomorrow_wd = (now + timedelta(days=1)).weekday()   # 5=Sat, 6=Sun
+    if tomorrow_wd in (5, 6):
+        log.debug("[briefing] suppressed — tomorrow is weekend (%d), "
+                  "Sat recap / Sun forecast handles it", tomorrow_wd)
+        return False
+
+    date_key = now.strftime("%Y-%m-%d")
     if date_key == _last_briefing_date_key:
         return False
 
