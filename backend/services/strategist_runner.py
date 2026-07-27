@@ -602,8 +602,14 @@ def _format_preformation_message(verdict: dict, kz_name: str, opens_utc: str, wh
 def _maybe_fire_preformation_alert(verdict: dict) -> None:
     """
     Fire a one-per-day "SETUP FORMING" heads-up for each configured killzone
-    when we're within the first 5 minutes of the trigger hour. Dedupe by
-    (kz_name, YYYY-MM-DD).
+    when we're within the first 5 minutes of the trigger hour.
+
+    Setup-quality gate: only fires when the current verdict already has a
+    real setup forming (BUY/SELL with conditions_passed >= 4 — ARMED grade).
+    "Session opens in an hour" without an in-flight setup is calendar noise;
+    the operator explicitly asked for signal, not schedule.
+
+    Dedupe by (kz_name, YYYY-MM-DD).
     """
     global _last_preformation_alerts
 
@@ -611,6 +617,12 @@ def _maybe_fire_preformation_alert(verdict: dict) -> None:
         return
     if is_weekend_quiet_hours():
         return
+
+    # ── Setup-quality gate ─────────────────────────────────────────────────
+    decision = verdict.get("decision", "STAND ASIDE")
+    cp = int(verdict.get("conditions_passed", 0) or 0)
+    if decision not in ("BUY", "SELL") or cp < 4:
+        return   # no real setup — silent
 
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
@@ -632,7 +644,8 @@ def _maybe_fire_preformation_alert(verdict: dict) -> None:
             )
             _send_plain(msg)
             _last_preformation_alerts[cfg["kz_name"]] = today
-            log.info("[strategist_runner] pre-formation alert fired for %s", cfg["kz_name"])
+            log.info("[strategist_runner] pre-formation alert fired for %s "
+                     "(%s %d/5)", cfg["kz_name"], decision, cp)
         except Exception as exc:
             log.warning("[strategist_runner] pre-formation alert failed for %s: %s",
                         cfg["kz_name"], exc)
