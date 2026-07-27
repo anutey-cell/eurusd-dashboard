@@ -286,6 +286,13 @@ def _maybe_fire_alert(verdict: dict) -> None:
                 _send_plain(_format_direction_flip(verdict, prior_direction=_last_signaled_direction))
                 log.info("[strategist_runner] direction flip alert fired: %s → %s",
                          _last_signaled_direction, decision)
+                # Record flip so the H3 cooldown gate in execution_gates
+                # blocks execution in the NEW direction for cooldown_min.
+                try:
+                    from services.execution_gates import mark_direction_flip
+                    mark_direction_flip(decision)
+                except Exception as _hexc:
+                    log.debug("[strategist_runner] flip cooldown mark failed: %s", _hexc)
             except Exception as exc:
                 log.warning("[strategist_runner] direction flip alert failed: %s", exc)
 

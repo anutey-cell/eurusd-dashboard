@@ -662,6 +662,11 @@ def _decide_execution_status(
     open_positions_count: int = 0,
     max_concurrent_positions: int = 5,
     kz_policy: Any | None = None,    # PolicyVerdict — informational only (see note)
+    # ── NEW: quality + headwind context (all optional for back-compat) ──
+    setup_score:  int   = 0,          # 0-100 fine-grain quality score
+    session_label: str  = "",         # e.g. "ny_kz", "overlap"
+    spread_pts:  float | None = None, # for wide-spread demote
+    db=None,                          # optional Session for cooldown/news queries
 ) -> tuple[str, str]:
     """
     Pick the execution_status value. Returns (status, reason).
@@ -726,6 +731,32 @@ def _decide_execution_status(
         return _EXEC_SIGNAL_ONLY, f"RR {rr or 0:.2f}<1.5 demo floor"
     if not (demo_auto_enqueue and allow_demo):
         return _EXEC_SIGNAL_ONLY, "Demo auto-enqueue disabled by operator"
+
+    # ── Quality + headwind gate (P128) ─────────────────────────────────────
+    # Only runs when db is provided (post-refactor path). Legacy callers
+    # bypass, preserving back-compat. Once all callers pass db, this can
+    # be tightened into a hard requirement.
+    if db is not None:
+        try:
+            from services.execution_gates import evaluate_execution_quality
+            quality = evaluate_execution_quality(
+                db=db,
+                setup_score=int(setup_score or 0),
+                rr=float(rr or 0.0),
+                session_label=session_label or "",
+                direction=proposed_signal,
+                spread_pts=spread_pts,
+                settings=settings,
+            )
+            if not quality["allow_execution"]:
+                # Log the first blocking reason so the verdict remains readable.
+                blocking = next(
+                    (r for r in quality["reasons"] if "BLOCK" in r or "DEMOTE" in r),
+                    "quality/headwind gate",
+                )
+                return _EXEC_SIGNAL_ONLY, f"Quality gate — {blocking}"
+        except Exception as exc:
+            log.warning("[strategist] execution_gates evaluation skipped: %s", exc)
 
     return _EXEC_DEMO_PLACED, "All gates pass"
 
@@ -1517,6 +1548,13 @@ def make_decision(db: Session) -> dict:
         open_positions_count=pos_snap["count"],
         max_concurrent_positions=effective_cap,    # ← dynamic, not static
         kz_policy=kz_policy,                        # ← NEW: hard cell-edge gate
+        # ── P128 quality + headwind gates ─────────────────────────────
+        setup_score=total_setup_score,
+        session_label=session_mandate or "",
+        spread_pts=(
+            float(((scan.get("risk") or {}).get("spreadPoints") or 0.0)) or None
+        ),
+        db=db,
     )
 
     entry_tolerance = _compute_entry_tolerance(atr_h1)

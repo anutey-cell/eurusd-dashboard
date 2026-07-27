@@ -208,6 +208,22 @@ class Settings(BaseSettings):
     scan_interval_seconds:      int  = 60    # frontend auto-refresh interval hint
     telegram_watchlist_alerts:  bool = False  # send WATCHLIST state alerts
 
+    # ── Execution quality + headwind gates (P128) ─────────────────────────────
+    # Sit on top of the 5-condition mandate. A verdict at 4/5+ still has to
+    # clear these gates before demo execution fires. Each can be disabled
+    # independently. Post-analysis of 30-day live data (7-25 → 8-26) showed
+    # the mandate was over-firing 10× the designed rate because the
+    # coarse conditions_passed count is the only quality gate — the
+    # fine-grain setup_score and negative-EV setups slipped through.
+    min_setup_score_for_execution:  int   = 85      # Q1: floor on 0-100 score
+    require_positive_ev:            bool  = True    # Q2: est_WR × RR must be > 1
+    session_penalty_enabled:        bool  = True    # H1: NY / overlap penalty
+    post_loss_cooldown_min:         int   = 60      # H2: minutes after last stop
+    direction_flip_cooldown_min:    int   = 120     # H3: minutes after flip alert
+    execution_tight_spread_pts:     float = 3.0     # H4: below → clean
+    execution_hard_spread_pts:      float = 5.0     # H4: above → hard block
+    news_proximity_lookahead_min:   int   = 30      # H5: no exec within window
+
     # ── Telegram bot (command-handler poller) ─────────────────────────────────
     # When True AND telegram_bot_token is set, a background thread long-polls
     # getUpdates and dispatches slash-commands (/status, /signals, /mute, ...).
