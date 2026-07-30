@@ -208,6 +208,19 @@ class Settings(BaseSettings):
     scan_interval_seconds:      int  = 60    # frontend auto-refresh interval hint
     telegram_watchlist_alerts:  bool = False  # send WATCHLIST state alerts
 
+    # ── Fixed-dollar TP structure (P130) ──────────────────────────────────────
+    # Trade goal: extract $20 min → $40 max XAU/USD price change per trade
+    # (i.e. 20-40 points per setup, at 0.01 lot). Trade plans are generated
+    # with FIXED-POINT TPs instead of ATR multiples, and SL is capped so RR
+    # stays ≥ mandate floor. Any structural stop that would require wider
+    # SL than max_sl_points is rejected as "sl_too_wide_for_target" —
+    # this keeps every fired setup inside the operator's capture envelope.
+    target_tp1_points:              float = 20.0    # first exit / breakeven trigger
+    target_tp2_points:              float = 40.0    # full close cap
+    max_sl_points:                  float = 20.0    # skip trades needing wider stops
+    min_sl_points:                  float = 8.0     # noise floor
+    fixed_tp_enabled:               bool  = True    # master switch (off = revert to ATR R-multiples)
+
     # ── Execution quality + headwind gates (P128) ─────────────────────────────
     # Sit on top of the 5-condition mandate. A verdict at 4/5+ still has to
     # clear these gates before demo execution fires. Each can be disabled

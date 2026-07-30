@@ -951,6 +951,64 @@ def _generate_trade_plan(
     swing_low  = min((c.low  for c in recent), default=None) if recent else None
     swing_high = max((c.high for c in recent), default=None) if recent else None
 
+    # ── P130: fixed-dollar TP mode ────────────────────────────────────────
+    # Operator goal: extract 20-40 point moves per trade.
+    # TP1 and TP2 are FIXED (settings.target_tp1_points / _tp2_points).
+    # SL uses the tighter of ATR-based and swing-based, capped at
+    # settings.max_sl_points; if the structural stop demands more, the
+    # setup is rejected rather than over-tightened (protecting against
+    # sweeps of the real level).
+    if getattr(settings, "fixed_tp_enabled", True):
+        tp1_pts = float(getattr(settings, "target_tp1_points", 20.0))
+        tp2_pts = float(getattr(settings, "target_tp2_points", 40.0))
+        max_sl  = float(getattr(settings, "max_sl_points",     20.0))
+        min_sl  = float(getattr(settings, "min_sl_points",      8.0))
+
+        # Structural + ATR SL — pick the tighter
+        if direction == "BUY":
+            sl_swing = (current_price - swing_low + 1.0) if swing_low else sl_dist_atr
+        else:
+            sl_swing = (swing_high - current_price + 1.0) if swing_high else sl_dist_atr
+        sl_dist = min(sl_swing, sl_dist_atr)
+
+        # Reject if the real structural stop needs > max_sl (would violate target)
+        if sl_dist > max_sl:
+            return {"entry": None, "stop_loss": None, "tp1": None, "tp2": None,
+                    "tp3": None, "rr": 0, "risk_pts": 0,
+                    "source": "sl_too_wide_for_target",
+                    "rejection": f"structural SL {sl_dist:.1f} pts > max {max_sl:.1f} — "
+                                 f"skip (setup doesn't fit ${int(tp2_pts)} capture target)"}
+        # Widen to noise floor if tighter than min_sl
+        if sl_dist < min_sl:
+            sl_dist = min_sl
+
+        if direction == "BUY":
+            sl  = current_price - sl_dist
+            tp1 = round(current_price + tp1_pts, 2)
+            tp2 = round(current_price + tp2_pts, 2)
+            tp3 = round(current_price + tp2_pts, 2)   # cap — no TP3 in fixed mode
+        else:
+            sl  = current_price + sl_dist
+            tp1 = round(current_price - tp1_pts, 2)
+            tp2 = round(current_price - tp2_pts, 2)
+            tp3 = round(current_price - tp2_pts, 2)
+
+        rr_primary = round(tp2_pts / sl_dist, 2)
+
+        return {
+            "entry":     round(current_price, 2),
+            "stop_loss": round(sl, 2),
+            "tp1":       tp1,
+            "tp2":       tp2,
+            "tp3":       tp3,
+            "rr":        rr_primary,
+            "risk_pts":  round(sl_dist, 2),
+            "target_pts_tp1": tp1_pts,
+            "target_pts_tp2": tp2_pts,
+            "source":    "strategist_fixed_target",
+        }
+
+    # ── Legacy ATR R-multiple mode (fixed_tp_enabled=false) ───────────────
     if direction == "BUY":
         # SL = MAX of (recent swing low - buffer) and (entry - ATR distance)
         #   i.e. take the wider of the two so we don't get knocked out by noise
@@ -1330,17 +1388,41 @@ def make_decision(db: Session) -> dict:
 
     tp1, tp2, tp3 = None, None, None
     if entry and stop_loss and take_profit and proposed_signal in ("BUY", "SELL"):
-        # Scanner-provided plan — stagger to TP1/TP2/TP3
         rr_unit = abs(entry - stop_loss)
-        if proposed_signal == "BUY":
-            tp1 = round(entry + rr_unit * 1.0, 2)
-            tp2 = round(entry + rr_unit * 2.5, 2)
-            tp3 = round(entry + rr_unit * 4.0, 2)
+        # P130: fixed-point TPs from operator envelope, overriding scanner's TP.
+        # SL from scanner is honoured (structural anchor), but if it's wider
+        # than max_sl_points, reject the setup — same guard as the ATR path.
+        if getattr(settings, "fixed_tp_enabled", True):
+            tp1_pts = float(getattr(settings, "target_tp1_points", 20.0))
+            tp2_pts = float(getattr(settings, "target_tp2_points", 40.0))
+            max_sl  = float(getattr(settings, "max_sl_points",     20.0))
+            if rr_unit > max_sl:
+                log.info("[strategist] scanner plan rejected — SL %.1f > max %.1f "
+                         "(doesn't fit $%d target)", rr_unit, max_sl, int(tp2_pts))
+                entry = stop_loss = tp1 = tp2 = tp3 = None
+                plan_source = "sl_too_wide_for_target"
+                rr = 0
+            else:
+                if proposed_signal == "BUY":
+                    tp1 = round(entry + tp1_pts, 2)
+                    tp2 = round(entry + tp2_pts, 2)
+                    tp3 = round(entry + tp2_pts, 2)   # cap
+                else:
+                    tp1 = round(entry - tp1_pts, 2)
+                    tp2 = round(entry - tp2_pts, 2)
+                    tp3 = round(entry - tp2_pts, 2)
+                rr = round(tp2_pts / rr_unit, 2)
         else:
-            tp1 = round(entry - rr_unit * 1.0, 2)
-            tp2 = round(entry - rr_unit * 2.5, 2)
-            tp3 = round(entry - rr_unit * 4.0, 2)
-        rr = round(abs(tp2 - entry) / rr_unit, 2)
+            # Legacy scanner-scaled R-multiples
+            if proposed_signal == "BUY":
+                tp1 = round(entry + rr_unit * 1.0, 2)
+                tp2 = round(entry + rr_unit * 2.5, 2)
+                tp3 = round(entry + rr_unit * 4.0, 2)
+            else:
+                tp1 = round(entry - rr_unit * 1.0, 2)
+                tp2 = round(entry - rr_unit * 2.5, 2)
+                tp3 = round(entry - rr_unit * 4.0, 2)
+            rr = round(abs(tp2 - entry) / rr_unit, 2)
 
     elif proposed_signal in ("BUY", "SELL") and current_price and atr_h1 > 0:
         # Scanner abstained → strategist generates its own ATR plan
