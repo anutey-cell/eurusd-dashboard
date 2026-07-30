@@ -1370,6 +1370,42 @@ def make_decision(db: Session) -> dict:
         score_rr = 5
     total_setup_score += score_rr
 
+    # ── Candlestick confluence bonus (P129) ─────────────────────────────
+    # Additive only: adds 0-10 to setup_score when a real candle pattern
+    # (pin bar / engulfing / inside-break / two-bar reversal / marubozu)
+    # coincides with the entry zone OR any mapped liquidity level.
+    # Never subtracts, never blocks execution.
+    candlestick_verdict = None
+    try:
+        from services.candlestick_reader import evaluate_candlestick_confluence
+        # Build the list of liquidity levels the pattern must sit near
+        _liq_zones = [
+            today_high, today_low, prev_day_high, prev_day_low,
+        ]
+        if liquidity_map_obj is not None:
+            _liq_zones += [
+                getattr(liquidity_map_obj, "poc", None),
+                getattr(liquidity_map_obj, "vah", None),
+                getattr(liquidity_map_obj, "val", None),
+                getattr(liquidity_map_obj, "vwap", None),
+            ]
+        candlestick_verdict = evaluate_candlestick_confluence(
+            candles=m15 or [],
+            direction=proposed_signal,
+            entry_zone_low=entry,   # scalar; module widens by tolerance
+            entry_zone_high=entry,
+            liquidity_zones=_liq_zones,
+            atr=atr_h1 or 0.0,
+        )
+        if candlestick_verdict.bonus:
+            total_setup_score += candlestick_verdict.bonus
+            log.info(
+                "[strategist] candlestick bonus +%d · %s",
+                candlestick_verdict.bonus, candlestick_verdict.detail,
+            )
+    except Exception as _cs_exc:
+        log.debug("[strategist] candlestick_reader skipped: %s", _cs_exc)
+
     # ── Diagnostic reasons (for reporting, NOT decision gating) ─────────
     # These were used to force STAND ASIDE in the legacy 80/100 model. The
     # 5-condition mandate model now governs the decision; these reasons are
@@ -1682,6 +1718,15 @@ def make_decision(db: Session) -> dict:
             "macd":           f"{macd_h1} ({'bull' if macd_h1 > 0 else 'bear'})",
             "atr_volatility": f"{atr_h1} pts (spread {'OK' if spread_acceptable else 'abnormal'})",
             "candle_quality": (scan.get("engineModel") or {}).get("fvg", "—"),
+            "candlestick": (
+                {
+                    "bonus":    candlestick_verdict.bonus,
+                    "patterns": list(candlestick_verdict.patterns),
+                    "at_zone":  candlestick_verdict.at_zone,
+                    "detail":   candlestick_verdict.detail,
+                }
+                if candlestick_verdict else None
+            ),
         },
         "trade_plan": {
             "entry_type": (
