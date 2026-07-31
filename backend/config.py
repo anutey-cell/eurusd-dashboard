@@ -137,14 +137,14 @@ class Settings(BaseSettings):
     # Default is signal-only, independent mode. Never affects existing engines.
     vp_trap_enabled:                 bool  = True    # master toggle (Phase 4 ships enabled)
     vp_trap_mode:                    str   = "independent"  # independent | confirmation | confluence
-    vp_trap_live_threshold:          int   = 80      # score >= X → live BUY/SELL alert
-    vp_trap_watch_threshold:         int   = 60      # score >= X → dashboard "monitoring"
+    vp_trap_live_threshold:          int   = 70      # P132: aggressive — was 80
+    vp_trap_watch_threshold:         int   = 55      # P132: aggressive — was 60
     vp_trap_countertrend_bonus:      int   = 10      # extra threshold for countertrend setups
     vp_trap_value_area_pct:          float = 0.70    # standard TPO 70%
     vp_trap_min_rr:                  float = 1.8     # minimum RR to fire
     vp_trap_zone_expiry_hours:       int   = 48      # armed zone expiry
     vp_trap_max_retests:             int   = 3       # max retests before zone stales
-    vp_trap_alert_cooldown_s:        int   = 1800    # 30 min per zone_id
+    vp_trap_alert_cooldown_s:        int   = 600     # P132: was 1800 (30m) → 10m
     vp_trap_auto_execute:            bool  = False   # OFF initially — validate live first
     vp_trap_penalize_tick_volume:    int   = 15      # score penalty when only tick-volume proxy
     vp_trap_telegram_alerts:         bool  = True    # send Telegram alerts (when enabled)
@@ -156,7 +156,7 @@ class Settings(BaseSettings):
     kz_magnet_telegram_alerts:       bool  = True    # Telegram alerts when enabled
     kz_magnet_min_distance_atr:      float = 0.6     # min distance from POC to trigger
     kz_magnet_max_va_width_atr:      float = 2.0     # skip prior KZ if VA too wide
-    kz_magnet_alert_cooldown_s:      int   = 1800    # 30 min between same-direction alerts
+    kz_magnet_alert_cooldown_s:      int   = 900     # P132: was 1800 (30m) → 15m
 
     # ── Mandate demo-execution opt-in ─────────────────────────────────────────
     # When True, the strategist will enqueue a 0.01-lot MT5 PendingExecution row

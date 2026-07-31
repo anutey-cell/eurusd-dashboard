@@ -1488,6 +1488,33 @@ def make_decision(db: Session) -> dict:
     except Exception as _cs_exc:
         log.debug("[strategist] candlestick_reader skipped: %s", _cs_exc)
 
+    # ── P132: Volume-Pivot Flux bonus (order-flow proxy) ────────────────
+    # Compute weighted-volume-profile pivot points + Elder-style flux
+    # (buy_vol - sell_vol split). Adds 0-5 to setup_score when the flux
+    # bias STRONGLY agrees with proposed direction. This is the closest
+    # thing to real order-flow available on retail MT5 data. Never
+    # subtracts, never blocks.
+    flux_verdict = None
+    try:
+        if proposed_signal in ("BUY", "SELL") and m15 and len(m15) >= 50:
+            from services.volume_pivot_flux import compute_vppp_flux
+            flux_res = compute_vppp_flux(m15[-100:])
+            fb = float(getattr(flux_res, "flux_bias", 0.0) or 0.0)
+            # Strict alignment threshold (0.15 > permissive helper's 0.10)
+            aligned = ((proposed_signal == "BUY"  and fb > 0.15) or
+                        (proposed_signal == "SELL" and fb < -0.15))
+            if aligned:
+                total_setup_score += 5
+                flux_verdict = {"bonus": 5, "bias": round(fb, 3),
+                                 "label": getattr(flux_res, "flux_label", None)}
+                log.info("[strategist] flux bonus +5 · bias=%.3f · %s",
+                          fb, getattr(flux_res, "flux_label", "?"))
+            else:
+                flux_verdict = {"bonus": 0, "bias": round(fb, 3),
+                                 "label": getattr(flux_res, "flux_label", None)}
+    except Exception as _fx_exc:
+        log.debug("[strategist] volume_pivot_flux skipped: %s", _fx_exc)
+
     # ── Diagnostic reasons (for reporting, NOT decision gating) ─────────
     # These were used to force STAND ASIDE in the legacy 80/100 model. The
     # 5-condition mandate model now governs the decision; these reasons are
@@ -1824,6 +1851,7 @@ def make_decision(db: Session) -> dict:
                 }
                 if candlestick_verdict else None
             ),
+            "flux": flux_verdict,   # P132: {bonus, bias, label} or None
         },
         "trade_plan": {
             "entry_type": (
