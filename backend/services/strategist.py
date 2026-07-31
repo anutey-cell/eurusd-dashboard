@@ -1602,6 +1602,21 @@ def make_decision(db: Session) -> dict:
     if decision == "STAND ASIDE" and conditions_passed < 3 and proposed_signal in ("BUY", "SELL"):
         stand_aside_reasons.insert(0, f"Conditions passed {conditions_passed}/5 (need ≥3 for any action)")
 
+    # ── P131 skip-stats recorder ────────────────────────────────────────
+    # In-process counter that answers "which condition failed most often"
+    # for calibration. Queryable via /api/v1/diagnostics/skip-stats.
+    try:
+        from services.skip_stats import record as _record_skip
+        _record_skip(
+            conditions=conditions,
+            conditions_passed=conditions_passed,
+            setup_score=total_setup_score,
+            execution_status=execution_status,
+            exec_reason=exec_reason,
+        )
+    except Exception:
+        pass   # never break the tick
+
     # ── Next-trigger guidance ───────────────────────────────────────────
     long_trigger = ""
     short_trigger = ""

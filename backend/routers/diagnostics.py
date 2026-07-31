@@ -594,3 +594,31 @@ def engine_state(
         },
         source="diagnostics",
     )
+
+
+@router.get(
+    "/skip-stats",
+    response_model=APIResponse[dict],
+    summary="Rolling in-process 'why did I skip' counter (P131)",
+)
+@limiter.limit("30/minute")
+def skip_stats(request: Request,
+                hours: int = Query(default=24, ge=1, le=168)) -> APIResponse[dict]:
+    """
+    Aggregates the last N hours of strategist verdicts into a breakdown of
+    which condition failed most often, which gate blocked most often, and
+    the setup_score distribution. Resets on process restart.
+    """
+    from services.skip_stats import summary
+    return APIResponse(data=summary(hours=hours), source="diagnostics")
+
+
+@router.get(
+    "/freshness",
+    response_model=APIResponse[dict],
+    summary="Historical-candle freshness across timeframes (P131)",
+)
+@limiter.limit("30/minute")
+def freshness(request: Request, db: Session = Depends(get_db)) -> APIResponse[dict]:
+    from services.data_freshness import check_freshness
+    return APIResponse(data=check_freshness(db), source="diagnostics")

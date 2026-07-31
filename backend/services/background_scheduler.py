@@ -441,6 +441,79 @@ def _run_newsletter_iteration():
                 log.warning("[newsletter] Sunday forecast send failed: %s", exc)
 
 
+# ── P131: candle top-up loop ─────────────────────────────────────────────────
+
+_CANDLE_INGESTION_INTERVAL_S = 900   # 15 min
+
+
+async def _candle_ingestion_loop():
+    """
+    Keep historical_candles fresh via TwelveData top-up every 15 min.
+    Prior TradingView-only path went silent when tvDatafeed sign-in broke;
+    this uses the same TwelveData provider the live scanner already uses.
+    """
+    from database import SessionLocal
+    from services.candle_ingestion import top_up_recent
+
+    log.info("[scheduler] candle ingestion loop started (every %ds)",
+             _CANDLE_INGESTION_INTERVAL_S)
+    while True:
+        try:
+            await asyncio.to_thread(_run_candle_ingestion)
+        except asyncio.CancelledError:
+            log.info("[scheduler] candle ingestion loop cancelled")
+            break
+        except Exception as exc:
+            log.warning("[scheduler] candle ingestion loop error: %s", exc)
+        await asyncio.sleep(_CANDLE_INGESTION_INTERVAL_S)
+
+
+def _run_candle_ingestion():
+    from database import SessionLocal
+    from services.candle_ingestion import top_up_recent
+    with SessionLocal() as db:
+        r = top_up_recent(db, pair="xauusd")
+        if r["totals"]["inserted"]:
+            log.info("[candle_ingestion] top-up inserted %d rows across %d TFs",
+                     r["totals"]["inserted"], len(r["timeframes"]))
+
+
+# ── P131: data-freshness sentinel loop ──────────────────────────────────────
+
+_FRESHNESS_CHECK_INTERVAL_S = 1800    # 30 min
+
+
+async def _data_freshness_loop():
+    """
+    Every 30 min check historical_candles staleness across timeframes.
+    Fires a Telegram alert once/day per stale timeframe.
+    """
+    log.info("[scheduler] data-freshness loop started (every %ds)",
+             _FRESHNESS_CHECK_INTERVAL_S)
+    # Small initial delay so we don't spam on startup before ingestion runs
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await asyncio.to_thread(_run_freshness_check)
+        except asyncio.CancelledError:
+            log.info("[scheduler] data-freshness loop cancelled")
+            break
+        except Exception as exc:
+            log.warning("[scheduler] data-freshness loop error: %s", exc)
+        await asyncio.sleep(_FRESHNESS_CHECK_INTERVAL_S)
+
+
+def _run_freshness_check():
+    from database import SessionLocal
+    from services.data_freshness import maybe_alert
+    with SessionLocal() as db:
+        r = maybe_alert(db) or {}
+        if r.get("stale"):
+            log.warning("[freshness] STALE timeframes: %s · details=%s",
+                        r["stale"], {k: v for k, v in r.get("details", {}).items()
+                                       if k in r["stale"]})
+
+
 def _run_auto_executor_iteration():
     """Single auto-executor iteration (runs in thread)."""
     global _last_auto_attempt
@@ -591,6 +664,7 @@ async def start_background_loops():
     if _tasks:
         log.info("[scheduler] loops already running")
         return
+    # (Loop bodies defined above; add here if not yet imported)
 
     from config import settings
     use_mandate = getattr(settings, "use_mandate_strategist", True)
@@ -603,6 +677,8 @@ async def start_background_loops():
         asyncio.create_task(_daily_briefing_loop(),        name="daily_briefing_loop"),
         asyncio.create_task(_weekly_digest_loop(),         name="weekly_digest_loop"),
         asyncio.create_task(_weekend_newsletter_loop(),    name="weekend_newsletter_loop"),
+        asyncio.create_task(_candle_ingestion_loop(),      name="candle_ingestion_loop"),
+        asyncio.create_task(_data_freshness_loop(),        name="data_freshness_loop"),
     ]
 
     # Pick exactly ONE execution authority — never both, or they'll fight.
