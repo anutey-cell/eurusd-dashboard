@@ -1554,6 +1554,29 @@ def make_decision(db: Session) -> dict:
     except Exception as _ex_exc:
         log.debug("[strategist] external_confluence skipped: %s", _ex_exc)
 
+    # ── P136: 4H manipulation layer (higher-timeframe trap filter) ───────
+    # Detects sweep of prev-4H high/low with M15 reclaim → trapped
+    # participants. Additive: +10 (full confirmation), +5 (weak LTF),
+    # 0 (nothing), -10 (broke and held → continuation, not manipulation).
+    # Never creates a trade; adjusts setup_score only.
+    four_h_manipulation = None
+    try:
+        from services.four_hour_manipulation import detect_4h_manipulation
+        four_h_manipulation = detect_4h_manipulation(
+            h4_candles=h4 or [],
+            candles_m15=m15 or [],
+            candles_m5=None,   # M5 not routinely loaded; layer handles None
+            atr_h1=atr_h1 or 0.0,
+            liquidity_map=liquidity_map_obj,
+        )
+        _adj = int(four_h_manipulation.get("confidence_adjustment", 0) or 0)
+        if _adj:
+            total_setup_score = max(0, min(100, total_setup_score + _adj))
+            log.info("[strategist] 4H manipulation adj %+d · %s",
+                      _adj, four_h_manipulation.get("reason", ""))
+    except Exception as _mh_exc:
+        log.debug("[strategist] four_hour_manipulation skipped: %s", _mh_exc)
+
     # ── Diagnostic reasons (for reporting, NOT decision gating) ─────────
     # These were used to force STAND ASIDE in the legacy 80/100 model. The
     # 5-condition mandate model now governs the decision; these reasons are
@@ -1923,6 +1946,7 @@ def make_decision(db: Session) -> dict:
                 if candlestick_verdict else None
             ),
             "flux": flux_verdict,   # P132: {bonus, bias, label} or None
+            "four_hour_manipulation": four_h_manipulation,   # P136 — trap-filter dict or None
         },
         "external_confluence": external_confluence,   # P134 — full structured dict or None
         "trade_plan": {

@@ -669,3 +669,30 @@ def vp_trap_measurement(request: Request,
     """
     from services.vp_trap_measurement import compute_stats
     return APIResponse(data=compute_stats(db, days=days), source="diagnostics")
+
+
+@router.get(
+    "/four-hour-manipulation",
+    response_model=APIResponse[dict],
+    summary="Prev-4H sweep + M15 reclaim (trap filter) — current snapshot (P136)",
+)
+@limiter.limit("30/minute")
+def four_hour_manipulation(request: Request,
+                             db: Session = Depends(get_db)) -> APIResponse[dict]:
+    from services.four_hour_manipulation import detect_4h_manipulation
+    from data.candles import get_candles
+    try:
+        h4  = get_candles(interval="H4",  limit=5,   pair="xauusd").candles or []
+        m15 = get_candles(interval="M15", limit=20,  pair="xauusd").candles or []
+    except Exception as exc:
+        return APIResponse(data={"error": f"candle fetch failed: {exc}"},
+                            source="diagnostics")
+    return APIResponse(
+        data=detect_4h_manipulation(
+            h4_candles=h4,
+            candles_m15=m15,
+            candles_m5=None,
+            atr_h1=0.0,
+        ),
+        source="diagnostics",
+    )
