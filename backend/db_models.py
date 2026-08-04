@@ -753,6 +753,60 @@ class TelegramChatPreference(Base):
     label           = Column(String(64), nullable=True)   # e.g. "Owner", "Ops group"
 
 
+class VpTrapMeasurementEvent(Base):
+    """
+    P135 — one row per VP Trap signal fired during the 30-day measurement
+    protocol. This is the append-only ground truth for computing the four
+    protocol metrics: setups/day, win rate, avg R, drawdown.
+
+    Lifecycle: PENDING → TRIGGERED → (TP1_HIT | TP2_HIT | STOPPED)
+                         └→ INVALIDATED (if opposing move before trigger)
+                         └→ EXPIRED (if valid_until passes without trigger)
+    """
+    __tablename__ = "vp_trap_measurement_events"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    created_at     = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    updated_at     = Column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+
+    # Identity
+    zone_id        = Column(String(48), nullable=False, index=True)
+    signal_id      = Column(String(64), nullable=True)  # optional cross-ref to canonical/legacy
+
+    # Setup context at fire time
+    direction      = Column(String(4),  nullable=False)  # BUY | SELL
+    score          = Column(Integer,    nullable=False)
+    session        = Column(String(32), nullable=False, default="unknown")
+    trap_side      = Column(String(16), nullable=True)   # bull_trap | bear_trap
+
+    # Trade plan
+    fired_at       = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    entry_price    = Column(Float, nullable=False)
+    stop_loss      = Column(Float, nullable=False)
+    tp1_price      = Column(Float, nullable=True)
+    tp2_price      = Column(Float, nullable=True)
+    tp1_rr         = Column(Float, nullable=True)
+    tp2_rr         = Column(Float, nullable=True)
+    invalidation_price = Column(Float, nullable=True)
+    valid_until    = Column(DateTime(timezone=True), nullable=True)
+
+    # Live outcome
+    status         = Column(String(24), nullable=False, default="PENDING", index=True)
+      # PENDING | TRIGGERED | TP1_HIT | TP2_HIT | STOPPED | INVALIDATED | EXPIRED
+    triggered_at   = Column(DateTime(timezone=True), nullable=True)
+    triggered_price = Column(Float, nullable=True)
+    closed_at      = Column(DateTime(timezone=True), nullable=True)
+    closed_price   = Column(Float, nullable=True)
+
+    # Outcome metrics (populated once closed)
+    r_realized     = Column(Float, nullable=True)   # 0.5 half-taken at TP1 + 2R runner at TP2 = 2.25R blended
+    mfe_pts        = Column(Float, nullable=True)   # max favorable excursion (points from entry)
+    mae_pts        = Column(Float, nullable=True)   # max adverse excursion
+    duration_min   = Column(Float, nullable=True)   # entry → close, minutes
+
+    notes_json     = Column(Text, nullable=True)
+
+
 class TelegramCommandLog(Base):
     """Append-only log of received bot commands — for audit + debug."""
     __tablename__ = "telegram_command_log"

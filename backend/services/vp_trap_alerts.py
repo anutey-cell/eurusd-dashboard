@@ -518,6 +518,31 @@ def maybe_dispatch_alert(
         "fingerprint": fingerprint,
         "sent_at":     time.time(),
     }
+    # ── P135: measurement-protocol hook ─────────────────────────────────
+    # Every VP Trap live-alert becomes a row in vp_trap_measurement_events.
+    # Idempotent by zone_id + 6h fired-at bucket.
+    try:
+        from services.vp_trap_measurement import record_signal
+        record_signal(
+            db,
+            zone_id=zone_id,
+            direction=direction,
+            score=int(breakdown.get("total", 0) or 0),
+            session=(zone.get("session") or plan.get("session") or "unknown"),
+            entry_price=float(plan.get("entry") or 0.0),
+            stop_loss=float(plan.get("stop_loss") or 0.0),
+            tp1_price=(float(plan["tp1"]) if plan.get("tp1") is not None else None),
+            tp2_price=(float(plan["tp2"]) if plan.get("tp2") is not None else None),
+            invalidation_price=(float(plan["invalidation"])
+                                 if plan.get("invalidation") is not None else None),
+            trap_side=zone.get("trap_side") or level_type,
+            signal_id=(str(signal_id) if signal_id else None),
+            notes={"mode": mode, "level_type": level_type,
+                   "breakdown_total": breakdown.get("total")},
+        )
+    except Exception as _m_exc:
+        log.debug("[vp_trap_alerts] measurement record skipped: %s", _m_exc)
+
     log.info("[vp_trap_alerts] fired %s %s score=%d id=%s mode=%s",
              direction, level_type, breakdown.get("total", 0), signal_id, mode)
     return signal_id

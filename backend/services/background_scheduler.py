@@ -514,6 +514,45 @@ def _run_freshness_check():
                                        if k in r["stale"]})
 
 
+# ── P135: VP Trap measurement outcome loop ───────────────────────────────────
+
+_VP_MEASUREMENT_INTERVAL_S = 60
+
+
+async def _vp_trap_measurement_loop():
+    """
+    Every 60s, walk PENDING+TRIGGERED VP Trap measurement rows and
+    advance them (TRIGGER, TP1_HIT, TP2_HIT, STOPPED, INVALIDATED, EXPIRED)
+    against the current XAU/USD price. This is the outcome tracker for
+    the 30-day protocol.
+    """
+    from config import settings
+    log.info("[scheduler] vp-trap measurement loop started (every %ds)",
+             _VP_MEASUREMENT_INTERVAL_S)
+    # Skip loop entirely if measurement is disabled
+    while True:
+        try:
+            if getattr(settings, "vp_trap_measurement_enabled", True):
+                await asyncio.to_thread(_run_vp_measurement)
+        except asyncio.CancelledError:
+            log.info("[scheduler] vp-trap measurement loop cancelled")
+            break
+        except Exception as exc:
+            log.warning("[scheduler] vp-trap measurement loop error: %s", exc)
+        await asyncio.sleep(_VP_MEASUREMENT_INTERVAL_S)
+
+
+def _run_vp_measurement():
+    from database import SessionLocal
+    from services.vp_trap_measurement import advance_outcomes
+    with SessionLocal() as db:
+        r = advance_outcomes(db) or {}
+        # Log only when something actually changed
+        interesting = {k: v for k, v in r.items() if isinstance(v, int) and v > 0}
+        if interesting:
+            log.info("[vp_measurement] outcomes advanced: %s", interesting)
+
+
 def _run_auto_executor_iteration():
     """Single auto-executor iteration (runs in thread)."""
     global _last_auto_attempt
@@ -679,6 +718,7 @@ async def start_background_loops():
         asyncio.create_task(_weekend_newsletter_loop(),    name="weekend_newsletter_loop"),
         asyncio.create_task(_candle_ingestion_loop(),      name="candle_ingestion_loop"),
         asyncio.create_task(_data_freshness_loop(),        name="data_freshness_loop"),
+        asyncio.create_task(_vp_trap_measurement_loop(),   name="vp_trap_measurement_loop"),
     ]
 
     # Pick exactly ONE execution authority — never both, or they'll fight.

@@ -237,6 +237,14 @@ class Settings(BaseSettings):
     execution_hard_spread_pts:      float = 5.0     # H4: above → hard block
     news_proximity_lookahead_min:   int   = 30      # H5: no exec within window
 
+    # ── 30-day VP Trap measurement protocol (P135) ────────────────────────────
+    # Records every VP Trap live alert as a measurement row + a background
+    # loop advances the outcome (TRIGGER / TP / SL / EXPIRED) against live
+    # price. Query stats via /api/v1/diagnostics/vp-trap-measurement?days=30.
+    # Verdict: ON TARGET only when signals/day 1-3, WR >= 40%, avg R >= +0.15R,
+    # over >= 20 closed trades. Below that we don't have a niche.
+    vp_trap_measurement_enabled: bool = True
+
     # ── External confluence layer (P134) ──────────────────────────────────────
     # Read-only confirmation layer: FastBull retail positioning + CME GC
     # futures context. Never generates trades on its own; only nudges the

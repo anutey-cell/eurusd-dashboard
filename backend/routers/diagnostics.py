@@ -651,3 +651,21 @@ def external_confluence(request: Request,
         ),
         source="diagnostics",
     )
+
+
+@router.get(
+    "/vp-trap-measurement",
+    response_model=APIResponse[dict],
+    summary="30-day VP Trap protocol stats — the 4 numbers that decide the niche (P135)",
+)
+@limiter.limit("30/minute")
+def vp_trap_measurement(request: Request,
+                          days: int = Query(default=30, ge=1, le=90),
+                          db: Session = Depends(get_db)) -> APIResponse[dict]:
+    """
+    Returns signals/day, win rate, avg R, drawdown + per-session breakdown +
+    verdict against the protocol targets (ON TARGET | BELOW TARGET |
+    INSUFFICIENT SAMPLE | NO DATA).
+    """
+    from services.vp_trap_measurement import compute_stats
+    return APIResponse(data=compute_stats(db, days=days), source="diagnostics")

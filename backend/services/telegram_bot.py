@@ -389,6 +389,21 @@ def cmd_mode(db: Session, client: TelegramClient, chat_id: str, args: str) -> di
 
 Handler = Callable[[Session, TelegramClient, str, str], dict]
 
+def cmd_protocol(db: Session, client: TelegramClient, chat_id: str, args: str) -> dict:
+    """P135 — VP Trap 30-day protocol progress + verdict."""
+    try:
+        days = int((args or "30").strip())
+    except ValueError:
+        days = 30
+    days = max(1, min(days, 90))
+    try:
+        from services.vp_trap_measurement import compute_stats, format_progress_digest
+        stats = compute_stats(db, days=days)
+        return _reply(client, chat_id, format_progress_digest(stats))
+    except Exception as exc:
+        return _reply(client, chat_id, f"⚠️ protocol query failed: {_esc(str(exc))}")
+
+
 COMMANDS: dict[str, Handler] = {
     "help":         cmd_help,
     "start":        cmd_help,     # Telegram's canonical bootstrap → same as help
@@ -399,6 +414,7 @@ COMMANDS: dict[str, Handler] = {
     "signal":       cmd_signal,
     "performance":  cmd_performance,
     "perf":         cmd_performance,
+    "protocol":     cmd_protocol,     # P135 — VP Trap 30-day progress
     "mute":         cmd_mute,
     "unmute":       cmd_unmute,
     "mode":         cmd_mode,
