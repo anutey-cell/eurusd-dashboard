@@ -61,6 +61,8 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
+from config import settings   # P133: hoisted from make_decision() — was scoped-only, broke briefing + P130 scanner-plan path
+
 log = logging.getLogger(__name__)
 
 
@@ -1618,6 +1620,22 @@ def make_decision(db: Session) -> dict:
     decision = "STAND ASIDE"
     if conditions_passed >= 3 and proposed_signal in ("BUY", "SELL"):
         decision = proposed_signal
+
+    # ── P133: no-plan-no-signal guard ────────────────────────────────────
+    # C1-C4 can pass while C5 (trade-plan validity) fails — e.g. when
+    # _generate_trade_plan rejects the setup via P130's SL cap, or the
+    # scanner's plan is incomplete. In that state conditions_passed is
+    # numerically ≥3 but there's no entry/SL to trade. Firing a
+    # "BUY 4/5" alert with entry=None is worse than no alert — it trains
+    # the operator to distrust the signal path. Downgrade to STAND ASIDE
+    # so no misleading Telegram fires.
+    if decision in ("BUY", "SELL") and (entry is None or stop_loss is None):
+        _plan_reason = (
+            "Trade plan unavailable — entry/SL couldn't be built "
+            f"(source={plan_source or 'none'})"
+        )
+        stand_aside_reasons.insert(0, _plan_reason)
+        decision = "STAND ASIDE"
 
     # Quality band derived from the legacy 0-100 score (kept for the dashboard
     # panel). The mandate's primary signal is conditions_passed.

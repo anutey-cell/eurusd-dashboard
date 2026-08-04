@@ -18,6 +18,7 @@ through to synthetic, and that response is explicitly tagged source="synthetic"
 so the frontend can refuse to display it.
 """
 import logging
+from config import settings   # P133: hoisted from get_candles() — was scoped-only, breaking briefing crash paths
 import random
 import time
 from datetime import datetime, timedelta, timezone

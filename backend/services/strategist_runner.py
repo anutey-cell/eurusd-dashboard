@@ -234,6 +234,16 @@ def _maybe_fire_alert(verdict: dict) -> None:
     es       = verdict.get("execution_status")
     cp       = verdict.get("conditions_passed", 0)
 
+    # ── P133 defensive gate: no plan = no alert ────────────────────────────
+    # Belt-and-suspenders on top of the strategist's decision-level guard.
+    # If a BUY/SELL slips through without entry/SL, drop the alert here
+    # rather than posting "SELL 4/5 · entry=None" to the user's phone.
+    tp = verdict.get("trade_plan") or {}
+    if decision in ("BUY", "SELL") and (tp.get("entry") is None or tp.get("stop_loss") is None):
+        log.warning("[strategist_runner] alert suppressed — %s cp=%s but no trade plan "
+                     "(entry=%s SL=%s)", decision, cp, tp.get("entry"), tp.get("stop_loss"))
+        return
+
     # Weekend gate — markets are flat from Fri 21:00 UTC to Sun 22:00 UTC.
     # No signals, no briefings, no invalidations during this window. The
     # Saturday recap + Sunday forecast newsletters handle weekend comms.
