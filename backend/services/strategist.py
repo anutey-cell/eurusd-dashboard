@@ -1517,6 +1517,43 @@ def make_decision(db: Session) -> dict:
     except Exception as _fx_exc:
         log.debug("[strategist] volume_pivot_flux skipped: %s", _fx_exc)
 
+    # ── P134: External confluence layer (FastBull + CME) ────────────────
+    # Read-only confirmation. Adds/subtracts up to ±15 setup_score, may
+    # set execution_status to EXTERNAL_CONFLUENCE_CONFLICT when both
+    # sources oppose the engine and price is heading into unmitigated
+    # opposing liquidity. Never CREATES a trade; never bypasses news/RR.
+    external_confluence = None
+    ext_status_override = None
+    try:
+        from services.external_confluence import get_external_confluence, status_for
+        _engine_levels = [
+            v for v in (
+                today_high, today_low, prev_day_high, prev_day_low,
+                (getattr(liquidity_map_obj, "poc",  None) if liquidity_map_obj else None),
+                (getattr(liquidity_map_obj, "vah",  None) if liquidity_map_obj else None),
+                (getattr(liquidity_map_obj, "val",  None) if liquidity_map_obj else None),
+                (getattr(liquidity_map_obj, "vwap", None) if liquidity_map_obj else None),
+            ) if v is not None
+        ]
+        external_confluence = get_external_confluence(
+            db=db,
+            engine_direction=proposed_signal or "STAND_ASIDE",
+            spot_price=current_price,
+            engine_levels=_engine_levels,
+            settings=settings,
+        )
+        conf = external_confluence.get("confluence", {})
+        adj  = int(conf.get("score_adjustment", 0) or 0)
+        if adj:
+            total_setup_score = max(0, min(100, total_setup_score + adj))
+            log.info("[strategist] external confluence score adj %+d · %s",
+                      adj, conf.get("reason", ""))
+        # Compute the specific status this tick maps to
+        ext_status_override = status_for(external_confluence,
+                                          proposed_signal or "STAND_ASIDE")
+    except Exception as _ex_exc:
+        log.debug("[strategist] external_confluence skipped: %s", _ex_exc)
+
     # ── Diagnostic reasons (for reporting, NOT decision gating) ─────────
     # These were used to force STAND ASIDE in the legacy 80/100 model. The
     # 5-condition mandate model now governs the decision; these reasons are
@@ -1735,6 +1772,22 @@ def make_decision(db: Session) -> dict:
         db=db,
     )
 
+    # ── P134: external-confluence execution downgrade ────────────────────
+    # Only tightens; never loosens. If confluence says "block trade" and
+    # we were about to place a demo trade, downgrade to CONFLICT status.
+    # If confluence merely conflicts (soft), leave SIGNAL_ONLY / cap it.
+    # Never re-enables execution that another gate had already blocked.
+    if external_confluence is not None:
+        _blocks = external_confluence.get("confluence", {}).get("blocks_trade")
+        if execution_status == _EXEC_DEMO_PLACED and _blocks:
+            _conf_reason = external_confluence["confluence"].get("reason", "")
+            execution_status = "EXTERNAL_CONFLUENCE_CONFLICT"
+            exec_reason = f"Downgraded — {_conf_reason}"
+            log.info("[strategist] execution downgraded → EXTERNAL_CONFLUENCE_CONFLICT")
+        elif execution_status == _EXEC_DEMO_PLACED and ext_status_override == "EXTERNAL_CONFLUENCE_CONFIRMED":
+            # Optional annotation — keep DEMO_PLACED but tag exec_reason
+            exec_reason = f"{exec_reason} · external CONFIRMED"
+
     entry_tolerance = _compute_entry_tolerance(atr_h1)
 
     mt5_execution_object = None
@@ -1871,6 +1924,7 @@ def make_decision(db: Session) -> dict:
             ),
             "flux": flux_verdict,   # P132: {bonus, bias, label} or None
         },
+        "external_confluence": external_confluence,   # P134 — full structured dict or None
         "trade_plan": {
             "entry_type": (
                 "Wait for confirmation" if decision == "STAND ASIDE"

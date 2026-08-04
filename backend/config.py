@@ -237,6 +237,19 @@ class Settings(BaseSettings):
     execution_hard_spread_pts:      float = 5.0     # H4: above → hard block
     news_proximity_lookahead_min:   int   = 30      # H5: no exec within window
 
+    # ── External confluence layer (P134) ──────────────────────────────────────
+    # Read-only confirmation layer: FastBull retail positioning + CME GC
+    # futures context. Never generates trades on its own; only nudges the
+    # setup_score (+5/+10 confirm, -5/-15 conflict) or downgrades execution
+    # to EXTERNAL_CONFLUENCE_CONFLICT. Fails open as unavailable/neutral.
+    external_confluence_enabled:    bool  = True
+    fastbull_confluence_enabled:    bool  = True
+    cme_confluence_enabled:         bool  = True
+    external_confluence_cache_seconds: int = 600   # 10 min
+    external_confluence_http_timeout_s: int = 3    # never delay the scanner
+    external_confluence_max_downgrade: int = 15    # cap on negative score adj
+    external_confluence_max_upgrade:  int  = 10    # cap on positive score adj
+
     # ── Telegram bot (command-handler poller) ─────────────────────────────────
     # When True AND telegram_bot_token is set, a background thread long-polls
     # getUpdates and dispatches slash-commands (/status, /signals, /mute, ...).

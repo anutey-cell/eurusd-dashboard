@@ -622,3 +622,32 @@ def skip_stats(request: Request,
 def freshness(request: Request, db: Session = Depends(get_db)) -> APIResponse[dict]:
     from services.data_freshness import check_freshness
     return APIResponse(data=check_freshness(db), source="diagnostics")
+
+
+@router.get(
+    "/external-confluence",
+    response_model=APIResponse[dict],
+    summary="FastBull + CME confluence snapshot (P134)",
+)
+@limiter.limit("30/minute")
+def external_confluence(request: Request,
+                          engine_direction: str = Query(default="STAND_ASIDE"),
+                          spot_price: float = Query(default=None),
+                          force: bool = Query(default=False),
+                          db: Session = Depends(get_db)) -> APIResponse[dict]:
+    """
+    Returns the current external-confluence verdict.
+    Pass ?engine_direction=BUY|SELL to see how the confluence
+    would score for that direction. ?force=true bypasses the cache.
+    """
+    from services.external_confluence import get_external_confluence
+    return APIResponse(
+        data=get_external_confluence(
+            db=db,
+            engine_direction=engine_direction,
+            spot_price=spot_price,
+            engine_levels=[],
+            force_refresh=force,
+        ),
+        source="diagnostics",
+    )
