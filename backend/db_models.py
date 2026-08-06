@@ -807,6 +807,100 @@ class VpTrapMeasurementEvent(Base):
     notes_json     = Column(Text, nullable=True)
 
 
+class QualifyingExpansion(Base):
+    """
+    Phase 13 — one row per detected significant directional move. The
+    "ground truth" against which alerts are scored for coverage.
+    """
+    __tablename__ = "qualifying_expansions"
+
+    id                      = Column(Integer, primary_key=True, autoincrement=True)
+    instrument              = Column(String(16), default="XAU/USD", nullable=False, index=True)
+    direction               = Column(String(4),  nullable=False)   # BULL | BEAR
+    started_at              = Column(DateTime(timezone=True), nullable=False, index=True)
+    ended_at                = Column(DateTime(timezone=True), nullable=False)
+    trigger_level           = Column(Float, nullable=True)
+    confirmation_at         = Column(DateTime(timezone=True), nullable=True)
+    total_distance          = Column(Float, nullable=False)
+    atr_multiple            = Column(Float, nullable=False)
+    max_retracement         = Column(Float, nullable=True)
+    detected                = Column(Boolean, nullable=False, default=False, index=True)
+    first_intel_alert_at    = Column(DateTime(timezone=True), nullable=True)
+    first_entry_alert_at    = Column(DateTime(timezone=True), nullable=True)
+    detection_delay_min     = Column(Float, nullable=True)
+    pct_of_move_captured    = Column(Float, nullable=True)
+    blocking_filter         = Column(String(64), nullable=True)
+    was_extended_at_detect  = Column(Boolean, nullable=False, default=False)
+    fingerprint             = Column(String(48), nullable=False, index=True, unique=True)
+    created_at              = Column(DateTime(timezone=True), default=_now, nullable=False)
+
+
+class ExpansionAlertMatch(Base):
+    """Links a QualifyingExpansion to a specific alert row for audit."""
+    __tablename__ = "expansion_alert_matches"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    expansion_id   = Column(Integer, nullable=False, index=True)
+    alert_source   = Column(String(32), nullable=False)     # intel | strategist
+    alert_type     = Column(String(64), nullable=True)
+    alert_sent_at  = Column(DateTime(timezone=True), nullable=False)
+    delay_seconds  = Column(Integer, nullable=False)
+    created_at     = Column(DateTime(timezone=True), default=_now, nullable=False)
+
+
+class MarketIntelligenceAlert(Base):
+    """
+    Phase 11 — audit trail for every market-intelligence alert the engine
+    considered firing. `delivery_result` distinguishes sent / shadow /
+    suppressed / failed so we can reconcile behavior in shadow mode.
+    """
+    __tablename__ = "market_intelligence_alerts"
+
+    id                      = Column(Integer, primary_key=True, autoincrement=True)
+    ts                      = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    instrument              = Column(String(16), default="XAU/USD", nullable=False, index=True)
+    alert_type              = Column(String(64), nullable=False, index=True)
+    trigger_price           = Column(Float, nullable=True)
+    directional_assessment  = Column(String(32), nullable=True)
+    opportunity_status      = Column(String(48), nullable=True)
+    entry_status            = Column(String(32), nullable=True)
+    directional_confidence  = Column(Float, nullable=True)
+    entry_confidence        = Column(Float, nullable=True)
+    body_text               = Column(Text, nullable=True)
+    delivery_result         = Column(String(16), nullable=False, default="pending", index=True)
+    delivery_reason         = Column(String(255), nullable=True)
+    fingerprint             = Column(String(48), nullable=False, index=True)
+
+
+class OpportunityStateTransition(Base):
+    """
+    Phase 7 — persisted history of the opportunity state machine.
+
+    Every state change appends one row. Restart-safe: on process boot the
+    engine reads the most recent row to hydrate `current_state`. Append-only —
+    never mutated. Query by `ts` for a full timeline.
+    """
+    __tablename__ = "opportunity_state_transitions"
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True)
+    ts                  = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    instrument          = Column(String(16), default="XAU/USD", nullable=False, index=True)
+
+    prev_state          = Column(String(32), nullable=True)
+    new_state           = Column(String(32), nullable=False, index=True)
+    price               = Column(Float,      nullable=True)
+
+    # Full context captured at the moment of transition
+    evidence_json       = Column(Text, nullable=True)
+    contradictions_json = Column(Text, nullable=True)
+    key_levels_json     = Column(Text, nullable=True)
+    invalidation_price  = Column(Float, nullable=True)
+    confidence          = Column(Float, nullable=True)   # 0-100
+    trigger_condition   = Column(String(96), nullable=True)
+
+    created_at          = Column(DateTime(timezone=True), default=_now, nullable=False)
+
+
 class TelegramCommandLog(Base):
     """Append-only log of received bot commands — for audit + debug."""
     __tablename__ = "telegram_command_log"

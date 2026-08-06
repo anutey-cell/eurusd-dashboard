@@ -25,8 +25,52 @@ from sqlalchemy import text
 log = logging.getLogger(__name__)
 
 
-DEFAULT_STALE_H = 6              # H1 candle > 6h old = stale
+DEFAULT_STALE_H = 6              # legacy — kept for back-compat callers
+
+# Per-timeframe staleness thresholds in minutes (per the directional
+# intelligence brief). Beyond these, the timeframe is degraded from the
+# data_quality_score AND excluded from any strategy that reads it.
+STALENESS_MIN_BY_TF: dict[str, int] = {
+    "M1":  3,
+    "M5":  10,
+    "M15": 20,
+    "H1":  70,
+    "H4":  300,       # 5 hours
+    "D1":  1560,      # 26 hours
+}
 _ALERT_STATE = {"date": None, "fired_for_tf": set()}
+
+
+def data_quality_score(details_by_tf: dict) -> int:
+    """
+    Compute a 0-100 data-quality score from a freshness-check result.
+
+    Fresh (age within threshold)                 → contributes full weight
+    Degraded (age up to 3× threshold)            → contributes half weight
+    Stale beyond 3× threshold, or missing entirely → contributes 0
+
+    Weights by tier (sum=100): M15 30, H1 30, H4 20, M5 10, D1 10.
+    Timeframes not scored just don't count.
+    """
+    weights = {"M15": 30, "H1": 30, "H4": 20, "M5": 10, "D1": 10}
+    total_weight = 0
+    score = 0
+    for tf, w in weights.items():
+        info = (details_by_tf or {}).get(tf)
+        if not info:
+            continue
+        total_weight += w
+        age_min = info.get("age_min") if isinstance(info, dict) else None
+        threshold = STALENESS_MIN_BY_TF.get(tf, 999999)
+        if age_min is None:
+            continue  # missing entirely → 0 contribution
+        if age_min <= threshold:
+            score += w
+        elif age_min <= 3 * threshold:
+            score += w // 2
+    if total_weight == 0:
+        return 0
+    return int(round(score * 100 / total_weight))
 
 
 def _last_candle_at(db, instrument: str, tf: str) -> Optional[datetime]:
@@ -62,29 +106,43 @@ def _is_weekend_closed(now: datetime) -> bool:
 
 
 def check_freshness(db, *, instrument: str = "XAU/USD",
-                     timeframes: tuple = ("M15", "H1", "H4"),
-                     staleness_h: int = DEFAULT_STALE_H,
+                     timeframes: tuple = ("M5", "M15", "H1", "H4", "D1"),
+                     staleness_h: Optional[int] = None,
                      now: Optional[datetime] = None) -> dict:
     """
-    Returns {"stale": [tf, ...], "fresh": [tf, ...], "details": {...}}.
-    No side effects — caller decides whether to alert.
+    Returns {"stale": [...], "fresh": [...], "details": {tf: {age_min,threshold_min,latest,status}},
+             "data_quality_score": int, "weekend": bool}.
+
+    Per-TF thresholds from STALENESS_MIN_BY_TF (M15=20 min, H1=70, H4=300 …).
+    Passing `staleness_h` overrides the per-TF thresholds (legacy back-compat).
     """
     now = now or datetime.now(timezone.utc)
     if _is_weekend_closed(now):
+        details = {tf: {"status": "weekend-closed"} for tf in timeframes}
         return {"stale": [], "fresh": list(timeframes), "weekend": True,
-                "details": {tf: "weekend-closed" for tf in timeframes}}
+                "details": details, "data_quality_score": 100}
 
     stale, fresh, details = [], [], {}
     for tf in timeframes:
+        threshold_min = (staleness_h * 60) if staleness_h else STALENESS_MIN_BY_TF.get(tf, 60)
         latest = _last_candle_at(db, instrument, tf)
         if latest is None:
             stale.append(tf)
-            details[tf] = "no candles at all"
+            details[tf] = {"status": "missing", "threshold_min": threshold_min}
             continue
-        age_h = (now - latest).total_seconds() / 3600
-        details[tf] = f"latest {latest.isoformat()} · age {age_h:.1f}h"
-        (stale if age_h > staleness_h else fresh).append(tf)
-    return {"stale": stale, "fresh": fresh, "weekend": False, "details": details}
+        age_min = (now - latest).total_seconds() / 60
+        info = {
+            "latest": latest.isoformat(),
+            "age_min": round(age_min, 1),
+            "threshold_min": threshold_min,
+            "status": "fresh" if age_min <= threshold_min else "stale",
+        }
+        details[tf] = info
+        (stale if age_min > threshold_min else fresh).append(tf)
+
+    return {"stale": stale, "fresh": fresh, "weekend": False,
+            "details": details,
+            "data_quality_score": data_quality_score(details)}
 
 
 def maybe_alert(db, client=None) -> Optional[dict]:
@@ -112,10 +170,19 @@ def maybe_alert(db, client=None) -> Optional[dict]:
     # Send Telegram alert
     try:
         from services.telegram_templates import _esc
-        text = ("*[ALERT] DATA-FEED STALE*\n"
+        def _fmt_detail(tf):
+            info = result["details"].get(tf, {})
+            if isinstance(info, str):
+                return _esc(info)
+            latest = info.get("latest", "—")
+            age_m = info.get("age_min")
+            thr = info.get("threshold_min")
+            return _esc(f"latest {latest} · age {age_m}min · threshold {thr}min")
+        text = ("*[ALERT] DATA\\-FEED STALE*\n"
                 f"Instrument: {_esc('XAU/USD')}\n"
-                f"Stale timeframes: {', '.join(_esc(t) for t in to_alert)}\n\n"
-                + "\n".join(f"  • {_esc(tf)}: {_esc(result['details'].get(tf, ''))}"
+                f"Stale timeframes: {', '.join(_esc(t) for t in to_alert)}\n"
+                f"Data\\-quality score: {result.get('data_quality_score', 0)}/100\n\n"
+                + "\n".join(f"  • {_esc(tf)}: {_fmt_detail(tf)}"
                               for tf in to_alert)
                 + "\n\nEngine will keep running on live ticks but any "
                   "lookback feature is on stale data\\.")

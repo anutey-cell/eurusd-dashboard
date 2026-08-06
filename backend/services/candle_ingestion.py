@@ -35,8 +35,11 @@ from sqlalchemy.orm import Session
 log = logging.getLogger(__name__)
 
 
-# Timeframes to keep topped up + max fetch per pull
+# Timeframes to keep topped up + max fetch per pull.
+# M5 added post-Pre-Phase-0 so directional intelligence has fresh execution
+# refinement data. TwelveData free tier: 8 req/min → 5 TFs/cycle fits easily.
 _TF_PLAN = [
+    ("M5",  200),
     ("M15", 200),
     ("H1",  200),
     ("H4",  100),
@@ -64,17 +67,37 @@ def _fetch_twelvedata(pair: str, interval: str, lookback: int) -> list:
                                     symbol=sym).candles
 
 
+def _field(c, name, default=None):
+    """
+    Read a candle field safely across Pydantic models AND plain dicts.
+
+    Historical bug: the old form `getattr(c, name, c.get(name))` evaluated
+    the DEFAULT arg first, which raises AttributeError on Pydantic v2 models
+    (they have no `.get()` method) — so every candle was silently dropped
+    at the bare `except Exception` in `_persist`. This helper avoids that.
+    """
+    if isinstance(c, dict):
+        v = c.get(name)
+        return default if v is None else v
+    v = getattr(c, name, None)
+    return default if v is None else v
+
+
 def _persist(db: Session, pair: str, tf: str, candles: list) -> dict:
-    """Insert candles idempotently. Returns per-timeframe counts."""
+    """Insert candles idempotently. Returns per-timeframe counts (with errors!)."""
     from db_models import HistoricalCandle
-    inserted, skipped = 0, 0
+    inserted, skipped, errors = 0, 0, 0
     instrument = _stored_instrument(pair)
     for c in candles:
         try:
-            ts = c.time if hasattr(c, "time") else c.get("time")
+            ts = _field(c, "time")
             if isinstance(ts, str):
                 ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             if ts is None:
+                errors += 1
+                if errors <= 3:
+                    log.warning("[candle_ingestion] %s %s: candle has no time field: %r",
+                                pair, tf, c)
                 continue
             if not getattr(ts, "tzinfo", None):
                 ts = ts.replace(tzinfo=timezone.utc)
@@ -82,11 +105,11 @@ def _persist(db: Session, pair: str, tf: str, candles: list) -> dict:
                 instrument=instrument,
                 timeframe=tf,
                 candle_time=ts,
-                open=float(getattr(c, "open", c.get("open"))),
-                high=float(getattr(c, "high", c.get("high"))),
-                low=float(getattr(c, "low",  c.get("low"))),
-                close=float(getattr(c, "close", c.get("close"))),
-                volume=int(float(getattr(c, "volume", c.get("volume") or 0)) or 0),
+                open=float(_field(c, "open", 0.0)),
+                high=float(_field(c, "high", 0.0)),
+                low=float(_field(c, "low",  0.0)),
+                close=float(_field(c, "close", 0.0)),
+                volume=int(float(_field(c, "volume", 0)) or 0),
                 source="twelvedata",
             )
             db.add(row)
@@ -97,20 +120,33 @@ def _persist(db: Session, pair: str, tf: str, candles: list) -> dict:
             skipped += 1
         except Exception as exc:
             db.rollback()
-            log.debug("[candle_ingestion] row insert skipped: %s", exc)
-    return {"inserted": inserted, "skipped_duplicate": skipped}
+            errors += 1
+            if errors <= 3:
+                log.warning("[candle_ingestion] %s %s: insert failed: %s: %s",
+                            pair, tf, type(exc).__name__, exc)
+    return {"inserted": inserted, "skipped_duplicate": skipped, "errors": errors}
 
 
 def top_up_recent(db: Session, pair: str = "xauusd",
-                    lookback_override: Optional[int] = None) -> dict:
-    """Public entry point. Loops every TF, top-ups, returns report."""
+                    lookback_override: Optional[int] = None,
+                    only_timeframes: Optional[tuple] = None) -> dict:
+    """
+    Public entry point. Loops every TF (or only `only_timeframes` if given),
+    top-ups, returns report.
+
+    `only_timeframes` lets the scheduler run a fast loop for M5/M15 and a
+    separate slow loop for HTFs so we stay within the TwelveData budget.
+    """
     report = {
         "pair":      pair,
         "started":   datetime.now(timezone.utc).isoformat(),
         "totals":    {"inserted": 0, "skipped": 0, "errors": 0},
         "timeframes": {},
     }
-    for tf, n_default in _TF_PLAN:
+    plan = _TF_PLAN if not only_timeframes else [
+        (tf, n) for tf, n in _TF_PLAN if tf in only_timeframes
+    ]
+    for tf, n_default in plan:
         n = lookback_override or n_default
         t0 = time.time()
         try:
@@ -125,11 +161,11 @@ def top_up_recent(db: Session, pair: str = "xauusd",
             report["timeframes"][tf] = r
             report["totals"]["inserted"] += r["inserted"]
             report["totals"]["skipped"]  += r["skipped_duplicate"]
-            if r["inserted"]:
-                log.info("[candle_ingestion] %s %s: fetched=%d inserted=%d "
-                          "dup=%d (%.2fs)",
+            report["totals"]["errors"]   += r.get("errors", 0)
+            if r["inserted"] or r.get("errors", 0):
+                log.info("[candle_ingestion] %s %s: fetched=%d inserted=%d dup=%d errors=%d (%.2fs)",
                           pair, tf, r["fetched"], r["inserted"],
-                          r["skipped_duplicate"], r["elapsed_s"])
+                          r["skipped_duplicate"], r.get("errors", 0), r["elapsed_s"])
         except Exception as exc:
             log.warning("[candle_ingestion] %s %s failed: %s", pair, tf, exc)
             report["timeframes"][tf] = {"error": str(exc)}

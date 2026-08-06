@@ -441,41 +441,62 @@ def _run_newsletter_iteration():
                 log.warning("[newsletter] Sunday forecast send failed: %s", exc)
 
 
-# ── P131: candle top-up loop ─────────────────────────────────────────────────
+# ── Pre-Phase-0: split candle top-up loops (fast M5/M15, slow HTF) ──────────
+#
+# TwelveData free tier: 8 req/min, 800/day. Budget:
+#   fast : M5+M15 every 5 min  = 2 × 288 = 576/day
+#   slow : H1+H4+D1 every 15 min = 3 × 96 = 288/day
+#   total ≈ 864/day (paid tier if budget tightens; still ~1.2s peak p95)
+#
+# Rationale: M5 has a 10-min staleness threshold in the brief. A 15-min
+# ingestion cadence guarantees M5 spends ~1/3 of every cycle "stale" —
+# which drops data_quality_score and (post-Phase-2) forces the strategist
+# to exclude M5. Fixing that requires the split cadence.
 
-_CANDLE_INGESTION_INTERVAL_S = 900   # 15 min
+_CANDLE_INGESTION_FAST_S = 300    # 5 min — M5 + M15
+_CANDLE_INGESTION_SLOW_S = 900    # 15 min — H1 + H4 + D1
 
 
-async def _candle_ingestion_loop():
-    """
-    Keep historical_candles fresh via TwelveData top-up every 15 min.
-    Prior TradingView-only path went silent when tvDatafeed sign-in broke;
-    this uses the same TwelveData provider the live scanner already uses.
-    """
-    from database import SessionLocal
-    from services.candle_ingestion import top_up_recent
-
-    log.info("[scheduler] candle ingestion loop started (every %ds)",
-             _CANDLE_INGESTION_INTERVAL_S)
+async def _candle_ingestion_fast_loop():
+    """Top-up M5 + M15 every 5 min to stay inside their freshness thresholds."""
+    log.info("[scheduler] candle ingestion FAST loop (M5+M15) started (every %ds)",
+             _CANDLE_INGESTION_FAST_S)
     while True:
         try:
-            await asyncio.to_thread(_run_candle_ingestion)
+            await asyncio.to_thread(_run_candle_ingestion, ("M5", "M15"))
         except asyncio.CancelledError:
-            log.info("[scheduler] candle ingestion loop cancelled")
+            log.info("[scheduler] candle ingestion FAST loop cancelled")
             break
         except Exception as exc:
-            log.warning("[scheduler] candle ingestion loop error: %s", exc)
-        await asyncio.sleep(_CANDLE_INGESTION_INTERVAL_S)
+            log.warning("[scheduler] candle ingestion FAST loop error: %s", exc)
+        await asyncio.sleep(_CANDLE_INGESTION_FAST_S)
 
 
-def _run_candle_ingestion():
+async def _candle_ingestion_slow_loop():
+    """Top-up H1 + H4 + D1 every 15 min (thresholds allow this cadence)."""
+    log.info("[scheduler] candle ingestion SLOW loop (H1+H4+D1) started (every %ds)",
+             _CANDLE_INGESTION_SLOW_S)
+    while True:
+        try:
+            await asyncio.to_thread(_run_candle_ingestion, ("H1", "H4", "D1"))
+        except asyncio.CancelledError:
+            log.info("[scheduler] candle ingestion SLOW loop cancelled")
+            break
+        except Exception as exc:
+            log.warning("[scheduler] candle ingestion SLOW loop error: %s", exc)
+        await asyncio.sleep(_CANDLE_INGESTION_SLOW_S)
+
+
+def _run_candle_ingestion(only_tf: Optional[tuple] = None):
     from database import SessionLocal
     from services.candle_ingestion import top_up_recent
     with SessionLocal() as db:
-        r = top_up_recent(db, pair="xauusd")
-        if r["totals"]["inserted"]:
-            log.info("[candle_ingestion] top-up inserted %d rows across %d TFs",
-                     r["totals"]["inserted"], len(r["timeframes"]))
+        r = top_up_recent(db, pair="xauusd", only_timeframes=only_tf)
+        if r["totals"]["inserted"] or r["totals"]["errors"]:
+            log.info("[candle_ingestion] top-up %s: inserted=%d skipped=%d errors=%d",
+                     only_tf or "ALL",
+                     r["totals"]["inserted"], r["totals"]["skipped"],
+                     r["totals"]["errors"])
 
 
 # ── P131: data-freshness sentinel loop ──────────────────────────────────────
@@ -551,6 +572,119 @@ def _run_vp_measurement():
         interesting = {k: v for k, v in r.items() if isinstance(v, int) and v > 0}
         if interesting:
             log.info("[vp_measurement] outcomes advanced: %s", interesting)
+
+
+# ── Phase 11: market-intelligence alert loop ──────────────────────────────
+#
+# Every 60s, run the full Phase 2-10 pipeline and let the intel engine
+# decide whether any new alert candidates fire. Governed by two flags:
+#   xauusd_market_intelligence_telegram_enabled — master switch
+#   xauusd_market_intel_shadow_mode              — persist-only (no send)
+# When flag is False, this loop still runs but all candidates are
+# suppressed with reason "flag off" — so nothing sends, nothing is stored.
+
+_MARKET_INTEL_INTERVAL_S = 60
+
+
+async def _market_intel_loop():
+    """Phase 11 detection + delivery loop. Fires every 60s."""
+    from config import settings
+    log.info("[scheduler] market-intel loop started (every %ds)",
+             _MARKET_INTEL_INTERVAL_S)
+    # Initial delay so freshness + candle ingestion have a chance to boot
+    await asyncio.sleep(30)
+    while True:
+        try:
+            # Only run pipeline if flag is on — else save the compute
+            if getattr(settings, "xauusd_market_intelligence_telegram_enabled", False):
+                await asyncio.to_thread(_run_market_intel_iteration)
+        except asyncio.CancelledError:
+            log.info("[scheduler] market-intel loop cancelled")
+            break
+        except Exception as exc:
+            log.warning("[scheduler] market-intel loop error: %s", exc)
+        await asyncio.sleep(_MARKET_INTEL_INTERVAL_S)
+
+
+def _run_market_intel_iteration():
+    """Full Phase 2-10 pipeline → Phase 11 detect/dedupe/persist."""
+    from database import SessionLocal
+    from services.canonical_market_data import get_canonical
+    from services.htf_weighted_alignment import compute_htf_alignment
+    from services.market_regime import classify_regime
+    from services.directional_evidence import compute_directional_evidence
+    from services.breakout_acceptance import scan_key_levels
+    from services.opportunity_state import evaluate_and_transition
+    from services.separated_verdicts import compute_separated_verdict
+    from services.key_level_ranking import rank_key_levels
+    from services.macro_interpretation import compute_macro_context
+    from services.market_intelligence_alerts import fire_intel_alerts
+    from config import settings
+
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    with SessionLocal() as db:
+        snap = cmd.snapshot(db)
+        try:
+            from services.calendar_provider import get_upcoming_events
+            events = get_upcoming_events(hours=2) or []
+        except Exception:
+            events = []
+
+        htf = compute_htf_alignment(snap)
+        regime = classify_regime(snap, upcoming_events=events)
+        evidence = compute_directional_evidence(
+            snap, htf_alignment=htf, regime=regime, upcoming_events=events,
+        )
+        breakouts = scan_key_levels(snap, htf_alignment=htf)
+        # PERSIST state transitions here so we accumulate history
+        state_tr = evaluate_and_transition(
+            db, snapshot=snap, regime=regime, htf_alignment=htf,
+            evidence=evidence, breakouts=breakouts, persist=True,
+        )
+        verdict = compute_separated_verdict(
+            snapshot=snap, htf_alignment=htf, regime=regime, evidence=evidence,
+            breakouts=breakouts, state_transition=state_tr,
+        )
+        ranking = rank_key_levels(snap, breakouts=breakouts)
+
+        # Macro — best-effort
+        macro = None
+        try:
+            correlation_snapshot = yields_context = dxy_bars = None
+            try:
+                from services.correlation_engine import compute_intermarket_correlations
+                correlation_snapshot = compute_intermarket_correlations(
+                    timeframe="H1", n_bars=100)
+            except Exception: pass
+            try:
+                from services.fred_provider import get_yields_context
+                yields_context = get_yields_context()
+            except Exception: pass
+            try:
+                from services.tradingview_provider import get_tv_candles
+                dxy_bars = get_tv_candles("dxy", timeframe="H1", limit=40)
+            except Exception: pass
+            macro = compute_macro_context(
+                snapshot=snap, tech_direction=htf.direction,
+                upcoming_events=events, dxy_bars=dxy_bars,
+                correlation_snapshot=correlation_snapshot,
+                yields_context=yields_context,
+            )
+        except Exception as exc:
+            log.debug("[market-intel] macro assembly skipped: %s", exc)
+
+        outcomes = fire_intel_alerts(
+            db, prev_state=state_tr.prev_state, new_state=state_tr.new_state,
+            trigger_condition=state_tr.trigger_condition,
+            trigger_price=state_tr.price,
+            snapshot=snap, verdict=verdict, evidence=evidence, ranking=ranking,
+            macro=macro, state_transition=state_tr, breakouts=breakouts,
+        )
+        # Log only if something happened
+        interesting = [o for o in outcomes if o.result in ("sent", "shadow")]
+        if interesting:
+            log.info("[market-intel] fired: %s",
+                      [(o.alert_type, o.result) for o in interesting])
 
 
 def _run_auto_executor_iteration():
@@ -716,9 +850,11 @@ async def start_background_loops():
         asyncio.create_task(_daily_briefing_loop(),        name="daily_briefing_loop"),
         asyncio.create_task(_weekly_digest_loop(),         name="weekly_digest_loop"),
         asyncio.create_task(_weekend_newsletter_loop(),    name="weekend_newsletter_loop"),
-        asyncio.create_task(_candle_ingestion_loop(),      name="candle_ingestion_loop"),
+        asyncio.create_task(_candle_ingestion_fast_loop(), name="candle_ingestion_fast_loop"),
+        asyncio.create_task(_candle_ingestion_slow_loop(), name="candle_ingestion_slow_loop"),
         asyncio.create_task(_data_freshness_loop(),        name="data_freshness_loop"),
         asyncio.create_task(_vp_trap_measurement_loop(),   name="vp_trap_measurement_loop"),
+        asyncio.create_task(_market_intel_loop(),          name="market_intel_loop"),
     ]
 
     # Pick exactly ONE execution authority — never both, or they'll fight.

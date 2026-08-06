@@ -625,6 +625,686 @@ def freshness(request: Request, db: Session = Depends(get_db)) -> APIResponse[di
 
 
 @router.get(
+    "/rollout-status",
+    response_model=APIResponse[dict],
+    summary="Rollout gates (Phase 15) — per-flag readiness + kill-switch hint",
+)
+@limiter.limit("20/minute")
+def rollout_status(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    For every Phase 2-14 feature flag, report:
+      currently_enabled, gate_flag, gate_currently,
+      requires (promotion criteria), risk, ready (True/False/None),
+      ready_reason.
+
+    None = cannot judge (missing signal). Never writes config; only
+    recommends. Includes emergency-disable instructions.
+    """
+    from services.rollout_gates import evaluate_rollout
+    report = evaluate_rollout(db)
+    return APIResponse(data=report.to_dict(), source="diagnostics")
+
+
+@router.get(
+    "/replay-validation",
+    response_model=APIResponse[dict],
+    summary="Replay validation (Phase 14) — old engine vs new engine over N days",
+)
+@limiter.limit("10/minute")
+def replay_validation(
+    request: Request,
+    days: int = Query(default=30, ge=7, le=60),
+    scan_first: bool = Query(default=True,
+                                description="Populate qualifying_expansions first"),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Compare old engine (strategist_verdicts cp>=3 BUY/SELL) against new engine
+    (market_intelligence_alerts) over the last N days. Uses
+    qualifying_expansions as ground truth.
+
+    Returns per-engine metrics + delta + verdict (BETTER / MIXED / WORSE /
+    NEUTRAL / INSUFFICIENT_SAMPLE), plus per-day scenario tagging.
+    """
+    from services.replay_engine import run_replay
+    from services.opportunity_coverage import detect_and_score
+    if scan_first:
+        detect_and_score(db, lookback_hours=days * 24)
+    report = run_replay(db, days=days)
+    return APIResponse(data=report.to_dict(), source="diagnostics")
+
+
+@router.get(
+    "/opportunity-coverage",
+    response_model=APIResponse[dict],
+    summary="Opportunity coverage report (Phase 13) — how many qualifying moves did we catch?",
+)
+@limiter.limit("20/minute")
+def opportunity_coverage(
+    request: Request,
+    days: int = Query(default=30, ge=1, le=90),
+    scan_hours: int = Query(default=168, description="Hours to scan for new expansions (0=skip)"),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Returns the coverage report: bull/bear/overall coverage %, median
+    detection delay, missed count, late detections, false directional alerts,
+    plus a verdict (ON TARGET / BELOW TARGET / UNDER-DETECTING / …).
+
+    Pass `scan_hours=0` to skip re-scanning and just return the report from
+    already-detected rows.
+    """
+    from services.opportunity_coverage import detect_and_score, compute_coverage_report
+    scan_result = None
+    if scan_hours > 0:
+        scan_result = detect_and_score(db, lookback_hours=scan_hours)
+    report = compute_coverage_report(db, days=days)
+    return APIResponse(
+        data={"report": report.to_dict(), "scan": scan_result},
+        source="diagnostics",
+    )
+
+
+@router.get(
+    "/missed-expansions",
+    response_model=APIResponse[dict],
+    summary="Missed expansions list (Phase 13) — the misses we need to close",
+)
+@limiter.limit("20/minute")
+def missed_expansions_endpoint(
+    request: Request,
+    days: int = Query(default=30, ge=1, le=90),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """Returns the list of qualifying expansions with no matched alert."""
+    from services.opportunity_coverage import missed_expansions
+    misses = missed_expansions(db, days=days)
+    return APIResponse(data={"count": len(misses), "misses": misses},
+                        source="diagnostics")
+
+
+@router.get(
+    "/market-intelligence-alerts",
+    response_model=APIResponse[dict],
+    summary="Market intelligence alert engine (Phase 11) — 18 alert types, shadow-first",
+)
+@limiter.limit("30/minute")
+def market_intelligence_alerts(
+    request: Request,
+    fire: bool = Query(default=False, description="Actually attempt to fire alerts (respects flags)"),
+    force_send: bool = Query(default=False, description="Bypass flags (dry-run only if fire=true)"),
+    history: int = Query(default=20, ge=0, le=100),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Runs the full Phase 2-10 pipeline, detects intel-worthy transitions,
+    and (if `fire=true`) processes each candidate through cooldown + daily
+    cap + delivery.
+
+    Delivery result values: sent | shadow | suppressed | failed.
+    Default endpoint call = detect-only (no persist, no send).
+    """
+    from services.canonical_market_data import get_canonical
+    from services.htf_weighted_alignment import compute_htf_alignment
+    from services.market_regime import classify_regime
+    from services.directional_evidence import compute_directional_evidence
+    from services.breakout_acceptance import scan_key_levels
+    from services.opportunity_state import evaluate_and_transition
+    from services.separated_verdicts import compute_separated_verdict
+    from services.key_level_ranking import rank_key_levels
+    from services.macro_interpretation import compute_macro_context
+    from services.market_intelligence_alerts import (
+        detect_alert_candidates, fire_intel_alerts, recent_intel_alerts,
+    )
+    from config import settings
+
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    snap = cmd.snapshot(db)
+
+    try:
+        from services.calendar_provider import get_upcoming_events
+        events = get_upcoming_events(hours=8) or []
+    except Exception:
+        events = []
+
+    htf = compute_htf_alignment(snap)
+    regime = classify_regime(snap, upcoming_events=events)
+    evidence = compute_directional_evidence(
+        snap, htf_alignment=htf, regime=regime, upcoming_events=events,
+    )
+    breakouts = scan_key_levels(snap, htf_alignment=htf)
+    state_tr = evaluate_and_transition(
+        db, snapshot=snap, regime=regime, htf_alignment=htf,
+        evidence=evidence, breakouts=breakouts, persist=False,
+    )
+    verdict = compute_separated_verdict(
+        snapshot=snap, htf_alignment=htf, regime=regime, evidence=evidence,
+        breakouts=breakouts, state_transition=state_tr,
+    )
+    ranking = rank_key_levels(snap, breakouts=breakouts)
+
+    # Macro (best-effort)
+    macro = None
+    try:
+        correlation_snapshot = None
+        yields_context = None
+        dxy_bars = None
+        try:
+            from services.correlation_engine import compute_intermarket_correlations
+            correlation_snapshot = compute_intermarket_correlations(timeframe="H1", n_bars=100)
+        except Exception: pass
+        try:
+            from services.fred_provider import get_yields_context
+            yields_context = get_yields_context()
+        except Exception: pass
+        try:
+            from services.tradingview_provider import get_tv_candles
+            dxy_bars = get_tv_candles("dxy", timeframe="H1", limit=40)
+        except Exception: pass
+        macro = compute_macro_context(
+            snapshot=snap, tech_direction=htf.direction,
+            upcoming_events=events, dxy_bars=dxy_bars,
+            correlation_snapshot=correlation_snapshot, yields_context=yields_context,
+        )
+    except Exception:
+        pass
+
+    # Detect (always)
+    cands = detect_alert_candidates(
+        prev_state=None,   # detection-only view uses "no prev" so all state hits register
+        new_state=state_tr.new_state,
+        trigger_condition=state_tr.trigger_condition,
+        trigger_price=state_tr.price,
+        breakouts=breakouts, macro=macro, snapshot=snap,
+    )
+
+    outcomes = []
+    if fire:
+        outcomes = fire_intel_alerts(
+            db, prev_state=state_tr.prev_state, new_state=state_tr.new_state,
+            trigger_condition=state_tr.trigger_condition,
+            trigger_price=state_tr.price,
+            snapshot=snap, verdict=verdict, evidence=evidence, ranking=ranking,
+            macro=macro, state_transition=state_tr, breakouts=breakouts,
+            force_send=force_send,
+        )
+
+    return APIResponse(
+        data={
+            "state": state_tr.new_state,
+            "candidates": [c.to_dict() for c in cands],
+            "outcomes": [o.to_dict() for o in outcomes],
+            "history": recent_intel_alerts(db, limit=history),
+            "flags": {
+                "market_intelligence_telegram_enabled": settings.xauusd_market_intelligence_telegram_enabled,
+                "shadow_mode": settings.xauusd_market_intel_shadow_mode,
+            },
+        },
+        source="diagnostics",
+    )
+
+
+@router.get(
+    "/macro-context",
+    response_model=APIResponse[dict],
+    summary="Enhanced macro interpretation (Phase 10) — DXY, yields, correlation, event risk",
+)
+@limiter.limit("30/minute")
+def macro_context(
+    request: Request,
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Returns DXY direction + yield direction + gold-DXY correlation state +
+    macro alignment with current technicals + move driver classification +
+    time-to-next-high-impact event.
+
+    Consumes correlation_engine + fred_provider + calendar. Any input missing
+    just marks that field UNKNOWN — never blocks the assessment.
+    """
+    from services.canonical_market_data import get_canonical
+    from services.htf_weighted_alignment import compute_htf_alignment
+    from services.macro_interpretation import compute_macro_context
+    from config import settings
+
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    snap = cmd.snapshot(db, force_refresh=force)
+    htf = compute_htf_alignment(snap)
+    tech_direction = htf.direction
+
+    # Optional data sources — best-effort, never raise
+    correlation_snapshot = None
+    yields_context = None
+    dxy_bars = None
+    try:
+        from services.correlation_engine import compute_intermarket_correlations
+        correlation_snapshot = compute_intermarket_correlations(timeframe="H1", n_bars=100)
+    except Exception as exc:
+        log.debug("[macro-context] correlation snapshot skipped: %s", exc)
+
+    try:
+        from services.fred_provider import get_yields_context
+        yields_context = get_yields_context()
+    except Exception as exc:
+        log.debug("[macro-context] yields context skipped: %s", exc)
+
+    try:
+        from services.tradingview_provider import get_tv_candles
+        dxy_bars = get_tv_candles("dxy", timeframe="H1", limit=40)
+    except Exception as exc:
+        log.debug("[macro-context] dxy bars skipped: %s", exc)
+
+    try:
+        from services.calendar_provider import get_upcoming_events
+        events = get_upcoming_events(hours=8) or []
+    except Exception:
+        events = []
+
+    assessment = compute_macro_context(
+        snapshot=snap, tech_direction=tech_direction,
+        upcoming_events=events, dxy_bars=dxy_bars,
+        correlation_snapshot=correlation_snapshot,
+        yields_context=yields_context,
+    )
+    return APIResponse(data=assessment.to_dict(), source="diagnostics")
+
+
+@router.get(
+    "/key-level-ranking",
+    response_model=APIResponse[dict],
+    summary="Ranked key levels into Tier 1/2/3 (Phase 9)",
+)
+@limiter.limit("30/minute")
+def key_level_ranking(
+    request: Request,
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Returns levels grouped into three tiers:
+      Tier 1 — immediate decision levels (≤ 2 ATR, score ≥ 40, up to 4)
+      Tier 2 — important supporting levels (≤ 4 ATR, score ≥ 25, up to 6)
+      Tier 3 — secondary intraday references (up to 8)
+
+    Consumes PDH/PDL/PWH/PWL/Asian/session levels + H4/H1 swing pivots
+    (+ optionally liquidity_map zones + breakout retest/acceptance context).
+    Ranks by TF weight, tag boost, reactions, sweep/acceptance/flipped role,
+    distance from price, and confluence.
+    """
+    from services.canonical_market_data import get_canonical
+    from services.htf_weighted_alignment import compute_htf_alignment
+    from services.breakout_acceptance import scan_key_levels
+    from services.key_level_ranking import rank_key_levels
+    from config import settings
+
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    snap = cmd.snapshot(db, force_refresh=force)
+    htf = compute_htf_alignment(snap)
+    breakouts = scan_key_levels(snap, htf_alignment=htf)
+
+    # Optional: existing liquidity_map — try to include
+    lm = None
+    try:
+        from services.liquidity_map import build_liquidity_map
+        d1 = snap.timeframes.get("D1")
+        m15 = snap.timeframes.get("M15")
+        h1 = snap.timeframes.get("H1")
+        if d1 and m15 and h1 and d1.candles and m15.candles and h1.candles:
+            lm = build_liquidity_map(
+                candles_d1=d1.candles, candles_m15=m15.candles,
+                candles_h1=h1.candles,
+                current_price=m15.candles[-1].close,
+                atr_h1=None,
+            )
+    except Exception as exc:
+        log.debug("[key_level_ranking] liquidity_map integration skipped: %s", exc)
+
+    ranking = rank_key_levels(snap, liquidity_map=lm, breakouts=breakouts)
+    return APIResponse(data=ranking.to_dict(), source="diagnostics")
+
+
+@router.get(
+    "/separated-verdicts",
+    response_model=APIResponse[dict],
+    summary="Direction / Opportunity / Entry three-part verdict (Phase 8)",
+)
+@limiter.limit("30/minute")
+def separated_verdicts(
+    request: Request,
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Publishes the three separate conclusions the brief demands — the fix
+    for "STAND ASIDE hides direction". Does NOT alter the mandate
+    strategist's entry rules (Phase 12 preserves them). Read-only view.
+
+    Fields:
+      directional_assessment ∈ Strong bullish … Strong bearish (7 levels)
+      opportunity_status     ∈ Conditions developing … Thesis invalidated
+      entry_status           ∈ No compliant entry … Entry confirmed
+      + reasons for each + ready_to_alert flag + confidence
+    """
+    from services.canonical_market_data import get_canonical
+    from services.htf_weighted_alignment import compute_htf_alignment
+    from services.market_regime import classify_regime
+    from services.directional_evidence import compute_directional_evidence
+    from services.breakout_acceptance import scan_key_levels
+    from services.opportunity_state import evaluate_and_transition
+    from services.separated_verdicts import compute_separated_verdict
+    from config import settings
+
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    snap = cmd.snapshot(db, force_refresh=force)
+
+    try:
+        from services.calendar_provider import get_upcoming_events
+        events = get_upcoming_events(hours=2) or []
+    except Exception:
+        events = []
+
+    htf = compute_htf_alignment(snap)
+    regime = classify_regime(snap, upcoming_events=events)
+    evidence = compute_directional_evidence(
+        snap, htf_alignment=htf, regime=regime, upcoming_events=events,
+    )
+    breakouts = scan_key_levels(snap, htf_alignment=htf)
+    # Non-persisting evaluation — we just need the current transition object
+    state_tr = evaluate_and_transition(
+        db, snapshot=snap, regime=regime, htf_alignment=htf,
+        evidence=evidence, breakouts=breakouts, persist=False,
+    )
+    verdict = compute_separated_verdict(
+        snapshot=snap, htf_alignment=htf, regime=regime, evidence=evidence,
+        breakouts=breakouts, state_transition=state_tr,
+    )
+    return APIResponse(
+        data={
+            "verdict": verdict.to_dict(),
+            "supporting": {
+                "state_transition_new_state": state_tr.new_state,
+                "htf_direction": htf.direction,
+                "htf_strength":  htf.strength,
+                "htf_score":     htf.score,
+                "regime":        regime.regime,
+                "dq_score":      evidence.data_quality_score,
+                "bull_evidence": evidence.bull_evidence_score,
+                "bear_evidence": evidence.bear_evidence_score,
+                "contradiction": evidence.contradiction_score,
+                "extension_risk": evidence.extension_risk_score,
+                "event_risk":    evidence.event_risk_score,
+            },
+        },
+        source="diagnostics",
+    )
+
+
+@router.get(
+    "/opportunity-state",
+    response_model=APIResponse[dict],
+    summary="Opportunity state machine (Phase 7) — persisted bull/bear state graph",
+)
+@limiter.limit("30/minute")
+def opportunity_state(
+    request: Request,
+    force: bool = Query(default=False),
+    persist: bool = Query(default=False, description="Write transition to DB if state changed"),
+    history: int = Query(default=10, ge=0, le=100),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Runs the full Phase 2-6 pipeline (canonical → HTF → regime → evidence →
+    breakout scan) and asks the state machine what the current opportunity
+    state is. Optionally persists the transition if `persist=true`.
+
+    Returns the current transition + recent history from the DB.
+    """
+    from services.canonical_market_data import get_canonical
+    from services.htf_weighted_alignment import compute_htf_alignment
+    from services.market_regime import classify_regime
+    from services.directional_evidence import compute_directional_evidence
+    from services.breakout_acceptance import scan_key_levels
+    from services.opportunity_state import (
+        evaluate_and_transition, get_recent_transitions,
+    )
+    from config import settings
+
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    snap = cmd.snapshot(db, force_refresh=force)
+
+    try:
+        from services.calendar_provider import get_upcoming_events
+        events = get_upcoming_events(hours=2) or []
+    except Exception:
+        events = []
+
+    htf = compute_htf_alignment(snap)
+    regime = classify_regime(snap, upcoming_events=events)
+    evidence = compute_directional_evidence(
+        snap, htf_alignment=htf, regime=regime, upcoming_events=events,
+    )
+    breakouts = scan_key_levels(snap, htf_alignment=htf)
+
+    tr = evaluate_and_transition(
+        db, snapshot=snap, regime=regime, htf_alignment=htf,
+        evidence=evidence, breakouts=breakouts, persist=persist,
+    )
+
+    return APIResponse(
+        data={
+            "current_transition": tr.to_dict(),
+            "history": get_recent_transitions(db, limit=history),
+        },
+        source="diagnostics",
+    )
+
+
+@router.get(
+    "/breakout-acceptance",
+    response_model=APIResponse[dict],
+    summary="Breakout acceptance classification (Phase 6) — 9-way per key level",
+)
+@limiter.limit("30/minute")
+def breakout_acceptance(
+    request: Request,
+    level: float = Query(default=None, description="Optional specific level"),
+    direction: str = Query(default=None, description="UP or DOWN (with `level`)"),
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Without params: scans PDH/PDL/PWH/PWL/Asian-high/Asian-low and returns
+    a list of active breakout assessments.
+    With `level` and `direction`: classifies a specific level only.
+    """
+    from services.canonical_market_data import get_canonical
+    from services.htf_weighted_alignment import compute_htf_alignment
+    from services.breakout_acceptance import classify_breakout, scan_key_levels
+    from config import settings
+
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    snap = cmd.snapshot(db, force_refresh=force)
+    htf = compute_htf_alignment(snap)
+
+    if level is not None and direction:
+        result = classify_breakout(snap, level=float(level),
+                                    direction=direction.upper(),
+                                    level_name="user", htf_alignment=htf)
+        return APIResponse(data=result.to_dict(), source="diagnostics")
+
+    assessments = scan_key_levels(snap, htf_alignment=htf)
+    return APIResponse(
+        data={"count": len(assessments),
+              "assessments": [a.to_dict() for a in assessments]},
+        source="diagnostics",
+    )
+
+
+@router.get(
+    "/directional-evidence",
+    response_model=APIResponse[dict],
+    summary="Directional evidence + contradiction scores (Phase 5) — 8-way multi-score",
+)
+@limiter.limit("30/minute")
+def directional_evidence(
+    request: Request,
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Returns the 8-score evidence assessment:
+      bull_evidence_score, bear_evidence_score, contradiction_score,
+      data_quality_score, event_risk_score, extension_risk_score,
+      directional_confidence, entry_quality_confidence
+    Plus itemised bull_items[], bear_items[], contradictions[].
+
+    Contradictions REDUCE confidence proportionately, they do not veto.
+    """
+    from services.canonical_market_data import get_canonical
+    from services.htf_weighted_alignment import compute_htf_alignment
+    from services.market_regime import classify_regime
+    from services.directional_evidence import compute_directional_evidence
+    from config import settings
+
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    snap = cmd.snapshot(db, force_refresh=force)
+
+    try:
+        from services.calendar_provider import get_upcoming_events
+        events = get_upcoming_events(hours=2) or []
+    except Exception:
+        events = []
+
+    htf = compute_htf_alignment(snap)
+    regime = classify_regime(snap, upcoming_events=events)
+    ev = compute_directional_evidence(
+        snap, htf_alignment=htf, regime=regime,
+        upcoming_events=events, macro_context=None,
+    )
+    return APIResponse(data=ev.to_dict(), source="diagnostics")
+
+
+@router.get(
+    "/htf-alignment",
+    response_model=APIResponse[dict],
+    summary="Weighted HTF alignment score (Phase 4) — D1/H4/H1/M15/M5",
+)
+@limiter.limit("30/minute")
+def htf_alignment(
+    request: Request,
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Weighted per-timeframe direction score. Replaces STRONG-only unanimity
+    (the current C1 logic) with:
+
+      D1  20% weight — broader context
+      H4  30% weight — structural bias
+      H1  30% weight — active directional control
+      M15 15% weight — transition/displacement
+      M5   5% weight — execution refinement
+
+    Score ∈ [-100, +100]. `direction` ∈ BULL/BEAR/NEUTRAL based on ±15 band.
+    `strength` ∈ STRONG (≥60) / MEDIUM (≥30) / WEAK (≥15) / NONE.
+    Also returns per-TF breakdown, unanimity flag, and TF grouping.
+
+    Fails open — missing/short TFs contribute 0 and warnings[] is filled.
+    """
+    from services.canonical_market_data import get_canonical
+    from services.htf_weighted_alignment import compute_htf_alignment
+    from config import settings
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    snap = cmd.snapshot(db, force_refresh=force)
+    result = compute_htf_alignment(snap)
+    return APIResponse(data=result.to_dict(), source="diagnostics")
+
+
+@router.get(
+    "/market-regime",
+    response_model=APIResponse[dict],
+    summary="Market regime classification (Phase 3) — 14-way, direction-first",
+)
+@limiter.limit("30/minute")
+def market_regime(
+    request: Request,
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Returns the current market regime assessment. Runs BEFORE any entry
+    strategy and does NOT depend on a compliant trade setup. Classification
+    is one of:
+
+      STRONG_BULLISH_EXPANSION | BULLISH_CONTINUATION | BULLISH_PULLBACK |
+      BULLISH_TRANSITION | BULLISH_ACCUMULATION |
+      BALANCED_RANGE |
+      BEARISH_ACCUMULATION | BEARISH_TRANSITION | BEARISH_PULLBACK |
+      BEARISH_CONTINUATION | STRONG_BEARISH_EXPANSION |
+      EXHAUSTION_OVEREXTENSION | HIGH_IMPACT_EVENT_RISK | INSUFFICIENT_DATA
+
+    Also returns: directional_bias, controller, control_trend, transitioning,
+    accepting_above/below, move_maturity, liquidity pools, invalidation_price,
+    confidence (0-100), evidence[], warnings[].
+
+    Fails open — snapshot missing bars → returns INSUFFICIENT_DATA, never raises.
+    """
+    from services.canonical_market_data import get_canonical
+    from services.market_regime import classify_regime
+    from config import settings
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    snap = cmd.snapshot(db, force_refresh=force)
+    # Pull upcoming events from calendar (best-effort — pass empty list if unavailable)
+    try:
+        from services.calendar_provider import get_upcoming_events
+        events = get_upcoming_events(hours=1) or []
+    except Exception:
+        events = []
+    assessment = classify_regime(snap, upcoming_events=events)
+    return APIResponse(data=assessment.to_dict(), source="diagnostics")
+
+
+@router.get(
+    "/canonical-market-data",
+    response_model=APIResponse[dict],
+    summary="Canonical market-data snapshot (Phase 2) — single source of truth per tick",
+)
+@limiter.limit("30/minute")
+def canonical_market_data(
+    request: Request,
+    instrument: str = Query(default="XAU/USD"),
+    timeframes: str = Query(default="M5,M15,H1,H4,D1"),
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Returns the current canonical snapshot. This is the single-source-of-truth
+    payload every strategy should read from (Phase 2 of the directional
+    intelligence overhaul). Snapshot includes:
+
+      - bid/ask/spread/tick timestamp + source
+      - per-timeframe candles + freshness status + age
+      - session/killzone identity + intraday hi/lo so far
+      - PDH/PDL/PDC/PWH/PWL/PWO/daily-open/asian-high/asian-low
+      - data_quality_score (0-100)
+      - build_latency_ms + warnings[]
+
+    Cache TTL: settings.xauusd_canonical_data_cache_ttl_s (default 15 s).
+    Pass ?force=true to bypass the cache.
+    """
+    from services.canonical_market_data import get_canonical
+    from config import settings
+    cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
+    tfs = tuple(t.strip().upper() for t in timeframes.split(",") if t.strip())
+    snap = cmd.snapshot(db, instrument=instrument, timeframes=tfs, force_refresh=force)
+    return APIResponse(data=snap.to_dict(), source="diagnostics")
+
+
+@router.get(
     "/external-confluence",
     response_model=APIResponse[dict],
     summary="FastBull + CME confluence snapshot (P134)",

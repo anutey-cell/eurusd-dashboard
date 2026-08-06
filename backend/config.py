@@ -276,6 +276,29 @@ class Settings(BaseSettings):
     notification_shadow_mode:       bool = True    # canonical is dry-run parallel to legacy
     notification_mode:              str  = "standard"  # minimal | standard | detailed
 
+    # ── Phase 2: Canonical market data service ────────────────────────────────
+    # Single source of truth for every strategy: bid/ask/spread/candles/session/
+    # levels/data_quality. Ships behind a flag so we can shadow-verify via
+    # /api/v1/diagnostics/canonical-market-data before wiring strategies to it.
+    xauusd_canonical_data_enabled: bool = False
+    xauusd_canonical_data_cache_ttl_s: int = 15
+
+    # ── Phase 3-14: Directional intelligence build (all off until validated) ──
+    # Each flag corresponds to one phase of the market-intelligence overhaul.
+    # Stays False until the phase's replay validation passes.
+    xauusd_market_regime_enabled: bool = False
+    xauusd_weighted_htf_alignment_enabled: bool = False
+    xauusd_directional_intelligence_enabled: bool = False
+    xauusd_breakout_acceptance_enabled: bool = False
+    xauusd_opportunity_state_machine_enabled: bool = False
+    xauusd_separated_verdicts_enabled: bool = False
+    xauusd_key_level_ranking_enabled: bool = False
+    xauusd_macro_interpretation_enabled: bool = False
+    xauusd_market_intelligence_telegram_enabled: bool = False
+    xauusd_market_intel_shadow_mode: bool = True     # canonical shadow while true
+    xauusd_opportunity_coverage_enabled: bool = False
+    xauusd_replay_validation_enabled: bool = False
+
     # ── Auth (optional API key protection) ───────────────────────────────────
     auth_enabled: bool = False
     api_key:      str  = "change_me"
