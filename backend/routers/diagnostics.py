@@ -1463,6 +1463,36 @@ def shadow_trade_recent(
 
 
 @router.get(
+    "/predator-candidates",
+    response_model=APIResponse[dict],
+    summary="Live Predator engine — current signal candidates from empirical edges",
+)
+@limiter.limit("30/minute")
+def predator_candidates(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Runs the Predator engine on the freshest data and returns any signals
+    it would emit right now. Read-only inspection — does not record.
+    Used to preview alerts before enabling predator_telegram_enabled.
+    """
+    from services.predator_engine import evaluate, format_telegram_alert
+    from config import settings
+    sigs = evaluate(db)
+    return APIResponse(
+        data={
+            "count":               len(sigs),
+            "signals":             [s.to_dict() for s in sigs],
+            "previews":            [format_telegram_alert(s) for s in sigs],
+            "telegram_enabled":    getattr(settings, "predator_telegram_enabled", False),
+            "predator_enabled":    getattr(settings, "predator_enabled", True),
+        },
+        source="diagnostics",
+    )
+
+
+@router.get(
     "/provider-health",
     response_model=APIResponse[dict],
     summary="Per-timeframe candle provider health + freshness + signal-blocked state",

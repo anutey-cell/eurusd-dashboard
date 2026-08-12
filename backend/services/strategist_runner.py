@@ -187,6 +187,9 @@ def run_once(db: Session) -> dict:
     # Shadow trade simulator — records ALL BUY/SELL verdicts (every grade)
     # for grader calibration. Never executes, never alerts. Fails silent.
     _maybe_shadow_record_trade(db, verdict)
+    # Also record cp=3 Watchlist observations with synthesized trade plan,
+    # so shadow_trades accumulates data even when mandate refuses BUY/SELL.
+    _maybe_shadow_record_watchlist(db, verdict)
 
     try:
         persist_verdict(db, verdict, pending_execution_id=pending_id)
@@ -254,6 +257,116 @@ def _maybe_shadow_record_trade(db: Session, verdict: dict) -> None:
                      verdict.get("decision"), grade_result.grade, r.fingerprint)
     except Exception as exc:
         log.debug("[shadow_trade] record skipped (non-fatal): %s", exc)
+
+
+def _maybe_shadow_record_watchlist(db: Session, verdict: dict) -> None:
+    """
+    Record cp=3 Watchlist verdicts by synthesizing a trade plan from
+    tf_alignment + last M5 close + recent M15 ATR. Feeds shadow_trades
+    so we get calibration data even when the mandate refuses to fire
+    BUY/SELL (cp<4). Every Watchlist observation becomes a data point.
+    """
+    if not getattr(settings, "shadow_trade_recording_enabled", True):
+        return
+    # Match on the mandate's actual reason string — it reads
+    # "Watchlist — 3/5 (no demo execution)" when cp=3 (execution_status
+    # itself is SIGNAL_ONLY, not "Watchlist"). Belt-and-suspenders match
+    # both fields so we catch either encoding.
+    reason = (verdict.get("execution_status_reason") or "")
+    exec_st = (verdict.get("execution_status") or "")
+    cp = int(verdict.get("conditions_passed") or 0)
+    setup_score = int(verdict.get("setup_score") or 0)
+    # Watchlist trigger — either the mandate labels it Watchlist, OR we
+    # have a lower-tier setup with strong tf alignment + non-trivial score
+    # (cp≥2 + score≥50). This broader net makes shadow_trades accumulate
+    # observation data even when mandate stays cp=2, so measurement never
+    # completely stalls waiting for cp≥3 windows.
+    is_mandate_watchlist = ("Watchlist" in reason) or (exec_st == "Watchlist")
+    # Broader net: any STAND_ASIDE with strong tf alignment counts as a
+    # measurable observation (we're tracking "when engine sees direction,
+    # is it right?"). Fingerprint dedup limits to 1 obs per hour per
+    # direction per 5pt price bucket, so noise stays bounded.
+    is_broad_candidate   = (cp >= 1 and setup_score >= 20)
+    if not (is_mandate_watchlist or is_broad_candidate):
+        return
+    # Infer direction from tf_alignment_label — require STRONG bias only,
+    # otherwise it's a coin-flip and not worth observing
+    tf_label = (verdict.get("tf_alignment_label") or "").lower()
+    if "strong bullish" in tf_label or ("bullish" in tf_label and "extended" in tf_label):
+        direction = "BUY"
+    elif "strong bearish" in tf_label or ("bearish" in tf_label and "extended" in tf_label):
+        direction = "SELL"
+    else:
+        return   # weak/neutral bias — skip
+
+    try:
+        from sqlalchemy import text
+        # Current price = last M5 close
+        row = db.execute(text(
+            "SELECT close FROM historical_candles "
+            "WHERE instrument='XAU/USD' AND timeframe='M5' "
+            "ORDER BY candle_time DESC LIMIT 1"
+        )).fetchone()
+        if not row or not row[0]:
+            return
+        price = float(row[0])
+        # ATR = mean(high-low) over last 14 H1 bars — broader than M15,
+        # captures real volatility for gold instead of quiet-window noise
+        atr_rows = db.execute(text(
+            "SELECT high, low FROM historical_candles "
+            "WHERE instrument='XAU/USD' AND timeframe='H1' "
+            "ORDER BY candle_time DESC LIMIT 14"
+        )).fetchall()
+        if not atr_rows or len(atr_rows) < 3:
+            return
+        atr_raw = sum(float(r[0]) - float(r[1]) for r in atr_rows) / len(atr_rows)
+        # Floor at 8 pts — a plausible minimum SL for XAUUSD; below that
+        # single-tick spread can take out the stop and observations become
+        # noise instead of signal
+        atr = max(atr_raw, 8.0)
+
+        # Synthesize plan: 1.0×ATR stop, 2.5×ATR TP1 (RR=2.5),
+        # 3.5×ATR TP2 (RR=3.5) — matches the mandate's minimum RR
+        if direction == "BUY":
+            entry = price
+            sl    = round(price - 1.0 * atr, 2)
+            tp1   = round(price + 2.5 * atr, 2)
+            tp2   = round(price + 3.5 * atr, 2)
+        else:
+            entry = price
+            sl    = round(price + 1.0 * atr, 2)
+            tp1   = round(price - 2.5 * atr, 2)
+            tp2   = round(price - 3.5 * atr, 2)
+
+        # Wrap into a shadow verdict — decision + plan so record_shadow_trade
+        # accepts it. Grade is explicit "Watchlist" via a synthetic result.
+        shadow_verdict = {
+            **verdict,
+            "decision":   direction,
+            "archetype":  "watchlist_observation",   # distinguishable in bucket stats
+            "trade_plan": {
+                "entry": entry, "stop_loss": sl,
+                "tp1": tp1, "tp2": tp2,
+                "tp1_rr": abs(tp1 - entry) / abs(entry - sl),
+                "tp2_rr": abs(tp2 - entry) / abs(entry - sl),
+                "invalidation": sl,
+            },
+        }
+
+        # Synthetic grade result — bypass the real grader (which would grade
+        # this "STAND ASIDE / not gradeable"). We want it tagged as Watchlist.
+        class _WatchlistGrade:
+            grade = "Watchlist"
+            reason = f"cp={verdict.get('conditions_passed')} · {tf_label} · synthesized 1.5×ATR/2×ATR/3×ATR"
+            composite_score = int(verdict.get("setup_score") or 0)
+
+        from services.shadow_trade_simulator import record_shadow_trade
+        r = record_shadow_trade(db, shadow_verdict, grade_result=_WatchlistGrade())
+        if r.recorded:
+            log.info("[shadow_trade/watchlist] recorded %s cp=%s atr=%.2f fp=%s",
+                     direction, verdict.get("conditions_passed"), atr, r.fingerprint)
+    except Exception as exc:
+        log.debug("[shadow_trade/watchlist] skipped (non-fatal): %s", exc)
 
 
 # ── Telegram side-effect ─────────────────────────────────────────────────────
@@ -1130,15 +1243,29 @@ def _last_bridge_heartbeat() -> Optional[dict]:
     Read the most recent MT5 bridge terminal state so the enqueue path can
     verify the daemon is on the sanctioned demo account before permitting
     an order. Fails safe: returns None on any error → enqueue refuses.
+
+    Race-safe: prefers the most-recent heartbeat WITH populated account
+    fields, falling back to raw last-seen only if none have account info.
+    Avoids false-refuse when a bare heartbeat overwrote a full one.
     """
     try:
         from routers.bridge import _MT5_TERMINAL_STATE
         if not _MT5_TERMINAL_STATE:
             return None
-        # Pick the most-recently-seen daemon's state
-        latest = max(_MT5_TERMINAL_STATE.values(),
-                       key=lambda s: s.get("last_seen") or datetime.min)
-        # Include symbol if daemon reported it (added by candle-push)
+
+        # First pass: entries WITH populated account_login, ranked by last_seen
+        with_account = [
+            s for s in _MT5_TERMINAL_STATE.values()
+            if s.get("account_login") is not None
+        ]
+        if with_account:
+            latest = max(with_account,
+                          key=lambda s: s.get("last_seen") or datetime.min)
+        else:
+            # Fallback: any entry, most-recently-seen
+            latest = max(_MT5_TERMINAL_STATE.values(),
+                          key=lambda s: s.get("last_seen") or datetime.min)
+
         if "symbol" not in latest:
             latest = {**latest, "symbol": "XAUUSD"}   # daemon only trades XAUUSD
         return latest

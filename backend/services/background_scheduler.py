@@ -612,6 +612,91 @@ def _run_shadow_trade_advance():
             log.info("[shadow_trade] outcomes advanced: %s", interesting)
 
 
+# ── Predator engine loop (2026-08-12) ────────────────────────────────────────
+#
+# Runs every N seconds. On each tick:
+#   1. Evaluates 3 walk-forward-validated detectors
+#   2. Dedupes by fingerprint (max 1 per hour per pattern per 5pt bucket)
+#   3. Records each fresh signal to shadow_trades (grade=archetype)
+#   4. Sends Telegram if predator_telegram_enabled is True
+#
+# No trade placement. Pure signal + measurement.
+
+_PREDATOR_SEEN: dict[str, float] = {}   # fingerprint -> unix ts
+
+
+async def _predator_loop():
+    from config import settings
+    interval = getattr(settings, "predator_loop_interval_s", 60)
+    log.info("[scheduler] predator engine loop started (every %ds)", interval)
+    await asyncio.sleep(30)   # let data pipeline warm up first
+    while True:
+        try:
+            if getattr(settings, "predator_enabled", True):
+                await asyncio.to_thread(_run_predator_iteration)
+        except asyncio.CancelledError:
+            log.info("[scheduler] predator loop cancelled")
+            break
+        except Exception as exc:
+            log.warning("[scheduler] predator loop error: %s", exc)
+        await asyncio.sleep(interval)
+
+
+def _run_predator_iteration():
+    import time as _time
+    from config import settings
+    from database import SessionLocal
+    from services.predator_engine import evaluate, format_telegram_alert
+
+    dedupe_s = int(getattr(settings, "predator_dedupe_cooldown_s", 3600))
+    now = _time.time()
+
+    with SessionLocal() as db:
+        signals = evaluate(db)
+        for sig in signals:
+            last = _PREDATOR_SEEN.get(sig.fingerprint)
+            if last and (now - last) < dedupe_s:
+                continue    # already fired within cooldown window
+            _PREDATOR_SEEN[sig.fingerprint] = now
+            log.info("[predator] fired %s %s @ %.2f RR=1:%.2f conf=%s",
+                     sig.archetype, sig.direction, sig.entry, sig.rr,
+                     sig.confidence)
+
+            # Record to shadow_trades (grade=archetype for bucket stats)
+            try:
+                from services.shadow_trade_simulator import record_shadow_trade
+                synthetic_verdict = {
+                    "decision":   sig.direction,
+                    "archetype":  sig.archetype,
+                    "setup_score": 85 if sig.confidence == "HIGH" else 75 if sig.confidence == "MED" else 65,
+                    "conditions_passed": 4,
+                    "trade_plan": {
+                        "entry": sig.entry, "stop_loss": sig.stop_loss,
+                        "tp1": sig.tp1, "tp2": sig.tp2,
+                        "tp1_rr": abs(sig.tp1 - sig.entry) / max(abs(sig.entry - sig.stop_loss), 0.1),
+                        "tp2_rr": abs(sig.tp2 - sig.entry) / max(abs(sig.entry - sig.stop_loss), 0.1),
+                        "invalidation": sig.stop_loss,
+                        "risk_reward": sig.rr,
+                    },
+                }
+                class _PredatorGrade:
+                    grade = f"PRED_{sig.archetype}_{sig.confidence}"
+                    reason = sig.thesis
+                    composite_score = 85 if sig.confidence == "HIGH" else 75
+
+                record_shadow_trade(db, synthetic_verdict, grade_result=_PredatorGrade())
+            except Exception as exc:
+                log.warning("[predator] shadow-record failed: %s", exc)
+
+            # Telegram (gated)
+            if getattr(settings, "predator_telegram_enabled", False):
+                try:
+                    from services.strategist_runner import _send_plain
+                    _send_plain(format_telegram_alert(sig))
+                except Exception as exc:
+                    log.warning("[predator] telegram send failed: %s", exc)
+
+
 # ── Phase 11: market-intelligence alert loop ──────────────────────────────
 #
 # Every 60s, run the full Phase 2-10 pipeline and let the intel engine
@@ -894,6 +979,7 @@ async def start_background_loops():
         asyncio.create_task(_vp_trap_measurement_loop(),   name="vp_trap_measurement_loop"),
         asyncio.create_task(_market_intel_loop(),          name="market_intel_loop"),
         asyncio.create_task(_shadow_trade_advance_loop(),  name="shadow_trade_advance_loop"),
+        asyncio.create_task(_predator_loop(),              name="predator_loop"),
     ]
 
     # Pick exactly ONE execution authority — never both, or they'll fight.

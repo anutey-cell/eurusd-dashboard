@@ -302,6 +302,16 @@ class Settings(BaseSettings):
     mandate_demo_server_contains:  str   = "Trial"     # server must contain this substring
     mandate_demo_symbol:           str   = "XAUUSD"
 
+    # ── Predator engine — outcome-first empirical signals (2026-08-12) ────────
+    # Runs in parallel with the mandate strategist. Emits distinct alerts for
+    # walk-forward-validated edges: ASIAN_BREAKDOWN, PDL_BREAK, VOL_CONTINUATION.
+    # Records every signal to shadow_trades for outcome tracking. Telegram is
+    # off by default so operator can review before it fires to their phone.
+    predator_enabled:              bool = True
+    predator_telegram_enabled:     bool = False
+    predator_loop_interval_s:      int  = 60
+    predator_dedupe_cooldown_s:    int  = 3600      # 1 hour between same fingerprint
+
     # ── Shadow trade simulator (data source for grader calibration) ──────────
     # Records EVERY BUY/SELL verdict (all grades A+/A/B/C) with a complete
     # trade plan into shadow_trades, then a background loop walks each row
