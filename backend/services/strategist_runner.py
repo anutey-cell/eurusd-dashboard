@@ -22,6 +22,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -50,6 +51,12 @@ _last_standby_fingerprint:  str   = ""
 _last_standby_at:           float = 0.0
 _last_enqueue_fingerprint:  str   = ""
 _last_enqueue_at:           float = 0.0
+
+# Watchlist heads-up state — fires when mandate says "Watchlist" (3/5 conditions)
+# but decision is still STAND ASIDE (needs 4/5 to be BUY/SELL). Deduped by
+# (direction, hour) so at most one per hour per direction.
+_last_watchlist_alert: dict = {"key": "", "sent_at": 0.0}
+_WATCHLIST_ALERT_COOLDOWN_S = 30 * 60   # 30 min min gap even within same bucket
 
 # Cooldowns by signal band — addresses 92% duplicate noise audit finding
 _COOLDOWN_S_5OF5         = 600.0     # 10 min — high-conviction
@@ -147,9 +154,28 @@ def run_once(db: Session) -> dict:
     """
     verdict = make_decision(db)
 
+    # Pre-compute signal grade so downstream side-effects (enqueue + alert)
+    # both see the same grade. Enqueue uses it for sizing; alert uses it for
+    # gating/formatting. Only applies to BUY/SELL decisions.
+    if verdict.get("decision") in ("BUY", "SELL"):
+        try:
+            from services.signal_grading import grade_verdict
+            _gr = grade_verdict(
+                verdict,
+                min_score_a=settings.signal_min_score_a,
+                min_score_aplus=settings.signal_min_score_aplus,
+                min_rr_a=settings.signal_min_rr_a,
+                min_rr_aplus=settings.signal_min_rr_aplus,
+                watchlist_score=settings.signal_watchlist_score,
+            )
+            verdict["signal_grade"] = _gr.to_dict()
+        except Exception as exc:
+            log.debug("[strategist_runner] pre-grade failed (non-fatal): %s", exc)
+
     # Side-effects — order matters: enqueue first so the log can back-link it
     pending_id = _maybe_enqueue_demo_order(db, verdict)
     _maybe_fire_alert(verdict)
+    _maybe_fire_watchlist_alert(verdict)      # 3/5 mandate heads-up (informational)
     _maybe_fire_preformation_alert(verdict)   # 1-hour-before-KZ heads-up
     _maybe_fire_momentum_alert(db, verdict)   # secondary momentum-continuation source
     _maybe_scan_vp_trap_zones(db)             # Phase 2 — advance state, no alerts yet
@@ -157,6 +183,10 @@ def run_once(db: Session) -> dict:
 
     # Canonical notification layer — runs in shadow mode alongside legacy
     _shadow_run_canonical_mandate(db, verdict)
+
+    # Shadow trade simulator — records ALL BUY/SELL verdicts (every grade)
+    # for grader calibration. Never executes, never alerts. Fails silent.
+    _maybe_shadow_record_trade(db, verdict)
 
     try:
         persist_verdict(db, verdict, pending_execution_id=pending_id)
@@ -190,6 +220,40 @@ def _shadow_run_canonical_mandate(db: Session, verdict: dict) -> None:
                      result.get("state"))
     except Exception as exc:
         log.warning("[canonical/mandate] shadow run failed: %s", exc)
+
+
+def _maybe_shadow_record_trade(db: Session, verdict: dict) -> None:
+    """
+    Record BUY/SELL verdicts to shadow_trades regardless of grade or alert
+    cooldown. Provides raw data for grader calibration — was A+ really better
+    than A? Did suppressed B/C setups outperform? Fails silent.
+    """
+    if not getattr(settings, "shadow_trade_recording_enabled", True):
+        return
+    if verdict.get("decision") not in ("BUY", "SELL"):
+        return
+    tp = verdict.get("trade_plan") or {}
+    if tp.get("entry") is None or tp.get("stop_loss") is None or tp.get("tp1") is None:
+        return
+    try:
+        # Compute grade so we can attribute the outcome per bucket.
+        # Reuse the same grader the alert path uses.
+        from services.signal_grading import grade_verdict
+        grade_result = grade_verdict(
+            verdict,
+            min_score_a=settings.signal_min_score_a,
+            min_score_aplus=settings.signal_min_score_aplus,
+            min_rr_a=settings.signal_min_rr_a,
+            min_rr_aplus=settings.signal_min_rr_aplus,
+            watchlist_score=settings.signal_watchlist_score,
+        )
+        from services.shadow_trade_simulator import record_shadow_trade
+        r = record_shadow_trade(db, verdict, grade_result=grade_result)
+        if r.recorded:
+            log.info("[shadow_trade] recorded %s grade=%s fp=%s",
+                     verdict.get("decision"), grade_result.grade, r.fingerprint)
+    except Exception as exc:
+        log.debug("[shadow_trade] record skipped (non-fatal): %s", exc)
 
 
 # ── Telegram side-effect ─────────────────────────────────────────────────────
@@ -328,9 +392,45 @@ def _maybe_fire_alert(verdict: dict) -> None:
                       elapsed, cooldown, band)
             return
 
+        # ── Signal grading gate (A+/A/B/C) ──────────────────────────────
+        # Suppress anything below A grade unless watchlist alerts explicitly
+        # enabled. No execution impact — this only filters Telegram noise.
+        from services.signal_grading import (
+            grade_verdict, format_signal_grade_body,
+            ALERT_GRADES, WATCHLIST_GRADES,
+        )
+        grade_result = grade_verdict(
+            verdict,
+            min_score_a=settings.signal_min_score_a,
+            min_score_aplus=settings.signal_min_score_aplus,
+            min_rr_a=settings.signal_min_rr_a,
+            min_rr_aplus=settings.signal_min_rr_aplus,
+            watchlist_score=settings.signal_watchlist_score,
+        )
+        grade = grade_result.grade
+        # Attach to verdict for downstream logging / dashboard
+        verdict["signal_grade"] = grade_result.to_dict()
+
+        # Suppress logic
+        if grade in WATCHLIST_GRADES and not settings.signal_watchlist_alerts_enabled:
+            log.info("[strategist_runner] alert SUPPRESSED — grade=%s (watchlist disabled): %s",
+                     grade, grade_result.reason)
+            return
+        if grade not in ALERT_GRADES and grade not in WATCHLIST_GRADES:
+            log.info("[strategist_runner] alert SUPPRESSED — grade=%s: %s",
+                     grade, grade_result.reason)
+            return
+
         # ── Fire ───────────────────────────────────────────────────────
         long_pct, short_pct = _fetch_sentiment()
-        msg = format_mandate_signal_message(verdict, long_pct=long_pct, short_pct=short_pct)
+        # New grading-aware format (per operator recalibration spec)
+        try:
+            from services.mt5_provider import get_tick
+            tick = get_tick("xauusd")
+            spread_pts = tick.get("spread_raw")
+        except Exception:
+            spread_pts = None
+        msg = format_signal_grade_body(verdict, grade_result, spread_pts=spread_pts)
 
         # ── VP Trap confirmation-mode enrichment ──────────────────────
         # When vp_trap_mode == "confirmation" AND we have an active VP Trap
@@ -364,6 +464,101 @@ def _maybe_fire_alert(verdict: dict) -> None:
         _last_signaled_direction = decision   # track for next flip detection
     except Exception as exc:
         log.debug("[strategist_runner] alert hook failed (non-fatal): %s", exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Watchlist heads-up (mandate cp=3, decision STAND_ASIDE, execution_status=Watchlist)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _maybe_fire_watchlist_alert(verdict: dict) -> None:
+    """
+    Fire a distinct 'watchlist heads-up' Telegram message when the mandate
+    labels the current state as 'Watchlist' (3/5 conditions) but decision is
+    still STAND_ASIDE (requires 4/5 for a BUY/SELL trade plan).
+
+    Gated by settings.signal_watchlist_alerts_enabled. Deduped by (direction,
+    hour) with a 30-min hard cooldown even inside the same hour bucket.
+
+    Purpose: give the operator a heads-up on setups the engine is watching
+    but has NOT yet committed to trading. Distinct wording so it can never
+    be confused with an actionable BUY/SELL alert. No trade plan included.
+    """
+    global _last_watchlist_alert
+    try:
+        if not getattr(settings, "signal_watchlist_alerts_enabled", False):
+            return
+        if verdict.get("execution_status") != "Watchlist":
+            return
+        # Never during weekend quiet hours
+        if is_weekend_quiet_hours():
+            return
+
+        # Derive direction from HTF alignment label
+        tf_label = (verdict.get("tf_alignment_label") or "").lower()
+        if "bullish" in tf_label:
+            direction = "BUY"
+        elif "bearish" in tf_label:
+            direction = "SELL"
+        else:
+            return   # no clear directional lean → nothing to watch
+
+        # Dedupe key = direction + UTC hour bucket
+        now = time.time()
+        hour_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+        key = f"{direction}|{hour_bucket}"
+        if _last_watchlist_alert.get("key") == key:
+            return
+        if now - float(_last_watchlist_alert.get("sent_at", 0.0)) < _WATCHLIST_ALERT_COOLDOWN_S:
+            return
+
+        msg = _format_watchlist_message(verdict, direction)
+        _send_plain(msg)
+        _last_watchlist_alert = {"key": key, "sent_at": now}
+        log.info("[strategist_runner] watchlist alert fired %s (cp=%s, score=%s)",
+                 direction, verdict.get("conditions_passed"),
+                 verdict.get("setup_score"))
+    except Exception as exc:
+        log.debug("[strategist_runner] watchlist alert hook failed (non-fatal): %s", exc)
+
+
+def _format_watchlist_message(verdict: dict, direction: str) -> str:
+    """Compose the informational Watchlist heads-up. Never a trade plan."""
+    price = verdict.get("price") or verdict.get("current_price")
+    tf_label = verdict.get("tf_alignment_label") or "—"
+    market_state = verdict.get("market_state") or "—"
+    session_class = verdict.get("session_classification") or "—"
+    setup_score = verdict.get("setup_score", "—")
+    cp = verdict.get("conditions_passed", 0)
+    reason = verdict.get("execution_status_reason") or "3/5 mandate conditions"
+
+    arrow = "📈" if direction == "BUY" else "📉"
+
+    lines = [
+        f"👀 WATCHLIST · XAU/USD · {arrow} {direction} bias forming",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"Setup at {cp}/5 conditions — mandate not yet actionable.",
+        "",
+        "📊 What the engine sees",
+    ]
+    if price is not None:
+        try:
+            lines.append(f"   Price:      ${float(price):,.2f}")
+        except (TypeError, ValueError):
+            pass
+    lines.extend([
+        f"   TF align:   {tf_label}",
+        f"   Market:     {market_state}",
+        f"   Session:    {session_class}",
+        f"   Setup:      {cp}/5  ·  score {setup_score}",
+        "",
+        "🚫 Why no trade plan yet",
+        f"   {reason}",
+        "",
+        "⚠️ Informational only. No entry / SL / TP attached.",
+        "   The engine will alert again if setup climbs to 4/5+ (actionable)",
+        "   or 5/5 (high-conviction).",
+    ])
+    return "\n".join(lines)
 
 
 def _format_direction_flip(verdict: dict, *, prior_direction: str) -> str:
@@ -914,10 +1109,88 @@ def _send_plain(text: str) -> None:
 
 # ── MT5 enqueue side-effect ──────────────────────────────────────────────────
 
+def _lot_size_for_grade(grade: str | None) -> float:
+    """
+    Grade-based lot sizing per operator mandate revision 2026-08-11 (DEMO only).
+    A+ = 0.15, A = 0.10, B / Watchlist = 0.05. Anything below B is not enqueued
+    (grade gate suppresses first), but returns B-tier size as a defensive fallback.
+    """
+    g = (grade or "").upper()
+    if g in ("A+", "APLUS"):
+        return float(settings.mandate_lot_a_plus)
+    if g == "A":
+        return float(settings.mandate_lot_a)
+    if g in ("B", "WATCHLIST"):
+        return float(settings.mandate_lot_b)
+    return float(settings.mandate_lot_b)   # defensive fallback
+
+
+def _last_bridge_heartbeat() -> Optional[dict]:
+    """
+    Read the most recent MT5 bridge terminal state so the enqueue path can
+    verify the daemon is on the sanctioned demo account before permitting
+    an order. Fails safe: returns None on any error → enqueue refuses.
+    """
+    try:
+        from routers.bridge import _MT5_TERMINAL_STATE
+        if not _MT5_TERMINAL_STATE:
+            return None
+        # Pick the most-recently-seen daemon's state
+        latest = max(_MT5_TERMINAL_STATE.values(),
+                       key=lambda s: s.get("last_seen") or datetime.min)
+        # Include symbol if daemon reported it (added by candle-push)
+        if "symbol" not in latest:
+            latest = {**latest, "symbol": "XAUUSD"}   # daemon only trades XAUUSD
+        return latest
+    except Exception:
+        return None
+
+
+def _current_open_lot_exposure(db: Session) -> float:
+    """
+    Sum lot sizes across all currently-open positions:
+      - PendingExecution rows with status='PENDING' (awaiting daemon pickup)
+      - Trade rows still open (status IN 'OPEN','FILLED','PARTIAL')
+
+    Used by the aggregate-exposure ceiling check. Fails safe: on any query
+    error, returns a high sentinel so the enqueue path refuses (preserves
+    capital, per mandate).
+    """
+    from sqlalchemy import text
+    total = 0.0
+    got_data = False
+    try:
+        row = db.execute(text(
+            "SELECT COALESCE(SUM(lot_size), 0) FROM pending_executions "
+            "WHERE status='PENDING'"
+        )).fetchone()
+        if row is not None:
+            total += float(row[0] or 0.0)
+            got_data = True
+    except Exception as exc:
+        log.debug("[strategist_runner] pending exposure query failed: %s", exc)
+    try:
+        row = db.execute(text(
+            "SELECT COALESCE(SUM(lot_size), 0) FROM trades "
+            "WHERE status IN ('OPEN','FILLED','PARTIAL')"
+        )).fetchone()
+        if row is not None:
+            total += float(row[0] or 0.0)
+            got_data = True
+    except Exception as exc:
+        log.debug("[strategist_runner] trades exposure query failed: %s", exc)
+    if not got_data:
+        # Fail-safe: report ceiling so enqueue refuses. Better to skip a trade
+        # than accidentally exceed the aggregate cap.
+        return float(settings.mandate_lot_max_aggregate)
+    return total
+
+
 def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
     """
-    Insert PendingExecution(lot=0.01, max_lot=0.01) when all mandate gates pass.
-    Returns the row id, or None if nothing was enqueued.
+    Insert PendingExecution with grade-based lot sizing (mandate revised
+    2026-08-11) when all mandate gates pass. Returns the row id, or None
+    if nothing was enqueued.
     """
     global _last_enqueue_fingerprint, _last_enqueue_at
 
@@ -939,10 +1212,54 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
         log.warning("[strategist_runner] enqueue refused: at position cap %d/%d", open_n, max_n)
         return None
 
-    # Hard mandate guards
-    if mt5_obj.get("lot") != 0.01:
-        log.error("[strategist_runner] refused to enqueue: lot != 0.01 (%s)", mt5_obj.get("lot"))
+    # ── Fixed 0.01 lot (mandate re-revised 2026-08-11 comprehensive brief) ──
+    grade = ((verdict.get("signal_grade") or {}).get("grade")) or "B"
+    lot = _lot_size_for_grade(grade)                # all grades → 0.01 now
+    ceiling = float(settings.mandate_lot_max_aggregate)   # 0.01
+
+    if lot > 0.01 + 1e-9 or lot > ceiling + 1e-9:
+        log.error("[strategist_runner] refused: lot %.4f > 0.01 mandate cap", lot)
         return None
+
+    # Aggregate exposure ceiling — sum of already-open positions + this new lot
+    current_exposure = _current_open_lot_exposure(db)
+    if current_exposure + lot > ceiling + 1e-9:
+        log.warning("[strategist_runner] enqueue refused: aggregate exposure "
+                    "would breach 0.01 ceiling (%.4f + %.4f > %.4f) — "
+                    "one position at a time",
+                    current_exposure, lot, ceiling)
+        return None
+
+    # ── HARD DEMO-ACCOUNT GUARD (mandate section 12) ────────────────────
+    # Absolutely refuse to enqueue if the daemon isn't on the sanctioned
+    # demo account. Fails safe: if we can't verify, refuse.
+    heartbeat = _last_bridge_heartbeat()
+    hb_login  = (heartbeat or {}).get("account_login")
+    hb_server = (heartbeat or {}).get("account_server") or ""
+    hb_symbol = (heartbeat or {}).get("symbol") or ""
+    demo_login  = int(getattr(settings, "mandate_demo_login", 435888680))
+    demo_srv    = str(getattr(settings, "mandate_demo_server_contains", "Trial"))
+    demo_symbol = str(getattr(settings, "mandate_demo_symbol", "XAUUSD"))
+
+    if hb_login is None:
+        log.error("[strategist_runner] REFUSED: no bridge heartbeat — "
+                    "cannot verify account is demo")
+        return None
+    if int(hb_login) != demo_login:
+        log.error("[strategist_runner] REFUSED: active login %s != sanctioned demo %s",
+                    hb_login, demo_login)
+        return None
+    if demo_srv.lower() not in hb_server.lower():
+        log.error("[strategist_runner] REFUSED: server %r lacks required substring %r",
+                    hb_server, demo_srv)
+        return None
+    if hb_symbol and hb_symbol.upper() != demo_symbol.upper():
+        log.error("[strategist_runner] REFUSED: symbol %r != sanctioned %r",
+                    hb_symbol, demo_symbol)
+        return None
+
+    # Live-execution safety gate — this must be explicitly False (upstream
+    # must set it; default True fails safe).
     if mt5_obj.get("live_execution_allowed", True):
         log.error("[strategist_runner] refused to enqueue: live_execution_allowed must be false")
         return None
@@ -972,9 +1289,11 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
             risk_pips=float(abs(mt5_obj["entry"] - mt5_obj["stop_loss"])),
             quality_score=int(verdict.get("setup_score") or 0),
             rr=float(mt5_obj["risk_reward"]),
-            max_lot=0.01,
+            lot_size=lot,          # grade-based (mandate revised 2026-08-11)
+            max_lot=ceiling,       # aggregate ceiling — daemon must respect
             reason=(
-                f"strategist mandate · {mt5_obj['conditions_passed']}/5 conditions"
+                f"strategist mandate · grade {grade} · lot {lot:.2f}"
+                f" · {mt5_obj['conditions_passed']}/5 conditions"
                 f" · est WR {verdict.get('estimated_win_rate_range')}"
             ),
             confirmations_json=json.dumps({
@@ -986,7 +1305,14 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
                 "market_state":          verdict.get("market_state"),
                 "liquidity_behaviour":   verdict.get("liquidity_behaviour"),
                 "tf_alignment":          verdict.get("tf_alignment_label"),
+                "signal_grade":          verdict.get("signal_grade"),
                 "mt5_execution_object":  mt5_obj,
+                "sizing":                {
+                    "grade":                 grade,
+                    "lot":                   lot,
+                    "aggregate_ceiling":     ceiling,
+                    "prior_open_exposure":   round(current_exposure, 4),
+                },
             }),
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
             status="PENDING",
@@ -997,8 +1323,11 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
         _last_enqueue_fingerprint = fp
         _last_enqueue_at          = time.time()
         log.info(
-            "[strategist_runner] ENQUEUED #%d %s xauusd lot=0.01 entry=%s SL=%s TP1=%s TP2=%s",
-            row.id, mt5_obj["action"], mt5_obj["entry"], mt5_obj["stop_loss"],
+            "[strategist_runner] ENQUEUED #%d %s xauusd grade=%s lot=%.2f "
+            "(exposure %.2f→%.2f/%.2f) entry=%s SL=%s TP1=%s TP2=%s",
+            row.id, mt5_obj["action"], grade, lot,
+            current_exposure, current_exposure + lot, ceiling,
+            mt5_obj["entry"], mt5_obj["stop_loss"],
             mt5_obj["take_profit_1"], mt5_obj["take_profit_2"],
         )
         return row.id

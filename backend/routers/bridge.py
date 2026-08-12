@@ -32,6 +32,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from config import settings
@@ -522,6 +523,128 @@ def bridge_status(
             "anyDaemonFresh": any(h["isFresh"] for h in heartbeats.values()),
             "anyAutoTradingEnabled": any_autotrading,
             "now": now.isoformat(),
+        },
+        source="mt5_bridge",
+    )
+
+
+# ── MT5 candle push (daemon → droplet) ──────────────────────────────────────
+#
+# The daemon on the operator's laptop calls mt5.copy_rates_from_pos() every
+# 30s and POSTs the batch here. Bars are upserted into historical_candles
+# with source='mt5'. This is the free-tier primary candle source, matching
+# the daemon-push architecture the tick pipeline already uses. Never trades.
+
+class MT5CandleRecord(BaseModel):
+    """Single OHLCV bar as reported by MT5. Timestamps must already be UTC."""
+    time:         str   = Field(..., description="ISO-8601 UTC")
+    open:         float
+    high:         float
+    low:          float
+    close:        float
+    tick_volume:  Optional[int]  = Field(default=0)
+    spread:       Optional[int]  = Field(default=None, description="MT5 raw spread, points")
+    real_volume:  Optional[int]  = Field(default=None)
+
+
+class MT5CandleBatch(BaseModel):
+    """Batch of bars for a single (symbol, timeframe) pushed by the daemon."""
+    symbol:     str  = Field(..., description="MT5 broker symbol (e.g. XAUUSD)")
+    timeframe:  str  = Field(..., description="M5 | M15 | H1 | H4 | D1")
+    count:      int
+    candles:    list[MT5CandleRecord]
+
+
+_MT5_ACCEPTED_TIMEFRAMES = {"M5", "M15", "H1", "H4", "D1"}
+_MT5_STORED_INSTRUMENT   = "XAU/USD"    # match historical_candles.instrument convention
+
+
+@router.post(
+    "/candles/receive",
+    response_model=APIResponse[dict],
+    summary="Receive OHLCV bars pushed by the local MT5 daemon (free-tier primary source)",
+)
+@limiter.limit("120/minute")
+def receive_mt5_candles(
+    request: Request,
+    batch: MT5CandleBatch,
+    bridge_daemon_id: str = Header(default="unknown", alias="X-Bridge-Daemon-Id"),
+    _: None = Depends(_require_bridge_secret),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Upsert a batch of MT5 candles into historical_candles. The daemon pushes
+    every 30s per timeframe. Bars are idempotent via the unique index on
+    (instrument, timeframe, candle_time) — duplicates are silently skipped.
+
+    Guardrails:
+      - Symbol MUST be XAUUSD (matches the demo mandate)
+      - Timeframe MUST be in {M5, M15, H1, H4, D1}
+      - Batch size capped at 500 bars (200 is the typical daemon payload)
+      - Timestamps MUST already be UTC when pushed
+    """
+    from db_models import HistoricalCandle
+
+    if (batch.symbol or "").upper() != "XAUUSD":
+        raise HTTPException(status_code=400,
+            detail=f"Symbol must be XAUUSD, got {batch.symbol!r}")
+    if batch.timeframe not in _MT5_ACCEPTED_TIMEFRAMES:
+        raise HTTPException(status_code=400,
+            detail=f"Timeframe must be one of {_MT5_ACCEPTED_TIMEFRAMES}, got {batch.timeframe!r}")
+    if len(batch.candles) > 500:
+        raise HTTPException(status_code=400,
+            detail=f"Batch too large ({len(batch.candles)} > 500)")
+
+    inserted = 0
+    duplicates = 0
+    errors = 0
+    latest_ts: Optional[datetime] = None
+
+    for c in batch.candles:
+        try:
+            ts = datetime.fromisoformat(c.time.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            row = HistoricalCandle(
+                instrument=_MT5_STORED_INSTRUMENT,
+                timeframe=batch.timeframe,
+                candle_time=ts,
+                open=float(c.open),
+                high=float(c.high),
+                low=float(c.low),
+                close=float(c.close),
+                volume=int(c.tick_volume or 0),
+                source="mt5",
+            )
+            db.add(row)
+            db.commit()
+            inserted += 1
+            if latest_ts is None or ts > latest_ts:
+                latest_ts = ts
+        except IntegrityError:
+            db.rollback()
+            duplicates += 1
+        except Exception as exc:
+            db.rollback()
+            errors += 1
+            if errors <= 3:
+                log.warning("[bridge/candles/receive] insert failed for %s %s @ %s: %s",
+                              batch.symbol, batch.timeframe, c.time, exc)
+
+    if inserted:
+        log.info("[bridge/candles/receive] %s %s [%s]: inserted=%d dup=%d errors=%d latest=%s",
+                    batch.symbol, batch.timeframe, bridge_daemon_id,
+                    inserted, duplicates, errors,
+                    latest_ts.isoformat() if latest_ts else None)
+
+    return APIResponse(
+        data={
+            "accepted":   inserted,
+            "duplicates": duplicates,
+            "errors":     errors,
+            "latest":     latest_ts.isoformat() if latest_ts else None,
+            "symbol":     batch.symbol,
+            "timeframe":  batch.timeframe,
         },
         source="mt5_bridge",
     )

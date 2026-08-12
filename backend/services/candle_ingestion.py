@@ -35,6 +35,18 @@ from sqlalchemy.orm import Session
 log = logging.getLogger(__name__)
 
 
+# Records the most recent ingestion error string so the freshness sentinel
+# can include a concrete root-cause hint in its Telegram alert (e.g.
+# "invalid or expired API key" vs "rate limit exceeded" vs "TV timeout").
+# Written on every failed fetch. Read only.
+_last_ingest_error: dict = {"at": None, "pair": None, "tf": None, "message": ""}
+
+
+def get_last_ingest_error() -> dict:
+    """Latest fetch failure across timeframes. Empty dict fields if none."""
+    return dict(_last_ingest_error)
+
+
 # Timeframes to keep topped up + max fetch per pull.
 # M5 added post-Pre-Phase-0 so directional intelligence has fresh execution
 # refinement data. TwelveData free tier: 8 req/min → 5 TFs/cycle fits easily.
@@ -67,6 +79,81 @@ def _fetch_twelvedata(pair: str, interval: str, lookback: int) -> list:
                                     symbol=sym).candles
 
 
+def _fetch_tradingview(pair: str, interval: str, lookback: int) -> list:
+    """Fetch via TradingView (free, unlimited). Returns [] on failure."""
+    from services.tradingview_provider import get_tv_candles
+    r = get_tv_candles(pair, timeframe=interval, limit=lookback)
+    return r or []
+
+
+def _fetch_yahoo(pair: str, interval: str, lookback: int) -> list:
+    """Fetch via Yahoo GC=F gold futures (free, unlimited). Returns [] on failure."""
+    from services.yahoo_provider import get_yahoo_candles
+    r = get_yahoo_candles(pair, timeframe=interval, limit=lookback)
+    return r or []
+
+
+# TV retry policy — the anonymous tvDatafeed session drops occasionally.
+# Retry with short backoffs before giving up and falling to Yahoo.
+_TV_RETRY_BACKOFFS_S: list[float] = [1.0, 3.0]
+
+
+def _fetch_with_fallback(pair: str, interval: str,
+                          lookback: int) -> tuple[list, str]:
+    """
+    Ingest fallback chain (per operator brief 2026-08-11):
+
+      1. TradingView OANDA:XAUUSD    (spot, retry on transient drops)
+      2. Yahoo GC=F                   (gold futures, ~$5-10 basis vs spot)
+
+    Note: MT5 bars arrive via a separate PUSH from the laptop daemon at
+    routers/bridge.py POST /candles/receive — they don't need to be pulled
+    here. When the daemon is running, MT5 bars land with source='mt5' and
+    win the freshness race naturally.
+
+    Raises RuntimeError only when BOTH providers are exhausted so the
+    freshness sentinel gets a clear error text.
+    """
+    from services.tradingview_provider import invalidate_cache as _tv_invalidate
+
+    last_exc: Optional[Exception] = None
+
+    # 1. TradingView with retries
+    for attempt, backoff in enumerate([0.0] + _TV_RETRY_BACKOFFS_S):
+        if backoff > 0:
+            time.sleep(backoff)
+            _tv_invalidate(pair)
+        try:
+            candles = _fetch_tradingview(pair, interval, lookback)
+            if candles:
+                return candles, "tradingview"
+            last_exc = RuntimeError(
+                f"TradingView empty for {pair} {interval} (attempt {attempt+1})"
+            )
+        except Exception as exc:
+            last_exc = exc
+            log.debug("[candle_ingestion] TV attempt %d for %s %s: %s",
+                        attempt + 1, pair, interval, exc)
+
+    # 2. Yahoo GC=F fallback (futures, not spot — flagged for downstream)
+    try:
+        candles = _fetch_yahoo(pair, interval, lookback)
+        if candles:
+            log.info("[candle_ingestion] %s %s: falling back to Yahoo GC=F "
+                     "(TV exhausted)", pair, interval)
+            return candles, "yahoo"
+    except Exception as exc:
+        last_exc = exc
+        log.debug("[candle_ingestion] Yahoo fallback for %s %s: %s",
+                    pair, interval, exc)
+
+    # Both providers exhausted — raise clean error text
+    raise RuntimeError(
+        f"All free-tier providers exhausted for {pair} {interval} "
+        f"(TV + Yahoo): {last_exc}"
+    )
+
+
 def _field(c, name, default=None):
     """
     Read a candle field safely across Pydantic models AND plain dicts.
@@ -83,7 +170,8 @@ def _field(c, name, default=None):
     return default if v is None else v
 
 
-def _persist(db: Session, pair: str, tf: str, candles: list) -> dict:
+def _persist(db: Session, pair: str, tf: str, candles: list,
+              source: str = "twelvedata") -> dict:
     """Insert candles idempotently. Returns per-timeframe counts (with errors!)."""
     from db_models import HistoricalCandle
     inserted, skipped, errors = 0, 0, 0
@@ -110,7 +198,7 @@ def _persist(db: Session, pair: str, tf: str, candles: list) -> dict:
                 low=float(_field(c, "low",  0.0)),
                 close=float(_field(c, "close", 0.0)),
                 volume=int(float(_field(c, "volume", 0)) or 0),
-                source="twelvedata",
+                source=source,
             )
             db.add(row)
             db.commit()
@@ -150,26 +238,33 @@ def top_up_recent(db: Session, pair: str = "xauusd",
         n = lookback_override or n_default
         t0 = time.time()
         try:
-            candles = _fetch_twelvedata(pair, tf, n)
+            candles, source = _fetch_with_fallback(pair, tf, n)
             if not candles:
                 report["timeframes"][tf] = {"error": "empty response"}
                 report["totals"]["errors"] += 1
                 continue
-            r = _persist(db, pair, tf, candles)
+            r = _persist(db, pair, tf, candles, source=source)
             r["fetched"] = len(candles)
+            r["source"] = source
             r["elapsed_s"] = round(time.time() - t0, 2)
             report["timeframes"][tf] = r
             report["totals"]["inserted"] += r["inserted"]
             report["totals"]["skipped"]  += r["skipped_duplicate"]
             report["totals"]["errors"]   += r.get("errors", 0)
             if r["inserted"] or r.get("errors", 0):
-                log.info("[candle_ingestion] %s %s: fetched=%d inserted=%d dup=%d errors=%d (%.2fs)",
-                          pair, tf, r["fetched"], r["inserted"],
+                log.info("[candle_ingestion] %s %s [%s]: fetched=%d inserted=%d dup=%d errors=%d (%.2fs)",
+                          pair, tf, source, r["fetched"], r["inserted"],
                           r["skipped_duplicate"], r.get("errors", 0), r["elapsed_s"])
         except Exception as exc:
             log.warning("[candle_ingestion] %s %s failed: %s", pair, tf, exc)
             report["timeframes"][tf] = {"error": str(exc)}
             report["totals"]["errors"] += 1
+            _last_ingest_error.update({
+                "at":      datetime.now(timezone.utc).isoformat(),
+                "pair":    pair,
+                "tf":      tf,
+                "message": str(exc)[:400],
+            })
 
     report["finished"] = datetime.now(timezone.utc).isoformat()
     return report

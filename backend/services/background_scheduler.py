@@ -501,7 +501,7 @@ def _run_candle_ingestion(only_tf: Optional[tuple] = None):
 
 # ── P131: data-freshness sentinel loop ──────────────────────────────────────
 
-_FRESHNESS_CHECK_INTERVAL_S = 1800    # 30 min
+_FRESHNESS_CHECK_INTERVAL_S = 600     # 10 min — faster detection of ingestion outages
 
 
 async def _data_freshness_loop():
@@ -572,6 +572,44 @@ def _run_vp_measurement():
         interesting = {k: v for k, v in r.items() if isinstance(v, int) and v > 0}
         if interesting:
             log.info("[vp_measurement] outcomes advanced: %s", interesting)
+
+
+# ── Shadow trade simulator outcome loop ────────────────────────────────────────
+#
+# Runs every N seconds (default 60) and walks every PENDING + TRIGGERED
+# shadow_trades row, advancing state against live M5 candles. Fully independent
+# of live execution — no orders, no alerts. Pure data pipeline.
+
+async def _shadow_trade_advance_loop():
+    from config import settings
+    interval = getattr(settings, "shadow_trade_advance_interval_s", 60)
+    log.info("[scheduler] shadow-trade advance loop started (every %ds)", interval)
+    await asyncio.sleep(30)  # let ingest + freshness boot first
+    while True:
+        try:
+            if getattr(settings, "shadow_trade_recording_enabled", True):
+                await asyncio.to_thread(_run_shadow_trade_advance)
+        except asyncio.CancelledError:
+            log.info("[scheduler] shadow-trade advance loop cancelled")
+            break
+        except Exception as exc:
+            log.warning("[scheduler] shadow-trade advance loop error: %s", exc)
+        await asyncio.sleep(interval)
+
+
+def _run_shadow_trade_advance():
+    from config import settings
+    from database import SessionLocal
+    from services.shadow_trade_simulator import advance_outcomes
+    with SessionLocal() as db:
+        r = advance_outcomes(
+            db,
+            expiry_hours=getattr(settings, "shadow_trade_expiry_hours", 12),
+        ) or {}
+        interesting = {k: v for k, v in r.items()
+                        if isinstance(v, int) and v > 0}
+        if interesting:
+            log.info("[shadow_trade] outcomes advanced: %s", interesting)
 
 
 # ── Phase 11: market-intelligence alert loop ──────────────────────────────
@@ -855,6 +893,7 @@ async def start_background_loops():
         asyncio.create_task(_data_freshness_loop(),        name="data_freshness_loop"),
         asyncio.create_task(_vp_trap_measurement_loop(),   name="vp_trap_measurement_loop"),
         asyncio.create_task(_market_intel_loop(),          name="market_intel_loop"),
+        asyncio.create_task(_shadow_trade_advance_loop(),  name="shadow_trade_advance_loop"),
     ]
 
     # Pick exactly ONE execution authority — never both, or they'll fight.

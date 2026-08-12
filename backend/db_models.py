@@ -807,6 +807,78 @@ class VpTrapMeasurementEvent(Base):
     notes_json     = Column(Text, nullable=True)
 
 
+class ShadowTrade(Base):
+    """
+    Shadow trade simulator ledger — one row per BUY/SELL verdict with a
+    complete trade plan (entry + SL + TP1 + TP2). Records ALL grades
+    (A+/A/B/C) so we can validate whether suppressed grades would have
+    underperformed.
+
+    Lifecycle:
+        PENDING → TRIGGERED → (TP1_HIT | TP2_HIT | STOPPED | EXPIRED)
+                              └→ INVALIDATED (if opposing move before trigger)
+
+    Never affects any live path. Never sends alerts. Pure data capture
+    for grade-rubric calibration and shadow-mode validation (Section 7 of
+    the strategy review).
+    """
+    __tablename__ = "shadow_trades"
+
+    id                    = Column(Integer, primary_key=True, autoincrement=True)
+    created_at            = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    updated_at            = Column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+
+    # Idempotency + attribution
+    fingerprint           = Column(String(48), nullable=False, index=True, unique=True)
+    verdict_id            = Column(Integer, nullable=True)          # optional FK to strategist_verdicts
+    instrument            = Column(String(16), default="XAU/USD", nullable=False, index=True)
+
+    # Grading context
+    grade                 = Column(String(16), nullable=False, index=True)   # A+ / A / B / C / STAND_ASIDE / INSUFFICIENT_DATA
+    grade_reason          = Column(String(255), nullable=True)
+    composite_score       = Column(Float, nullable=True)             # signal grading composite score if computed
+    archetype             = Column(String(48), nullable=True, index=True)   # e.g. "liquidity_sweep_reversal"
+    regime_at_entry       = Column(String(48), nullable=True, index=True)
+    session_at_entry      = Column(String(24), nullable=True, index=True)
+
+    # Setup context
+    direction             = Column(String(4),  nullable=False)       # BUY | SELL
+    setup_score           = Column(Integer,    nullable=True)
+    conditions_passed     = Column(Integer,    nullable=True)
+
+    # Trade plan
+    fired_at              = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    entry_price           = Column(Float, nullable=False)
+    stop_loss             = Column(Float, nullable=False)
+    tp1_price             = Column(Float, nullable=False)
+    tp2_price             = Column(Float, nullable=True)
+    tp3_price             = Column(Float, nullable=True)
+    invalidation_price    = Column(Float, nullable=True)
+    tp1_rr                = Column(Float, nullable=True)
+    tp2_rr                = Column(Float, nullable=True)
+
+    # Session-conditional slippage assumptions (applied to expectancy)
+    est_spread_pts        = Column(Float, nullable=True)
+    est_slippage_pts      = Column(Float, nullable=True)
+
+    # Outcome tracking
+    status                = Column(String(24), nullable=False, default="PENDING", index=True)
+    triggered_at          = Column(DateTime(timezone=True), nullable=True)
+    triggered_price       = Column(Float, nullable=True)
+    closed_at             = Column(DateTime(timezone=True), nullable=True)
+    closed_price          = Column(Float, nullable=True)
+
+    # Outcome metrics (populated once closed)
+    r_realized            = Column(Float, nullable=True)     # nominal R
+    r_spread_adjusted     = Column(Float, nullable=True)     # spread-adjusted R (what live P&L would show)
+    mfe_pts               = Column(Float, nullable=True)     # max favorable excursion
+    mae_pts               = Column(Float, nullable=True)     # max adverse excursion
+    duration_min          = Column(Float, nullable=True)
+
+    # Free-form metadata
+    notes_json            = Column(Text, nullable=True)
+
+
 class QualifyingExpansion(Base):
     """
     Phase 13 — one row per detected significant directional move. The

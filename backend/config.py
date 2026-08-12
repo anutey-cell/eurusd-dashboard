@@ -276,6 +276,42 @@ class Settings(BaseSettings):
     notification_shadow_mode:       bool = True    # canonical is dry-run parallel to legacy
     notification_mode:              str  = "standard"  # minimal | standard | detailed
 
+    # ── Signal grading (A+/A/B/C) — signal-only quality gate ─────────────────
+    # These control which alerts reach Telegram. NO EXECUTION IMPACT — the
+    # execution enqueue path is separately gated by allow_demo_trading (which
+    # is False in signals-only mode).
+    signal_min_score_a:      int   = 80      # score ≥ 80 → grade A eligible
+    signal_min_score_aplus:  int   = 90      # score ≥ 90 → grade A+ eligible
+    signal_min_rr_a:         float = 2.5     # RR ≥ 2.5   → grade A eligible
+    signal_min_rr_aplus:     float = 3.0     # RR ≥ 3.0   → grade A+ eligible
+    signal_watchlist_score:  int   = 70      # score 70-79 → grade B (watchlist)
+    signal_watchlist_alerts_enabled: bool = False   # False = never send B alerts
+
+    # ── Mandate lot sizing (RE-REVISED 2026-08-11 — 0.01 fixed on DEMO only) ──
+    # Comprehensive brief on 2026-08-11 (later same day) reverted the earlier
+    # grade-based 0.05-0.15 scheme back to fixed 0.01 for demo testing.
+    # Brief also added hard account/symbol guards enforced in strategist_runner.
+    mandate_lot_a_plus:            float = 0.01
+    mandate_lot_a:                 float = 0.01
+    mandate_lot_b:                 float = 0.01
+    mandate_lot_max_aggregate:     float = 0.01
+
+    # Demo-only account guard — hard-refuse enqueue if these don't match.
+    # ONLY these credentials are allowed to receive test orders.
+    mandate_demo_login:            int   = 435888680
+    mandate_demo_server_contains:  str   = "Trial"     # server must contain this substring
+    mandate_demo_symbol:           str   = "XAUUSD"
+
+    # ── Shadow trade simulator (data source for grader calibration) ──────────
+    # Records EVERY BUY/SELL verdict (all grades A+/A/B/C) with a complete
+    # trade plan into shadow_trades, then a background loop walks each row
+    # against live price and marks TRIGGERED / TP1_HIT / TP2_HIT / STOPPED /
+    # INVALIDATED / EXPIRED. Pure data capture — NEVER executes, NEVER alerts.
+    # Query via /api/v1/diagnostics/shadow-trade-stats?days=30.
+    shadow_trade_recording_enabled:   bool = True
+    shadow_trade_advance_interval_s:  int  = 60
+    shadow_trade_expiry_hours:        int  = 12
+
     # ── Phase 2: Canonical market data service ────────────────────────────────
     # Single source of truth for every strategy: bid/ask/spread/candles/session/
     # levels/data_quality. Ships behind a flag so we can shadow-verify via

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
@@ -1374,5 +1375,267 @@ def four_hour_manipulation(request: Request,
             candles_m5=None,
             atr_h1=0.0,
         ),
+        source="diagnostics",
+    )
+
+
+@router.get(
+    "/shadow-trade-stats",
+    response_model=APIResponse[dict],
+    summary="Shadow trade simulator — outcome stats bucketed by grade × archetype × regime × session",
+)
+@limiter.limit("30/minute")
+def shadow_trade_stats(
+    request: Request,
+    days: int = Query(default=30, ge=1, le=180),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Reports resolved shadow trades over the last `days` days:
+      - overall count + mean R (nominal + spread-adjusted)
+      - per-bucket (grade, archetype, regime, session) stats
+      - hit rate + sample size + meets-min-sample flag (>=20 for calibration)
+
+    Data source for grader recalibration — was A+ actually better than A?
+    Did suppressed B/C setups outperform? Feed into config lookup once buckets
+    reach 20+ samples.
+    """
+    from services.shadow_trade_simulator import compute_bucket_stats
+    return APIResponse(
+        data=compute_bucket_stats(db, days=days),
+        source="diagnostics",
+    )
+
+
+@router.get(
+    "/shadow-trade-recent",
+    response_model=APIResponse[dict],
+    summary="Recent shadow trades (all grades, PENDING/TRIGGERED/CLOSED)",
+)
+@limiter.limit("30/minute")
+def shadow_trade_recent(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=500),
+    status: str | None = Query(default=None,
+        description="Filter: PENDING | TRIGGERED | TP1_HIT | TP2_HIT | STOPPED | INVALIDATED | EXPIRED"),
+    grade: str | None = Query(default=None,
+        description="Filter: A+ | A | B | C | UNGRADED"),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """Recent shadow-trade rows for quick inspection of what the simulator is capturing."""
+    from sqlalchemy import text
+    where = ["instrument = :inst"]
+    params: dict = {"inst": "XAU/USD", "lim": limit}
+    if status:
+        where.append("status = :st")
+        params["st"] = status
+    if grade:
+        where.append("grade = :gr")
+        params["gr"] = grade
+    sql = (
+        "SELECT id, created_at, fingerprint, grade, direction, "
+        "session_at_entry, regime_at_entry, archetype, "
+        "entry_price, stop_loss, tp1_price, tp2_price, "
+        "tp1_rr, tp2_rr, composite_score, setup_score, conditions_passed, "
+        "status, triggered_at, closed_at, closed_price, "
+        "r_realized, r_spread_adjusted, mfe_pts, mae_pts, duration_min, "
+        "est_spread_pts, est_slippage_pts "
+        "FROM shadow_trades WHERE " + " AND ".join(where) +
+        " ORDER BY created_at DESC LIMIT :lim"
+    )
+    try:
+        rows = db.execute(text(sql), params).fetchall()
+    except Exception as exc:
+        return APIResponse(data={"error": str(exc), "rows": []}, source="diagnostics")
+
+    cols = ["id", "created_at", "fingerprint", "grade", "direction",
+            "session_at_entry", "regime_at_entry", "archetype",
+            "entry_price", "stop_loss", "tp1_price", "tp2_price",
+            "tp1_rr", "tp2_rr", "composite_score", "setup_score",
+            "conditions_passed", "status", "triggered_at", "closed_at",
+            "closed_price", "r_realized", "r_spread_adjusted", "mfe_pts",
+            "mae_pts", "duration_min", "est_spread_pts", "est_slippage_pts"]
+    out = [dict(zip(cols, r)) for r in rows]
+    return APIResponse(
+        data={"count": len(out), "rows": out},
+        source="diagnostics",
+    )
+
+
+@router.get(
+    "/provider-health",
+    response_model=APIResponse[dict],
+    summary="Per-timeframe candle provider health + freshness + signal-blocked state",
+)
+@limiter.limit("30/minute")
+def provider_health(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    """
+    Comprehensive provider-health report per brief section 7:
+      - active candle provider per timeframe (source of latest bar)
+      - latest candle timestamp per timeframe
+      - candle age per timeframe (minutes)
+      - status vs freshness threshold (fresh | degraded | stale | missing)
+      - last provider error text
+      - flags: TV in use, TD failure, synthetic used, MT5 tick available
+      - current bid/ask/spread
+      - data-quality score (0-100)
+      - signals-allowed vs blocked-due-to-data
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from sqlalchemy import text
+    from services.data_freshness import STALENESS_MIN_BY_TF, data_quality_score
+    from services.candle_ingestion import get_last_ingest_error
+    from config import settings
+
+    now = _dt.now(_tz.utc)
+    now_naive = now.replace(tzinfo=None)
+
+    # Per-timeframe latest bar + source
+    tfs = ["M5", "M15", "H1", "H4", "D1"]
+    per_tf: dict[str, dict] = {}
+    tv_in_use = False
+    synthetic_used = False
+    mt5_bars_present = False
+    yahoo_used = False
+    td_used = False
+    latest_by_source: dict[str, str] = {}
+
+    for tf in tfs:
+        row = db.execute(text(
+            "SELECT candle_time, source FROM historical_candles "
+            "WHERE instrument=:i AND timeframe=:tf "
+            "ORDER BY candle_time DESC LIMIT 1"
+        ), {"i": "XAU/USD", "tf": tf}).fetchone()
+        threshold = STALENESS_MIN_BY_TF.get(tf, 60)
+        if not row or not row[0]:
+            per_tf[tf] = {
+                "provider":       None,
+                "latest":         None,
+                "age_min":        None,
+                "threshold_min":  threshold,
+                "status":         "missing",
+            }
+            continue
+        latest = row[0]
+        source = row[1]
+
+        # SQLite may return candle_time as str; normalise to naive UTC datetime
+        if isinstance(latest, str):
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    latest = _dt.strptime(latest.split("+")[0], fmt); break
+                except ValueError:
+                    continue
+        if hasattr(latest, "tzinfo") and latest.tzinfo is not None:
+            latest = latest.astimezone(_tz.utc).replace(tzinfo=None)
+
+        try:
+            age_min = (now_naive - latest).total_seconds() / 60
+        except Exception:
+            age_min = None
+
+        if age_min is None:
+            status = "missing"
+        elif age_min <= threshold:
+            status = "fresh"
+        elif age_min <= 3 * threshold:
+            status = "degraded"
+        else:
+            status = "stale"
+
+        per_tf[tf] = {
+            "provider":       source,
+            "latest":         latest.isoformat() if hasattr(latest, "isoformat") else str(latest),
+            "age_min":        round(age_min, 1) if age_min is not None else None,
+            "threshold_min":  threshold,
+            "status":         status,
+        }
+        # Track which providers are actively serving fresh/degraded bars
+        latest_by_source[source or "unknown"] = per_tf[tf]["latest"]
+        if source == "tradingview" and status in ("fresh", "degraded"):
+            tv_in_use = True
+        if source == "mt5" and status in ("fresh", "degraded"):
+            mt5_bars_present = True
+        if source == "yahoo" and status in ("fresh", "degraded"):
+            yahoo_used = True
+        if source == "twelvedata" and status in ("fresh", "degraded"):
+            td_used = True
+        if source == "synthetic" and status in ("fresh", "degraded"):
+            synthetic_used = True
+
+    quality = data_quality_score(per_tf)
+
+    # MT5 tick availability (from bridge heartbeat) + current bid/ask/spread
+    tick_available = False
+    tick_data: Optional[dict] = None
+    try:
+        from routers.bridge import _MT5_TERMINAL_STATE
+        if _MT5_TERMINAL_STATE:
+            latest_hb = max(_MT5_TERMINAL_STATE.values(),
+                              key=lambda s: s.get("last_seen") or _dt.min.replace(tzinfo=_tz.utc))
+            last_seen = latest_hb.get("last_seen")
+            if last_seen and (now - last_seen).total_seconds() < 120:
+                tick_available = True
+                tick_data = {
+                    "account_login":     latest_hb.get("account_login"),
+                    "account_server":    latest_hb.get("account_server"),
+                    "account_demo":      latest_hb.get("account_demo"),
+                    "connected":         latest_hb.get("connected"),
+                    "trade_allowed":     latest_hb.get("trade_allowed"),
+                    "last_seen":         last_seen.isoformat(),
+                    "seconds_ago":       round((now - last_seen).total_seconds(), 1),
+                }
+    except Exception:
+        pass
+
+    # Try to fetch current bid/ask/spread from mt5_provider (in-container mt5
+    # module won't work on Linux — this returns nothing on droplet, but the
+    # heartbeat gives us the bridge-side snapshot)
+    bid_ask_spread: Optional[dict] = None
+    try:
+        from services.mt5_provider import get_tick
+        bid_ask_spread = get_tick("xauusd")
+    except Exception:
+        pass  # expected on droplet (no local MT5 install)
+
+    last_err = get_last_ingest_error() or {}
+
+    # Decide whether signals are allowed based on primary-TF freshness
+    stale_primary = [tf for tf in ("M5", "M15") if per_tf[tf]["status"] in ("stale", "missing")]
+    signals_allowed = not stale_primary and quality >= 60 and not synthetic_used
+
+    return APIResponse(
+        data={
+            "now":                  now.isoformat(),
+            "per_timeframe":        per_tf,
+            "data_quality_score":   quality,
+            "signals_allowed":      signals_allowed,
+            "blocked_reason":       (
+                f"stale primary TFs: {stale_primary}"          if stale_primary
+                else "synthetic candles present"                if synthetic_used
+                else f"quality score {quality}<60"              if quality < 60
+                else None
+            ),
+            "flags": {
+                "tradingview_in_use":    tv_in_use,
+                "twelvedata_in_use":     td_used,
+                "yahoo_in_use":          yahoo_used,
+                "mt5_bars_present":      mt5_bars_present,
+                "synthetic_used":        synthetic_used,
+                "mt5_tick_available":    tick_available,
+                "tradingview_enabled_setting": getattr(settings, "tradingview_enabled", None),
+            },
+            "mt5_tick":             tick_data,
+            "current_bid_ask":      bid_ask_spread,
+            "last_ingest_error":    last_err,
+            "provider_priority": [
+                "mt5 (via daemon push)",
+                "tradingview (OANDA:XAUUSD)",
+                "yahoo (GC=F futures)",
+            ],
+        },
         source="diagnostics",
     )

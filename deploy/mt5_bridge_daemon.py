@@ -52,6 +52,11 @@ import sys
 import threading
 import time
 import uuid
+from pathlib import Path
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env.bridge", override=True)
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -719,11 +724,87 @@ def reconcile_orphaned_trades() -> None:
             log.warning("reconcile: report_closed for ticket %s failed: %s", ticket, exc)
 
 
+# ── MT5 candle push (daemon → droplet) ───────────────────────────────────────
+#
+# Every CANDLE_PUSH_SEC (default 30s) we call mt5.copy_rates_from_pos() for
+# each timeframe and POST the batch to the droplet at /candles/receive.
+# This makes MT5 the free-tier PRIMARY candle source (not TradingView).
+# Read-only — no trade capability. Runs alongside the pending-order poller.
+
+MT5_SYMBOL       = env("MT5_SYMBOL", "XAUUSD")
+CANDLE_PUSH_SEC  = int(env("CANDLE_PUSH_SEC", "30"))
+CANDLE_LOOKBACK  = int(env("CANDLE_LOOKBACK", "200"))
+
+# MT5 timeframe constants — map string labels to mt5 module attributes
+_MT5_TF_MAP: dict[str, int] = {}
+def _build_tf_map():
+    """Lazily build the MT5 timeframe map after mt5 module imports."""
+    global _MT5_TF_MAP
+    if _MT5_TF_MAP:
+        return
+    try:
+        _MT5_TF_MAP = {
+            "M5":  mt5.TIMEFRAME_M5,
+            "M15": mt5.TIMEFRAME_M15,
+            "H1":  mt5.TIMEFRAME_H1,
+            "H4":  mt5.TIMEFRAME_H4,
+            "D1":  mt5.TIMEFRAME_D1,
+        }
+    except Exception as exc:
+        log.warning("Failed to build MT5 timeframe map: %s", exc)
+
+
+def push_candles() -> None:
+    """
+    Fetch and POST OHLCV batches for M5/M15/H1/H4/D1 to the droplet.
+    Timestamps are converted to UTC before posting so the backend can trust them.
+    Fails silent — one TF failing doesn't stop the others.
+    """
+    _build_tf_map()
+    if not _MT5_TF_MAP:
+        return
+    from datetime import timezone as _tz
+    for tf_str, tf_int in _MT5_TF_MAP.items():
+        try:
+            rates = mt5.copy_rates_from_pos(MT5_SYMBOL, tf_int, 0, CANDLE_LOOKBACK)
+            if rates is None or len(rates) == 0:
+                log.debug("push_candles %s %s: no rates", MT5_SYMBOL, tf_str)
+                continue
+            payload_candles = []
+            for r in rates:
+                # r is a numpy structured array row: time,open,high,low,close,tick_volume,spread,real_volume
+                ts_epoch = int(r["time"])
+                ts_iso = datetime.fromtimestamp(ts_epoch, tz=_tz.utc).isoformat()
+                payload_candles.append({
+                    "time":         ts_iso,
+                    "open":         float(r["open"]),
+                    "high":         float(r["high"]),
+                    "low":          float(r["low"]),
+                    "close":        float(r["close"]),
+                    "tick_volume":  int(r["tick_volume"]),
+                    "spread":       int(r["spread"]) if "spread" in r.dtype.names else None,
+                    "real_volume":  int(r["real_volume"]) if "real_volume" in r.dtype.names else None,
+                })
+            body = {
+                "symbol":     MT5_SYMBOL,
+                "timeframe":  tf_str,
+                "count":      len(payload_candles),
+                "candles":    payload_candles,
+            }
+            r = session.post(api("/candles/receive"), json=body, timeout=15)
+            if not r.ok:
+                log.warning("push_candles %s: HTTP %s %s",
+                              tf_str, r.status_code, (r.text or "")[:120])
+        except Exception as exc:
+            log.warning("push_candles %s failed: %s", tf_str, exc)
+
+
 def main():
     log.info("MT5 Bridge Daemon starting")
     log.info("Daemon ID: %s", DAEMON_ID)
     log.info("Dashboard: %s", DASHBOARD_URL)
-    log.info("Poll interval: %ds  ·  Heartbeat: %ds", POLL_SEC, HEARTBEAT_SEC)
+    log.info("Poll interval: %ds  ·  Heartbeat: %ds  ·  Candle push: %ds",
+             POLL_SEC, HEARTBEAT_SEC, CANDLE_PUSH_SEC)
 
     if not mt5_init():
         log.error("Fatal: MT5 connect failed. Exiting.")
@@ -735,6 +816,7 @@ def main():
     reconcile_orphaned_trades()
 
     last_heartbeat = 0
+    last_candle_push = 0
     try:
         while _running:
             now = time.time()
@@ -743,6 +825,11 @@ def main():
             if now - last_heartbeat >= HEARTBEAT_SEC:
                 heartbeat()
                 last_heartbeat = now
+
+            # Periodic candle push — feeds droplet historical_candles from MT5
+            if now - last_candle_push >= CANDLE_PUSH_SEC:
+                push_candles()
+                last_candle_push = now
 
             # Periodic reconcile sweep (every 15 min) — catches orphans
             # that monitor threads dropped mid-run.
