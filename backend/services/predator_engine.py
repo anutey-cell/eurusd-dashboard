@@ -197,6 +197,10 @@ def detect_asian_breakdown(bars: list[tuple],
     #1 edge — Asian Range Breakdown SELL.
     Fires when the just-closed M15 bar breached below asian_low by ≥ 2pt AND
     volume surge OR RSI H1 leaning weak.
+
+    TPs revised 2026-08-12 from Phase 5 exit sweep:
+      TP1 = 30pt  (empirical PF=2.12, WR=52%, expct=+8.16 — best cell)
+      TP2 = 50pt  (was 90pt; 90pt drops PF to 1.15 — dangerous)
     """
     if len(bars) < 20: return None
     a_high, a_low = _asian_range(bars)
@@ -211,8 +215,8 @@ def detect_asian_breakdown(bars: list[tuple],
 
     entry = c
     stop  = round(a_low + 5.0, 2)
-    tp1   = round(entry - 50.0, 2)
-    tp2   = round(entry - 90.0, 2)
+    tp1   = round(entry - 30.0, 2)   # empirically optimal (was 50)
+    tp2   = round(entry - 50.0, 2)   # empirically safe (was 90 — negative expct)
     sl_pts = abs(stop - entry)
     rr = round(abs(tp1 - entry) / max(sl_pts, 0.1), 2)
 
@@ -264,8 +268,11 @@ def detect_pdl_break(bars: list[tuple],
 
     entry = c
     stop  = round(prev_l + 5.0, 2)
-    tp1   = round(entry - 50.0, 2)
-    tp2   = round(entry - 90.0, 2)
+    # TPs revised 2026-08-12 (Phase 5 exit sweep):
+    #   TP1 = 40pt  (best PF+expct, WR=51%, PF=1.80)
+    #   TP2 = 60pt  (was 90pt; 90pt turns expectancy NEGATIVE)
+    tp1   = round(entry - 40.0, 2)
+    tp2   = round(entry - 60.0, 2)
     sl_pts = abs(stop - entry)
     rr = round(abs(tp1 - entry) / max(sl_pts, 0.1), 2)
 
@@ -338,10 +345,39 @@ def detect_vol_continuation(bars: list[tuple],
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate(db: Session) -> list[PredatorSignal]:
-    """Run all detectors on the freshest M15 bar. Returns 0..N signals."""
-    bars = _load_recent_m15(db, n=250)
-    if len(bars) < 50:
+    """
+    Run all SELL detectors on the freshest M15 bar. Returns 0..N signals.
+
+    ENGINE MODE: SELL-PREDATOR / BUY-OBSERVATION
+      This engine only fires SELL signals — no BUY archetype survived
+      walk-forward validation on 5 months of XAU/USD M15 data. Any BUY
+      opportunity is currently observation-only.
+
+    REGIME GATE:
+      Signals suppress unless (direction_regime × vol_regime) has empirical
+      lift in the Phase 3 audit matrix. Bullish regimes = no signals.
+    """
+    bars = _load_recent_m15(db, n=300)   # need 300 for regime classifier
+    if len(bars) < 60:
         log.debug("[predator] insufficient bars (%d)", len(bars))
+        return []
+
+    # ── Regime gate ──────────────────────────────────────────────────
+    try:
+        from services.regime_detector import (
+            classify_current_regime, is_predator_favorable_regime,
+            regime_confidence_multiplier,
+        )
+        regime = classify_current_regime(db)
+        allowed, reason = is_predator_favorable_regime(regime)
+        if not allowed:
+            log.debug("[predator] suppressed by regime gate: %s", reason)
+            return []
+        regime_mult = regime_confidence_multiplier(
+            regime.get("direction"), regime.get("volatility")
+        )
+    except Exception as exc:
+        log.warning("[predator] regime gate errored — suppressing signals: %s", exc)
         return []
 
     rsi_h1 = _last_h1_rsi(db)
@@ -349,7 +385,7 @@ def evaluate(db: Session) -> list[PredatorSignal]:
 
     signals: list[PredatorSignal] = []
 
-    # Primary detectors
+    # Primary detectors (SELL only — no BUY archetype validated)
     s1 = detect_asian_breakdown(bars, rsi_h1=rsi_h1, vol_r=vol_r)
     if s1: signals.append(s1)
     s2 = detect_pdl_break(bars, vol_r=vol_r)
@@ -359,19 +395,32 @@ def evaluate(db: Session) -> list[PredatorSignal]:
     s3 = detect_vol_continuation(bars, vol_r=vol_r, other_signals=signals)
     if s3: signals.append(s3)
 
+    # Downgrade confidence for less-favorable regime cells (0.5-0.8 multiplier)
+    if regime_mult < 1.0 and signals:
+        for sig in signals:
+            if sig.confidence == "HIGH" and regime_mult < 0.8:
+                sig.confidence = "MED"
+            elif sig.confidence == "MED" and regime_mult < 0.6:
+                sig.confidence = "LOW"
+
     return signals
 
 
-def format_telegram_alert(sig: PredatorSignal) -> str:
+def format_telegram_alert(sig: PredatorSignal, regime: Optional[dict] = None) -> str:
     """Distinct message format so operator can see this is a Predator signal."""
-    return "\n".join([
-        f"🐺 PREDATOR SIGNAL — {sig.archetype}  [{sig.confidence}]",
+    lines = [
+        f"🐺 PREDATOR — {sig.archetype}  [{sig.confidence}]",
+        f"MODE: SELL-PREDATOR / BUY-OBSERVATION",
         f"XAU/USD  ·  {sig.direction}",
+    ]
+    if regime:
+        lines.append(f"Regime: {regime.get('direction')} × {regime.get('volatility')} × {regime.get('session')}")
+    lines += [
         "",
         f"Entry:  {sig.entry:.2f}",
         f"Stop:   {sig.stop_loss:.2f}  (risk {abs(sig.entry - sig.stop_loss):.1f} pts)",
-        f"TP1:    {sig.tp1:.2f}  (reward {abs(sig.tp1 - sig.entry):.1f} pts)",
-        f"TP2:    {sig.tp2:.2f}",
+        f"TP1:    {sig.tp1:.2f}  (empirical optimum for archetype)",
+        f"TP2:    {sig.tp2:.2f}  (empirically safe stretch)",
         f"RR:     1:{sig.rr}",
         f"Session: {sig.session}  ·  bar {sig.bar_time[:16]}",
         "",
@@ -379,9 +428,10 @@ def format_telegram_alert(sig: PredatorSignal) -> str:
         f"Counterparty:  {sig.counterparty}",
         f"Trigger:  {sig.trigger}",
         "",
-        "Source: empirical edge (walk-forward validated)",
-        "This is a Predator signal — separate from the mandate strategist.",
-    ])
+        "Source: outcome-first empirical edge · regime-gated · walk-forward validated",
+        "SELL-only engine — no BUY archetype survived 5-month audit.",
+    ]
+    return "\n".join(lines)
 
 
 __all__ = [

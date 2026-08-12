@@ -302,6 +302,17 @@ class Settings(BaseSettings):
     mandate_demo_server_contains:  str   = "Trial"     # server must contain this substring
     mandate_demo_symbol:           str   = "XAUUSD"
 
+    # ── Legacy mandate gates — DISABLED per Phase 9 empirical audit 2026-08-12
+    # Each of these gates removed net POSITIVE expectancy from predator signals:
+    #   killzone_gate       blocked +11,243 pts of profit (368 wins, 581 losses)
+    #   extended_ema20_gate blocked +12,903 pts of profit (508 wins, 808 losses)
+    #   atr_high_gate       blocked  +9,418 pts of profit (410 wins, 544 losses)
+    # Kept as feature flags so we can re-enable individually if a regime shift
+    # makes them useful again. Set True to restore the old suppressive behavior.
+    mandate_killzone_gate_enabled:        bool = False
+    mandate_extended_ema20_gate_enabled:  bool = False
+    mandate_atr_high_gate_enabled:        bool = False
+
     # ── Predator engine — outcome-first empirical signals (2026-08-12) ────────
     # Runs in parallel with the mandate strategist. Emits distinct alerts for
     # walk-forward-validated edges: ASIAN_BREAKDOWN, PDL_BREAK, VOL_CONTINUATION.

@@ -443,19 +443,28 @@ def _evaluate_5_conditions(
 
     # C2: Empirical (killzone × direction) edge filter
     # ────────────────────────────────────────────────
-    # Replaces the legacy "model_letter in A/B/C/D" check which in the
-    # 893-trade backtest had ZERO predictive value (5/5 and 4/5 produced
-    # identical WR because model_confirmed never differentiates winners
-    # from losers in this engine's structure).
-    #
-    # The new C2 asks: in this specific killzone, has this direction
-    # produced positive expectancy historically? That's the question that
-    # actually matters for whether the next firing is likely to print
-    # green. ALLOW or EXPLORE pass; BLOCK fails.
-    #
-    # Fallback: if kz_policy is None (no current killzone or upstream
-    # failure), keep the legacy model-letter check so we don't go dark.
-    if kz_policy is not None:
+    # DISABLED per Phase 9 predator audit 2026-08-12 — the killzone gate
+    # blocked +11,243 pts of net-positive expectancy across 949 signals
+    # (368 wins + 581 losses blocked, avg +11.85 pts each). Kept as a
+    # settings flag so we can re-enable if a regime shift makes the gate
+    # useful again. When disabled, C2 always passes and the kz_policy is
+    # logged for observability only.
+    try:
+        from config import settings as _s
+        _c2_active = bool(getattr(_s, "mandate_killzone_gate_enabled", False))
+    except Exception:
+        _c2_active = False
+
+    if not _c2_active:
+        c2_ok = True
+        if kz_policy is not None:
+            c2_detail = (
+                f"[C2 DISABLED — audit] observed kz-policy {kz_policy.decision} "
+                f"· {kz_policy.killzone} {kz_policy.direction} · n={kz_policy.sample_size}"
+            )
+        else:
+            c2_detail = "[C2 DISABLED — audit] no kz_policy in scope"
+    elif kz_policy is not None:
         c2_ok = kz_policy.decision in ("ALLOW", "EXPLORE")
         c2_detail = (
             f"kz-policy {kz_policy.decision} · {kz_policy.killzone} "
