@@ -1,42 +1,44 @@
 """
-Predator Engine — outcome-first XAU/USD signals from empirical edge discovery.
-=============================================================================
+Predator Engine v2 — outcome-first XAU/USD signals with M5-close detection.
+==========================================================================
 
-Ships the three walk-forward-validated edges from `scripts/edge_discovery.py`
-as first-class signals. Runs in parallel with the mandate strategist so we can
-A/B compare live. Every fire records to shadow_trades for outcome tracking.
+Empirically-driven changes 2026-08-12 (backend/scripts/predator_latency_audit.py):
 
-Archetypes (ranked by validated expectancy):
+  1. M5-CLOSE DETECTION (was M15-close). Restores ~87-99% of theoretical
+     expectancy that M15-confirmation destroys. Evidence:
+       ASIAN_BREAKDOWN  expct +2.38 → +12.98 pt/trade  (M15 → M5)
+       PDL_BREAK        expct +20.59 → +26.35 pt/trade
 
-  1. ASIAN_BREAKDOWN     — SELL when M15 closes below Asian-session low
-                           (test_lift 1.62, +9.24pt expectancy)
-     Counterparty: Overnight buyers whose stops sit below Asian range;
-                   Asian-session range traders.
+  2. EXTENSION FILTER. Reject when too much of the move is already gone:
+       ASIAN: pct_consumed > 30%   (OPTIMAL bucket is -4.77 expct — DELETE)
+       PDL:   pct_consumed > 60%   (LATE bucket is -28.35 expct)
 
-  2. PDL_BREAK           — SELL when M15 closes below prev-day low w/ acceptance
-                           (test_lift 1.33, +11.49pt expectancy)
-     Counterparty: Yesterday's dip-buyers; retail "prev-low = support" holders.
+  3. ASIAN TPs 20/40 (was 30/50). Median remaining move is 27pt so 30pt TP1
+     only hit 47.7%. 20pt hits 60.8%. PDL TPs unchanged (40/60 still valid).
 
-  3. VOL_CONTINUATION    — Direction-follow when volume > 1.3x 50-bar mean +
-                           confluent level break (test_lift 1.42, +8.93pt)
-     Counterparty: Fade traders; mean-reversion algos.
+  4. STATE MACHINE. Signal carries state = OBSERVE | ARMED | FIRE. ARMED
+     emitted when price approaches level (pre-signal awareness). FIRE emitted
+     only when M5 close breaches level + confluence + extension filter passes.
+
+Archetypes (SELL only — no BUY edge validated on 5-month audit):
+
+  ASIAN_BREAKDOWN  — SELL when M5 closes below Asian-session low
+                     Prey: overnight buyers, range-bound stops below asian_low
+  PDL_BREAK        — SELL when M5 closes below prev-day low (with acceptance)
+                     Prey: yesterday's dip-buyers, retail "PDL = support" holders
+  VOL_CONTINUATION — Direction-follow when volume >=1.3x mean + confluent primary
+                     Prey: fade traders, mean-reversion algos
 
 Safety:
-  - Never places orders. Emits signals only (recorded to shadow_trades).
-  - Telegram gated by settings.predator_telegram_enabled (default False).
-  - Dedupe per (archetype, direction, entry-bucket, hour) so max 1 signal
-    per pattern per hour per 5pt price bucket.
-  - Requires data-freshness sentinel passing before evaluating.
-
-Usage:
-  from services.predator_engine import evaluate
-  signals = evaluate(db)     # list[PredatorSignal]
+  - Never places orders. Signals only, recorded to shadow_trades.
+  - Regime-gated (services.regime_detector) — bullish regimes = no signals.
+  - Telegram gated by predator_telegram_enabled (default False).
+  - Fingerprint dedupe per M5 bar per level bucket.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
-import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -47,26 +49,44 @@ from sqlalchemy.orm import Session
 log = logging.getLogger(__name__)
 
 
+# Empirical median remaining move from audit — used by extension filter to
+# normalise pct_consumed calculation.
+_EXPECTED_TOTAL_MOVE_PTS: dict[str, float] = {
+    "ASIAN_BREAKDOWN": 40.0,   # median remaining 27.1pt + median lost 10.7pt ≈ 38pt total, rounded 40
+    "PDL_BREAK":        75.0,   # median remaining 54.9pt + median lost 16.8pt ≈ 72pt total, rounded 75
+}
+
+# Per-archetype extension filter thresholds (fraction of expected total move)
+_EXTENSION_LIMIT: dict[str, float] = {
+    "ASIAN_BREAKDOWN": 0.30,   # Phase 7 audit: OPTIMAL (30-60%) is -4.77 expct
+    "PDL_BREAK":        0.60,   # Phase 7 audit: LATE (60-100%) is -28.35 expct
+}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Signal dataclass
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class PredatorSignal:
-    archetype:    str      # ASIAN_BREAKDOWN | PDL_BREAK | VOL_CONTINUATION
-    direction:    str      # BUY | SELL
-    entry:        float
-    stop_loss:    float
-    tp1:          float
-    tp2:          float
-    rr:           float
-    thesis:       str      # WHY (counterparty)
-    trigger:      str      # WHEN (this bar's condition)
-    confidence:   str      # HIGH | MED | LOW
-    counterparty: str
-    session:      str
-    bar_time:     str      # ISO
-    fingerprint:  str      # (archetype, direction, entry_5pt_bucket, hour)
+    archetype:      str
+    direction:      str
+    state:          str          # OBSERVE | ARMED | FIRE
+    entry:          float
+    stop_loss:      float
+    tp1:            float
+    tp2:            float
+    rr:             float
+    thesis:         str
+    trigger:        str
+    confidence:     str          # HIGH | MED | LOW
+    counterparty:   str
+    session:        str
+    bar_time:       str          # ISO of the M5 bar that fired
+    fingerprint:    str
+    pct_consumed:   Optional[float] = None    # 0.0–1.0
+    latency_pts:    Optional[float] = None
+    m5_used:        bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -76,31 +96,31 @@ class PredatorSignal:
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_recent_m15(db: Session, n: int = 250) -> list[tuple]:
-    """Return the most-recent n M15 bars oldest-first as (t, o, h, l, c, v)."""
+def _parse_ts(t):
+    if isinstance(t, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try: return datetime.strptime(t.split("+")[0], fmt)
+            except ValueError: continue
+    return t
+
+
+def _load_recent(db: Session, tf: str, n: int) -> list[tuple]:
     rows = db.execute(text(
         "SELECT candle_time, open, high, low, close, volume "
-        "FROM historical_candles "
-        "WHERE instrument='XAU/USD' AND timeframe='M15' "
+        "FROM historical_candles WHERE instrument='XAU/USD' AND timeframe=:tf "
         "ORDER BY candle_time DESC LIMIT :n"
-    ), {"n": n}).fetchall()
+    ), {"tf": tf, "n": n}).fetchall()
     out = []
     for r in rows:
-        t = r[0]
-        if isinstance(t, str):
-            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    t = datetime.strptime(t.split("+")[0], fmt); break
-                except ValueError:
-                    continue
+        t = _parse_ts(r[0])
         if hasattr(t, "tzinfo") and t.tzinfo is not None:
             t = t.replace(tzinfo=None)
-        out.append((t, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5] or 0)))
+        out.append((t, float(r[1]), float(r[2]), float(r[3]),
+                     float(r[4]), float(r[5] or 0)))
     return list(reversed(out))
 
 
 def _last_h1_rsi(db: Session, n: int = 14) -> Optional[float]:
-    """Latest H1 RSI(14) — used as filter/confluence."""
     rows = db.execute(text(
         "SELECT close FROM historical_candles "
         "WHERE instrument='XAU/USD' AND timeframe='H1' "
@@ -120,51 +140,42 @@ def _last_h1_rsi(db: Session, n: int = 14) -> Optional[float]:
     return round(100 - 100 / (1 + avg_g / avg_l), 1)
 
 
-def _prev_day_hl(bars: list[tuple]) -> tuple[Optional[float], Optional[float]]:
-    """Return (prev_day_high, prev_day_low) for the calendar day before bars[-1]."""
-    if not bars: return None, None
-    last_t = bars[-1][0]
+def _prev_day_hl(m5_bars: list[tuple]) -> tuple[Optional[float], Optional[float]]:
+    if not m5_bars: return None, None
+    last_t = m5_bars[-1][0]
     today_start = last_t.replace(hour=0, minute=0, second=0, microsecond=0)
-    prev_day_start = today_start - timedelta(days=1)
+    prev_start = today_start - timedelta(days=1)
     highs, lows = [], []
-    for t, o, h, l, c, v in bars:
-        if prev_day_start <= t < today_start:
+    for t, o, h, l, c, v in m5_bars:
+        if prev_start <= t < today_start:
             highs.append(h); lows.append(l)
     if not highs: return None, None
     return max(highs), min(lows)
 
 
-def _asian_range(bars: list[tuple]) -> tuple[Optional[float], Optional[float]]:
-    """
-    Return (asian_high, asian_low) for the most recent completed
-    Asian session (22:00 → 06:00 UTC).
-    """
-    if not bars: return None, None
-    last_t = bars[-1][0]
+def _asian_range(m5_bars: list[tuple]) -> tuple[Optional[float], Optional[float]]:
+    if not m5_bars: return None, None
+    last_t = m5_bars[-1][0]
     if 22 <= last_t.hour or last_t.hour < 6:
-        # inside Asian session — use what has formed since window start
         session_start = last_t.replace(hour=22, minute=0, second=0, microsecond=0)
-        if last_t.hour < 6:
-            session_start -= timedelta(days=1)
+        if last_t.hour < 6: session_start -= timedelta(days=1)
     else:
         today_6 = last_t.replace(hour=6, minute=0, second=0, microsecond=0)
         session_start = today_6 - timedelta(hours=8)
     session_end = session_start + timedelta(hours=8)
     highs, lows = [], []
-    for t, o, h, l, c, v in bars:
+    for t, o, h, l, c, v in m5_bars:
         if session_start <= t < session_end:
             highs.append(h); lows.append(l)
     if not highs: return None, None
     return max(highs), min(lows)
 
 
-def _vol_ratio(bars: list[tuple], window: int = 50) -> Optional[float]:
-    """Latest bar volume / mean(volume) over last `window` bars."""
-    if len(bars) < window + 1: return None
-    recent = bars[-window-1:-1]
-    avg = sum(b[5] for b in recent) / window
+def _vol_ratio_m5(m5_bars: list[tuple], window: int = 50) -> Optional[float]:
+    if len(m5_bars) < window + 1: return None
+    avg = sum(b[5] for b in m5_bars[-window-1:-1]) / window
     if avg <= 0: return None
-    return round(bars[-1][5] / avg, 2)
+    return round(m5_bars[-1][5] / avg, 2)
 
 
 def _session_label(hour: int) -> str:
@@ -180,43 +191,82 @@ def _session_label(hour: int) -> str:
 
 def _fingerprint(archetype: str, direction: str, entry: float,
                     bar_time: datetime) -> str:
-    """(archetype, direction, entry rounded to 5pt bucket, hour) → short hash."""
+    """Include the M5 bar-time to the minute so we don't dedupe across bars."""
     bucket = round(entry / 5.0) * 5
-    key = f"{archetype}|{direction}|{bucket}|{bar_time.strftime('%Y%m%d%H')}"
+    key = f"{archetype}|{direction}|{bucket}|{bar_time.strftime('%Y%m%d%H%M')}"
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Detectors
+# First-M5-close-below-level scanner — the CORE latency fix
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_asian_breakdown(bars: list[tuple],
+def _first_m5_close_below(m5_bars: list[tuple], level: float,
+                             lookback_bars: int = 48) -> Optional[dict]:
+    """
+    Walk the last `lookback_bars` M5 bars (≈4h). Return the FIRST bar whose
+    CLOSE is below `level`. This is the executable entry timestamp — much
+    earlier than waiting for M15 close confirmation.
+    """
+    slice_bars = m5_bars[-lookback_bars:] if len(m5_bars) > lookback_bars else m5_bars
+    for i, (t, o, h, l, c, v) in enumerate(slice_bars):
+        if c < level:
+            return {
+                "time": t, "close": c, "high": h, "low": l,
+                "idx_in_slice": i,
+            }
+    return None
+
+
+def _apply_extension_filter(archetype: str, level: float,
+                                first_break_price: float,
+                                current_close: float) -> tuple[bool, float]:
+    """
+    Returns (passes, pct_consumed). pct_consumed = (level - current_close) /
+    expected_total_move. Rejects when pct exceeds the archetype's threshold.
+    """
+    expected = _EXPECTED_TOTAL_MOVE_PTS.get(archetype, 50.0)
+    limit    = _EXTENSION_LIMIT.get(archetype, 0.50)
+    consumed_pts = abs(level - current_close)
+    pct = consumed_pts / max(expected, 0.1)
+    return (pct <= limit, min(pct, 2.0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Detectors (M5-close based)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_asian_breakdown(m5_bars: list[tuple],
                               rsi_h1: Optional[float] = None,
                               vol_r: Optional[float] = None) -> Optional[PredatorSignal]:
     """
     #1 edge — Asian Range Breakdown SELL.
-    Fires when the just-closed M15 bar breached below asian_low by ≥ 2pt AND
-    volume surge OR RSI H1 leaning weak.
-
-    TPs revised 2026-08-12 from Phase 5 exit sweep:
-      TP1 = 30pt  (empirical PF=2.12, WR=52%, expct=+8.16 — best cell)
-      TP2 = 50pt  (was 90pt; 90pt drops PF to 1.15 — dangerous)
+    Fires on the FIRST M5 close below asian_low - 2pt with confluence AND
+    extension filter passes.
     """
-    if len(bars) < 20: return None
-    a_high, a_low = _asian_range(bars)
+    if len(m5_bars) < 20: return None
+    a_high, a_low = _asian_range(m5_bars)
     if a_low is None: return None
-    t, o, h, l, c, v = bars[-1]
-
-    if c >= a_low - 2.0:
+    if not ((vol_r is not None and vol_r >= 1.3)
+            or (rsi_h1 is not None and rsi_h1 < 45)):
         return None
-    # Confluence gate: need EITHER vol_ratio ≥ 1.3 OR RSI H1 < 45
-    if not ((vol_r is not None and vol_r >= 1.3) or (rsi_h1 is not None and rsi_h1 < 45)):
+
+    hit = _first_m5_close_below(m5_bars, a_low - 2.0)
+    if hit is None: return None
+
+    t = hit["time"]; c = hit["close"]
+
+    # Extension filter — only fire if not already over-consumed
+    passes, pct = _apply_extension_filter("ASIAN_BREAKDOWN", a_low, hit["close"], c)
+    if not passes:
+        log.debug("[predator/asian] extension filter rejected: pct_consumed=%.2f", pct)
         return None
 
     entry = c
     stop  = round(a_low + 5.0, 2)
-    tp1   = round(entry - 30.0, 2)   # empirically optimal (was 50)
-    tp2   = round(entry - 50.0, 2)   # empirically safe (was 90 — negative expct)
+    # TPs revised 2026-08-12 (median remaining=27pt, so 30pt only hit 47%)
+    tp1   = round(entry - 20.0, 2)
+    tp2   = round(entry - 40.0, 2)
     sl_pts = abs(stop - entry)
     rr = round(abs(tp1 - entry) / max(sl_pts, 0.1), 2)
 
@@ -226,143 +276,174 @@ def detect_asian_breakdown(bars: list[tuple],
     return PredatorSignal(
         archetype="ASIAN_BREAKDOWN",
         direction="SELL",
+        state="FIRE",
         entry=entry, stop_loss=stop, tp1=tp1, tp2=tp2, rr=rr,
-        thesis=f"Price {c:.2f} broke Asian_low {a_low:.2f} — overnight buyers "
-               f"trapped, stops sitting below range",
-        trigger=f"M15 close {c:.2f} < asian_low {a_low:.2f} - 2 pts "
-                f"(vol_ratio={vol_r} rsi_h1={rsi_h1})",
+        thesis=(f"M5 close {c:.2f} broke Asian_low {a_low:.2f} — overnight "
+                f"buyers trapped, stops sitting below range"),
+        trigger=f"first M5 close below asian_low-2pt (vol_r={vol_r} rsi={rsi_h1})",
         confidence=confidence,
         counterparty="Overnight Asian buyers who bought near range highs; "
                      "range-bound stops below asian_low",
         session=_session_label(t.hour),
         bar_time=t.isoformat(),
         fingerprint=_fingerprint("ASIAN_BREAKDOWN", "SELL", entry, t),
+        pct_consumed=round(pct, 3),
+        latency_pts=round(abs(a_low - c), 1),
+        m5_used=True,
     )
 
 
-def detect_pdl_break(bars: list[tuple],
+def detect_pdl_break(m5_bars: list[tuple],
                         vol_r: Optional[float] = None) -> Optional[PredatorSignal]:
     """
-    #2 edge — Previous-Day Low Break SELL with acceptance.
-    Fires when latest M15 close is below prev_day_low - 3pt AND has stayed
-    below for ≥ 2 consecutive bars (acceptance).
+    #2 edge — Prev-Day Low Break SELL.
+    Fires on the FIRST M5 close below prev_day_low - 3pt with acceptance
+    (prev M5 bar also closed below) + confluence + extension filter passes.
     """
-    if len(bars) < 20: return None
-    prev_h, prev_l = _prev_day_hl(bars)
+    if len(m5_bars) < 20: return None
+    prev_h, prev_l = _prev_day_hl(m5_bars)
     if prev_l is None: return None
-    t, o, h, l, c, v = bars[-1]
 
-    if c >= prev_l - 3.0:
-        return None
-    # Acceptance: prev bar's close ALSO below prev_l
-    prev_bar_close = bars[-2][4]
-    if prev_bar_close >= prev_l:
-        return None
+    hit = _first_m5_close_below(m5_bars, prev_l - 3.0)
+    if hit is None: return None
 
-    # Confluence: vol_ratio ≥ 1.2 OR close is also below Asian low
-    a_high, a_low = _asian_range(bars)
-    stacked_with_asian = a_low is not None and c < a_low
+    # Acceptance: preceding M5 bar's close ALSO below the level
+    slice_start = len(m5_bars) - min(len(m5_bars), 48)
+    hit_idx_absolute = slice_start + hit["idx_in_slice"]
+    if hit_idx_absolute < 1: return None
+    if m5_bars[hit_idx_absolute - 1][4] >= prev_l:
+        return None   # no acceptance — single-bar breach is fragile
+
+    t = hit["time"]; c = hit["close"]
+
+    a_high, a_low = _asian_range(m5_bars)
+    stacked = a_low is not None and c < a_l if (a_l := a_low) is not None else False
     has_vol = vol_r is not None and vol_r >= 1.2
-    if not (has_vol or stacked_with_asian):
+    if not (has_vol or stacked):
+        return None
+
+    passes, pct = _apply_extension_filter("PDL_BREAK", prev_l, c, c)
+    if not passes:
+        log.debug("[predator/pdl] extension filter rejected: pct=%.2f", pct)
         return None
 
     entry = c
     stop  = round(prev_l + 5.0, 2)
-    # TPs revised 2026-08-12 (Phase 5 exit sweep):
-    #   TP1 = 40pt  (best PF+expct, WR=51%, PF=1.80)
-    #   TP2 = 60pt  (was 90pt; 90pt turns expectancy NEGATIVE)
     tp1   = round(entry - 40.0, 2)
     tp2   = round(entry - 60.0, 2)
     sl_pts = abs(stop - entry)
     rr = round(abs(tp1 - entry) / max(sl_pts, 0.1), 2)
 
-    confidence = "HIGH" if stacked_with_asian and has_vol else \
-                 "MED"  if stacked_with_asian or has_vol else "LOW"
+    confidence = "HIGH" if stacked and has_vol else \
+                 "MED"  if stacked or has_vol else "LOW"
 
     return PredatorSignal(
         archetype="PDL_BREAK",
         direction="SELL",
+        state="FIRE",
         entry=entry, stop_loss=stop, tp1=tp1, tp2=tp2, rr=rr,
-        thesis=f"Price {c:.2f} broke prev_day_low {prev_l:.2f} with acceptance "
-               f"({'stacked with Asian-low' if stacked_with_asian else ''} "
-               f"{'+ vol surge' if has_vol else ''}). "
-               "Yesterday's dip-buyers underwater.",
-        trigger=f"2 consecutive M15 closes below prev_day_low - 3pts",
+        thesis=(f"M5 acceptance below prev_day_low {prev_l:.2f}. "
+                f"Yesterday's dip-buyers underwater. "
+                f"{'Stacked with Asian-low.' if stacked else ''} "
+                f"{'Vol surge.' if has_vol else ''}").strip(),
+        trigger=f"2 consecutive M5 closes below PDL-3pt",
         confidence=confidence,
         counterparty="Yesterday's dip-buyers whose stops sit below PDL; "
                      "retail 'PDL=support' bagholders",
         session=_session_label(t.hour),
         bar_time=t.isoformat(),
         fingerprint=_fingerprint("PDL_BREAK", "SELL", entry, t),
+        pct_consumed=round(pct, 3),
+        latency_pts=round(abs(prev_l - c), 1),
+        m5_used=True,
     )
 
 
-def detect_vol_continuation(bars: list[tuple],
+def detect_vol_continuation(m5_bars: list[tuple],
                                 vol_r: Optional[float] = None,
                                 other_signals: list[PredatorSignal] | None = None
                               ) -> Optional[PredatorSignal]:
     """
-    #3 edge — High-Vol Continuation.
-    Only fires when there IS already a level-break signal from #1 or #2
-    (empirical: vol_high alone is weak; vol_high + level break is strong).
-    Amplifies the primary signal's direction.
+    #3 edge — High-Vol Continuation. Only fires when a primary
+    (asian_breakdown or pdl_break) also fired. Same plan, distinct label.
     """
-    if len(bars) < 60: return None
-    if vol_r is None or vol_r < 1.3:
-        return None
-    # Must have a confluent primary signal
-    if not other_signals:
-        return None
+    if len(m5_bars) < 60: return None
+    if vol_r is None or vol_r < 1.3: return None
+    if not other_signals: return None
     primary = other_signals[0]
-
-    t, o, h, l, c, v = bars[-1]
-
-    # Follow the primary's direction — same entry/plan just labelled differently
-    # to make Telegram reader see the "vol amplifier" context.
+    t = _parse_ts(primary.bar_time)
     return PredatorSignal(
         archetype="VOL_CONTINUATION",
         direction=primary.direction,
-        entry=primary.entry,
-        stop_loss=primary.stop_loss,
-        tp1=primary.tp1,
-        tp2=primary.tp2,
-        rr=primary.rr,
-        thesis=f"Volume surge (ratio {vol_r:.2f}× 50-bar avg) confirms "
-               f"{primary.archetype}. Continuation likely.",
+        state="FIRE",
+        entry=primary.entry, stop_loss=primary.stop_loss,
+        tp1=primary.tp1, tp2=primary.tp2, rr=primary.rr,
+        thesis=(f"Volume surge (ratio {vol_r:.2f}× 50-bar avg) confirms "
+                f"{primary.archetype}. Continuation likely."),
         trigger=f"vol_ratio={vol_r:.2f} + confluent {primary.archetype}",
         confidence="HIGH" if vol_r >= 2.0 else "MED",
         counterparty="Fade traders and mean-reversion algos betting the "
                      "vol spike is exhaustion",
-        session=_session_label(t.hour),
-        bar_time=t.isoformat(),
+        session=primary.session,
+        bar_time=primary.bar_time,
         fingerprint=_fingerprint("VOL_CONTINUATION", primary.direction,
                                     primary.entry, t),
+        pct_consumed=primary.pct_consumed,
+        latency_pts=primary.latency_pts,
+        m5_used=True,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public entry point
+# ARMED-state helpers (pre-signal awareness)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _armed_status(m5_bars: list[tuple], rsi_h1: Optional[float]) -> Optional[dict]:
+    """
+    Emit an ARMED signal when price is APPROACHING a validated level (within
+    5pt) but hasn't broken yet. Gives operator early awareness.
+    Returns None if no proximity to level.
+    """
+    if len(m5_bars) < 20: return None
+    a_high, a_low = _asian_range(m5_bars)
+    prev_h, prev_l = _prev_day_hl(m5_bars)
+    if not m5_bars: return None
+    close = m5_bars[-1][4]
+
+    # Distance from each relevant level (SELL: below asian_low or PDL)
+    armed_reasons = []
+    if a_low is not None and 0 < close - a_low <= 5.0:
+        armed_reasons.append(f"within 5pt of asian_low {a_low:.2f}")
+    if prev_l is not None and 0 < close - prev_l <= 5.0:
+        armed_reasons.append(f"within 5pt of prev_day_low {prev_l:.2f}")
+    if rsi_h1 is not None and rsi_h1 < 45:
+        armed_reasons.append(f"RSI H1 {rsi_h1:.0f} weak")
+
+    if not armed_reasons:
+        return None
+    return {
+        "reasons":     armed_reasons,
+        "distance_to_asian_low": (close - a_low) if a_low else None,
+        "distance_to_pdl":       (close - prev_l) if prev_l else None,
+        "close":       close,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public entry
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate(db: Session) -> list[PredatorSignal]:
     """
-    Run all SELL detectors on the freshest M15 bar. Returns 0..N signals.
-
-    ENGINE MODE: SELL-PREDATOR / BUY-OBSERVATION
-      This engine only fires SELL signals — no BUY archetype survived
-      walk-forward validation on 5 months of XAU/USD M15 data. Any BUY
-      opportunity is currently observation-only.
-
-    REGIME GATE:
-      Signals suppress unless (direction_regime × vol_regime) has empirical
-      lift in the Phase 3 audit matrix. Bullish regimes = no signals.
+    M5-close detection, regime-gated, extension-filtered, ARMED-aware.
+    ENGINE MODE: SELL-PREDATOR / BUY-OBSERVATION.
     """
-    bars = _load_recent_m15(db, n=300)   # need 300 for regime classifier
-    if len(bars) < 60:
-        log.debug("[predator] insufficient bars (%d)", len(bars))
+    m5 = _load_recent(db, "M5", n=300)      # ≥250 for lookback + 50 vol window
+    if len(m5) < 80:
+        log.debug("[predator] insufficient M5 bars (%d)", len(m5))
         return []
 
-    # ── Regime gate ──────────────────────────────────────────────────
+    # Regime gate
     try:
         from services.regime_detector import (
             classify_current_regime, is_predator_favorable_regime,
@@ -374,30 +455,48 @@ def evaluate(db: Session) -> list[PredatorSignal]:
             log.debug("[predator] suppressed by regime gate: %s", reason)
             return []
         regime_mult = regime_confidence_multiplier(
-            regime.get("direction"), regime.get("volatility")
+            regime.get("direction"), regime.get("volatility"),
         )
     except Exception as exc:
-        log.warning("[predator] regime gate errored — suppressing signals: %s", exc)
+        log.warning("[predator] regime gate errored: %s", exc)
         return []
 
     rsi_h1 = _last_h1_rsi(db)
-    vol_r = _vol_ratio(bars)
+    vol_r = _vol_ratio_m5(m5)
 
     signals: list[PredatorSignal] = []
 
-    # Primary detectors (SELL only — no BUY archetype validated)
-    s1 = detect_asian_breakdown(bars, rsi_h1=rsi_h1, vol_r=vol_r)
+    s1 = detect_asian_breakdown(m5, rsi_h1=rsi_h1, vol_r=vol_r)
     if s1: signals.append(s1)
-    s2 = detect_pdl_break(bars, vol_r=vol_r)
+    s2 = detect_pdl_break(m5, vol_r=vol_r)
     if s2: signals.append(s2)
-
-    # Vol continuation only if #1 or #2 also fired
-    s3 = detect_vol_continuation(bars, vol_r=vol_r, other_signals=signals)
+    s3 = detect_vol_continuation(m5, vol_r=vol_r, other_signals=signals)
     if s3: signals.append(s3)
 
-    # Downgrade confidence for less-favorable regime cells (0.5-0.8 multiplier)
-    if regime_mult < 1.0 and signals:
+    # If no FIRE, emit an ARMED "watching" signal if price is near level
+    if not signals:
+        armed = _armed_status(m5, rsi_h1)
+        if armed:
+            t = m5[-1][0]
+            signals.append(PredatorSignal(
+                archetype="APPROACHING_LEVEL",
+                direction="SELL",
+                state="ARMED",
+                entry=armed["close"], stop_loss=0.0, tp1=0.0, tp2=0.0, rr=0.0,
+                thesis="Approaching validated level — no fire yet",
+                trigger="; ".join(armed["reasons"]),
+                confidence="—",
+                counterparty="—",
+                session=_session_label(t.hour),
+                bar_time=t.isoformat(),
+                fingerprint=_fingerprint("ARMED", "SELL", armed["close"], t),
+                pct_consumed=None, latency_pts=None, m5_used=True,
+            ))
+
+    # Regime downgrade of FIRE confidence
+    if regime_mult < 1.0:
         for sig in signals:
+            if sig.state != "FIRE": continue
             if sig.confidence == "HIGH" and regime_mult < 0.8:
                 sig.confidence = "MED"
             elif sig.confidence == "MED" and regime_mult < 0.6:
@@ -407,29 +506,45 @@ def evaluate(db: Session) -> list[PredatorSignal]:
 
 
 def format_telegram_alert(sig: PredatorSignal, regime: Optional[dict] = None) -> str:
-    """Distinct message format so operator can see this is a Predator signal."""
+    if sig.state == "ARMED":
+        lines = [
+            f"👁  PREDATOR ARMED — approaching level",
+            f"XAU/USD  ·  potential {sig.direction}",
+        ]
+        if regime:
+            lines.append(f"Regime: {regime.get('direction')} × {regime.get('volatility')}")
+        lines += [
+            "",
+            f"Current: {sig.entry:.2f}",
+            f"Trigger conditions: {sig.trigger}",
+            "",
+            "State: ARMED (no entry yet — waiting for M5 close below level)",
+        ]
+        return "\n".join(lines)
+    # FIRE format
     lines = [
-        f"🐺 PREDATOR — {sig.archetype}  [{sig.confidence}]",
+        f"🐺 PREDATOR FIRE — {sig.archetype}  [{sig.confidence}]",
         f"MODE: SELL-PREDATOR / BUY-OBSERVATION",
-        f"XAU/USD  ·  {sig.direction}",
+        f"XAU/USD  ·  {sig.direction}  (M5-close detection)",
     ]
     if regime:
         lines.append(f"Regime: {regime.get('direction')} × {regime.get('volatility')} × {regime.get('session')}")
     lines += [
         "",
         f"Entry:  {sig.entry:.2f}",
-        f"Stop:   {sig.stop_loss:.2f}  (risk {abs(sig.entry - sig.stop_loss):.1f} pts)",
-        f"TP1:    {sig.tp1:.2f}  (empirical optimum for archetype)",
-        f"TP2:    {sig.tp2:.2f}  (empirically safe stretch)",
+        f"Stop:   {sig.stop_loss:.2f}   (risk {abs(sig.entry - sig.stop_loss):.1f} pts)",
+        f"TP1:    {sig.tp1:.2f}",
+        f"TP2:    {sig.tp2:.2f}",
         f"RR:     1:{sig.rr}",
-        f"Session: {sig.session}  ·  bar {sig.bar_time[:16]}",
+        f"Session: {sig.session}  ·  M5 bar {sig.bar_time[:16]}",
+        f"Extension: {(sig.pct_consumed or 0)*100:.0f}% of expected move consumed  (filter: OK)",
         "",
         f"Why:  {sig.thesis}",
         f"Counterparty:  {sig.counterparty}",
         f"Trigger:  {sig.trigger}",
         "",
-        "Source: outcome-first empirical edge · regime-gated · walk-forward validated",
-        "SELL-only engine — no BUY archetype survived 5-month audit.",
+        "Source: outcome-first empirical edge · M5 confirmation · regime-gated",
+        "SELL-only engine — no BUY archetype survived audit.",
     ]
     return "\n".join(lines)
 
