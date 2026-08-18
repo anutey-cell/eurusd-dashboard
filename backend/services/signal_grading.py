@@ -202,6 +202,8 @@ def format_signal_grade_body(verdict: dict, grade_result: GradeResult,
         f"{grade_result.reason}",
         "",
         "(Signal-only mode — no automatic order placement.)",
+        "",
+        "ENGINE: LEGACY",
     ]
     return "\n".join(lines)
 
@@ -225,6 +227,8 @@ def format_stand_aside_body(verdict: dict, grade_result: GradeResult) -> str:
         f"{grade_result.reason}",
         "",
         "(No compliant entry. No trade sent.)",
+        "",
+        "ENGINE: LEGACY",
     ])
 
 

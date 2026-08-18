@@ -52,16 +52,28 @@ PENDING_TTL_SECONDS = 300   # 5 minutes
 # ── Auth dependency ──────────────────────────────────────────────────────────
 
 def _require_bridge_secret(x_bridge_secret: str | None = Header(default=None)) -> None:
-    expected = (settings.mt5_bridge_shared_secret or "").strip()
-    if not expected:
+    """
+    Accepts the primary shared secret, or (during a rotation window) a previous
+    one via MT5_BRIDGE_SHARED_SECRET_PREV. Set the prev var while rolling out a
+    new secret to the daemon; clear it once the daemon is confirmed on the new
+    value. Fail-safe: neither set → 503.
+    """
+    current = (settings.mt5_bridge_shared_secret or "").strip()
+    prev    = (getattr(settings, "mt5_bridge_shared_secret_prev", "") or "").strip()
+    if not current and not prev:
         raise HTTPException(
             status_code=503,
             detail="MT5_BRIDGE_SHARED_SECRET not configured on server.",
         )
-    if not x_bridge_secret or x_bridge_secret != expected:
+    if not x_bridge_secret:
         raise HTTPException(
             status_code=401,
-            detail="Invalid or missing X-Bridge-Secret header.",
+            detail="Missing X-Bridge-Secret header.",
+        )
+    if x_bridge_secret != current and (not prev or x_bridge_secret != prev):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid X-Bridge-Secret header.",
         )
 
 
@@ -262,6 +274,69 @@ def report_result(
             db.commit()
     except Exception as exc:
         log.warning("[bridge] strategist_verdicts post-trade writeback failed: %s", exc)
+
+    # ── Predator post-trade writeback to predator_positions ──────────────
+    # ACCEPTED  → position OPEN (mt5_ticket + opened_at)
+    # CLOSED    → position CLOSED (closed_at + realized_pts/mfe/mae/outcome)
+    # REJECTED/FAILED/EXPIRED → position REJECTED (with reason)
+    # Without this, exposure ghosts accumulate and PREDATOR_EXPOSURE_LIMIT_BLOCK
+    # blocks legitimate new batches.
+    try:
+        from db_models import PredatorPosition
+        pp = (
+            db.query(PredatorPosition)
+            .filter(PredatorPosition.pending_execution_id == row.id)
+            .first()
+        )
+        if pp is not None:
+            now_utc = datetime.now(timezone.utc)
+            if result.status == "ACCEPTED":
+                pp.status = "OPEN"
+                if result.ticket is not None:
+                    pp.mt5_ticket = result.ticket
+                if pp.opened_at is None:
+                    pp.opened_at = now_utc
+            elif result.status == "CLOSED":
+                pp.status = "CLOSED"
+                pp.closed_at = now_utc
+                if result.ticket is not None:
+                    pp.mt5_ticket = result.ticket
+                if result.pips_outcome is not None:
+                    pp.realized_pts = float(result.pips_outcome)
+                if result.mfe_pts is not None:
+                    pp.mfe_pts = float(result.mfe_pts)
+                if result.mae_pts is not None:
+                    pp.mae_pts = float(result.mae_pts)
+                if result.result:
+                    # Map WIN/LOSS/BREAKEVEN → TP/SL/BE (predator uses TP1|TP2|SL|MANUAL|TIMEOUT)
+                    outcome_map = {"WIN": pp.tp_target,   # TP1 or TP2 — depends on pos
+                                    "LOSS": "SL",
+                                    "BREAKEVEN": "MANUAL"}
+                    pp.outcome = outcome_map.get(result.result.upper(), result.result)
+            elif result.status in ("REJECTED", "FAILED", "EXPIRED"):
+                pp.status = "REJECTED"
+                pp.reject_reason = (result.error or f"bridge status={result.status}")[:255]
+            db.commit()
+
+            # Also update batch-level counters when a position closes so
+            # positions_opened / total_exposure reflect reality.
+            if result.status in ("CLOSED", "REJECTED", "FAILED", "EXPIRED"):
+                from db_models import PredatorSignalBatch
+                from sqlalchemy import text as _text
+                agg = db.execute(_text(
+                    "SELECT COUNT(*) AS n_open, COALESCE(SUM(lot_size),0) AS lots "
+                    "FROM predator_positions "
+                    "WHERE batch_id=:bid AND status IN ('ENQUEUED','OPEN')"
+                ), {"bid": pp.batch_id}).fetchone()
+                batch = db.query(PredatorSignalBatch).filter(
+                    PredatorSignalBatch.id == pp.batch_id
+                ).first()
+                if batch is not None:
+                    batch.positions_opened = int(agg[0] or 0)
+                    batch.total_exposure = float(agg[1] or 0.0)
+                    db.commit()
+    except Exception as exc:
+        log.warning("[bridge] predator_positions post-trade writeback failed: %s", exc)
 
     # On ACCEPTED, also write to MT5TradeLog so the analytics + daily counter
     # are consistent with what they'd have seen if MT5 ran locally.

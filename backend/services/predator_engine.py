@@ -62,6 +62,30 @@ _EXTENSION_LIMIT: dict[str, float] = {
     "PDL_BREAK":        0.60,   # Phase 7 audit: LATE (60-100%) is -28.35 expct
 }
 
+# Hardcoded empirical stats per archetype (Phase 2 executable-edge audit,
+# 3-month M5-overlap sample). Displayed in Telegram FIRE alerts so operator
+# sees the historical basis for the signal, not just the archetype label.
+_ARCHETYPE_STATS: dict[str, dict] = {
+    "ASIAN_BREAKDOWN": {
+        "sample":       129,       # M5-close variant
+        "wr":           0.57,
+        "expectancy":   12.98,
+        "pf":           4.25,
+    },
+    "PDL_BREAK": {
+        "sample":       118,
+        "wr":           0.73,
+        "expectancy":   26.35,
+        "pf":           10.41,
+    },
+    "VOL_CONTINUATION": {
+        "sample":       "inherits primary",
+        "wr":           "inherits primary",
+        "expectancy":   "inherits primary",
+        "pf":           "inherits primary",
+    },
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Signal dataclass
@@ -505,51 +529,168 @@ def evaluate(db: Session) -> list[PredatorSignal]:
     return signals
 
 
-def format_telegram_alert(sig: PredatorSignal, regime: Optional[dict] = None) -> str:
+def format_telegram_alert(sig: PredatorSignal, regime: Optional[dict] = None,
+                             key_level: Optional[float] = None,
+                             current_price: Optional[float] = None,
+                             deployment_plan=None) -> str:
+    """
+    Two message shapes — ARMED (pre-signal awareness) and FIRE (executable
+    trade alert). Both carry the ENGINE: PREDATOR source-separation tag so
+    the operator can never confuse them with LEGACY mandate signals.
+
+    If `deployment_plan` (a predator_position_sizer.DeploymentPlan) is passed
+    for a FIRE, the Position Plan section is appended per spec §7.
+    """
+    regime_str = "unknown"
+    if regime:
+        regime_str = (f"{regime.get('direction','?')} × "
+                      f"{regime.get('volatility','?')} × "
+                      f"{regime.get('session','?')}")
+
     if sig.state == "ARMED":
+        cur = current_price or sig.entry
+        distance = abs(key_level - cur) if key_level else "—"
         lines = [
-            f"👁  PREDATOR ARMED — approaching level",
-            f"XAU/USD  ·  potential {sig.direction}",
-        ]
-        if regime:
-            lines.append(f"Regime: {regime.get('direction')} × {regime.get('volatility')}")
-        lines += [
+            f"👁 PREDATOR ARMED — XAUUSD",
+            f"Direction: {sig.direction}",
+            f"Archetype: {sig.archetype}",
+            f"Regime: {regime_str}",
+            f"Key Level: {key_level:.2f}" if key_level else "Key Level: —",
+            f"Current Price: {cur:.2f}",
+            f"Distance to Trigger: {distance:.1f} pts" if isinstance(distance, (int, float)) else f"Distance to Trigger: {distance}",
+            f"Setup Edge: {sig.confidence}",
+            (f"Entry Extension: {(sig.pct_consumed or 0)*100:.0f}%"
+             if sig.pct_consumed is not None else "Entry Extension: —"),
+            "Status: NO ENTRY YET",
             "",
-            f"Current: {sig.entry:.2f}",
-            f"Trigger conditions: {sig.trigger}",
+            f"Reason:",
+            f"{sig.thesis}",
             "",
-            "State: ARMED (no entry yet — waiting for M5 close below level)",
+            f"Trigger Required:",
+            f"{sig.trigger}",
+            "",
+            "This is NOT a trade signal.",
+            "ENGINE: PREDATOR",
         ]
         return "\n".join(lines)
-    # FIRE format
+
+    # FIRE — executable trade alert
+    stats = _ARCHETYPE_STATS.get(sig.archetype, {})
+    wr_display = stats.get("wr")
+    expct_display = stats.get("expectancy")
+    if isinstance(wr_display, float):     wr_display = f"{wr_display*100:.0f}%"
+    if isinstance(expct_display, float):  expct_display = f"+{expct_display:.1f} pts/trade"
+
     lines = [
-        f"🐺 PREDATOR FIRE — {sig.archetype}  [{sig.confidence}]",
-        f"MODE: SELL-PREDATOR / BUY-OBSERVATION",
-        f"XAU/USD  ·  {sig.direction}  (M5-close detection)",
-    ]
-    if regime:
-        lines.append(f"Regime: {regime.get('direction')} × {regime.get('volatility')} × {regime.get('session')}")
-    lines += [
+        f"🐺 PREDATOR FIRE — XAUUSD",
+        f"Direction: {sig.direction}",
+        f"Archetype: {sig.archetype}",
+        f"Regime: {regime_str}",
+        f"Entry: {sig.entry:.2f}",
+        f"Invalidation / SL: {sig.stop_loss:.2f}   (risk {abs(sig.entry - sig.stop_loss):.1f} pts)",
+        f"TP1: {sig.tp1:.2f}",
+        f"TP2: {sig.tp2:.2f}",
+        (f"Entry Extension: {(sig.pct_consumed or 0)*100:.0f}%"
+         if sig.pct_consumed is not None else "Entry Extension: —"),
+        f"Historical Sample: {stats.get('sample', '—')}",
+        f"Regime-Matched Sample: —",   # not available yet — future work
+        f"Historical Win Rate: {wr_display}",
+        f"Historical Expectancy: {expct_display}",
+        f"Profit Factor: {stats.get('pf', '—')}",
         "",
-        f"Entry:  {sig.entry:.2f}",
-        f"Stop:   {sig.stop_loss:.2f}   (risk {abs(sig.entry - sig.stop_loss):.1f} pts)",
-        f"TP1:    {sig.tp1:.2f}",
-        f"TP2:    {sig.tp2:.2f}",
-        f"RR:     1:{sig.rr}",
+        f"Prey:",
+        f"{sig.counterparty}",
+        "",
+        f"Exploit:",
+        f"{sig.thesis}",
+        "",
+        f"Confidence: {sig.confidence}",
         f"Session: {sig.session}  ·  M5 bar {sig.bar_time[:16]}",
-        f"Extension: {(sig.pct_consumed or 0)*100:.0f}% of expected move consumed  (filter: OK)",
+        "Status: EXECUTABLE",
         "",
-        f"Why:  {sig.thesis}",
-        f"Counterparty:  {sig.counterparty}",
-        f"Trigger:  {sig.trigger}",
-        "",
-        "Source: outcome-first empirical edge · M5 confirmation · regime-gated",
         "SELL-only engine — no BUY archetype survived audit.",
     ]
+
+    # ── Position Plan section (spec §7 — appended when a plan is provided) ──
+    if deployment_plan is not None:
+        ev = getattr(deployment_plan, "expansion_evidence", None)
+        vol_pct = getattr(ev, "vol_pct", None) if ev else None
+        exp_confirmed = getattr(ev, "confirmed", False) if ev else False
+        lines.extend([
+            "",
+            "Position Plan",
+            f"Position Size: {deployment_plan.positions[0].lot_size:.2f} lots",
+            f"Exposure Mode: {deployment_plan.exposure_mode}",
+            f"Planned Positions: {len(deployment_plan.positions)}",
+            f"Maximum Current Exposure: {deployment_plan.max_exposure_lots:.2f} lots",
+            f"Volume Expansion: {'YES' if exp_confirmed else 'NO'}",
+        ])
+        if deployment_plan.exposure_mode == "EXPANSION" and ev:
+            lines.extend([
+                f"Volume Percentile: {vol_pct:.0f}" if vol_pct is not None
+                else "Volume Percentile: —",
+                f"Expansion Confirmation: {ev.reason}",
+                "Maximum Exposure Allowed: 0.30 lots",
+            ])
+
+    lines.append("")
+    lines.append("ENGINE: PREDATOR")
     return "\n".join(lines)
+
+
+def format_predator_execution_summary(batch, ticket_ids: list, *,
+                                        skipped_reason: Optional[str] = None) -> str:
+    """
+    Sent after `execute_batch_staged` returns. Reports what actually got enqueued.
+    `batch` is a PredatorSignalBatch row; `ticket_ids` is the list of
+    pending_execution.id values (MT5 tickets fill in later — bridge daemon
+    writes them back into predator_positions.mt5_ticket).
+    """
+    if skipped_reason:
+        return "\n".join([
+            "Predator Execution — SKIPPED",
+            f"Batch: {batch.id}   Signal: {batch.signal_id}",
+            f"Reason: {skipped_reason}",
+            "No orders were sent.",
+            "",
+            "ENGINE: PREDATOR",
+        ])
+
+    tickets_str = ", ".join(str(t) for t in ticket_ids) if ticket_ids else "—"
+    lines = [
+        "Predator Execution",
+        f"Positions Opened: {batch.positions_opened}",
+        f"Lot per Position: {batch.lot_per_position:.2f}",
+        f"Total Exposure: {batch.total_exposure:.2f} lots",
+        f"Exposure Mode: {batch.exposure_mode}",
+        f"Pending IDs: {tickets_str}",
+        f"Batch: {batch.id}   Signal: {batch.signal_id}",
+    ]
+    if batch.execution_status not in ("COMPLETE",):
+        lines.append(f"Status: {batch.execution_status}")
+        if batch.abort_reason:
+            lines.append(f"Note: {batch.abort_reason}")
+    lines.extend(["", "ENGINE: PREDATOR"])
+    return "\n".join(lines)
+
+
+def format_telegram_invalidated(archetype: str, direction: str,
+                                    reason: str) -> str:
+    """Sent when an ARMED setup becomes invalid before FIRE."""
+    return "\n".join([
+        f"❌ PREDATOR INVALIDATED — XAUUSD",
+        f"Archetype: {archetype}",
+        f"Direction: {direction}",
+        f"Reason: {reason}",
+        f"Status: NO TRADE",
+        "",
+        "ENGINE: PREDATOR",
+    ])
 
 
 __all__ = [
     "PredatorSignal", "evaluate", "format_telegram_alert",
+    "format_telegram_invalidated", "format_predator_execution_summary",
     "detect_asian_breakdown", "detect_pdl_break", "detect_vol_continuation",
+    "_ARCHETYPE_STATS", "_EXPECTED_TOTAL_MOVE_PTS", "_EXTENSION_LIMIT",
 ]

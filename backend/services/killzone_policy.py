@@ -74,12 +74,13 @@ POLICY_TABLE: list[PolicyRow] = [
     PolicyRow("london_kz", "SELL", "ALLOW",  146, 22.0, +0.200,
               "London open + continuation SELL — best cell at +0.20R."),
 
-    # ── NY KZ (13:00-16:00 UTC) — both modest edges, allow ─────────────────
+    # ── NY KZ (13:00-16:00 UTC) — BUY still allow; SELL flipped by live data ─
     # Covers mandate "New York open sweep".
     PolicyRow("ny_kz",     "BUY",  "ALLOW",  103, 23.3, +0.078,
               "NY open BUY — solid +0.08R edge with high relative WR."),
-    PolicyRow("ny_kz",     "SELL", "ALLOW",   57, 17.5, +0.035,
-              "NY open SELL — small but positive edge."),
+    PolicyRow("ny_kz",     "SELL", "BLOCK",   32, 34.4, -0.300,
+              "NY open SELL — FLIPPED 2026-08-18: live post-blacklist n=32 shows "
+              "-0.30R vs prior +0.035R backtest. Small sample but clear negative."),
 
     # ── Overlap / Lunch (10:00-13:00 UTC) — neutral, EXPLORE only ──────────
     # Covers mandate "London lunch chop". Backtest expectancy ~+0.02R.
@@ -88,18 +89,20 @@ POLICY_TABLE: list[PolicyRow] = [
     PolicyRow("overlap",   "SELL", "EXPLORE", 30, 16.7, +0.017,
               "Lunch chop SELL — near-zero edge, allow exploratory."),
 
-    # ── NY PM (16:00-22:00 UTC) — overlap expansion, MEASURED LOSER ────────
-    # Covers mandate "London/NY overlap expansion". Both directions losing.
+    # ── NY PM (16:00-22:00 UTC) — overlap expansion. SELL flipped by live data.
+    # Covers mandate "London/NY overlap expansion".
     PolicyRow("ny_pm",     "BUY",  "BLOCK",  163, 16.6, -0.015,
               "Overlap expansion BUY — small negative edge, block."),
-    PolicyRow("ny_pm",     "SELL", "BLOCK",   84, 13.1, -0.042,
-              "Overlap expansion SELL — worst cell, hard block."),
+    PolicyRow("ny_pm",     "SELL", "ALLOW",   56, 62.5, +0.188,
+              "Overlap expansion SELL — FLIPPED 2026-08-18: live post-blacklist "
+              "n=56 shows +0.19R with 62.5% WR vs prior -0.042R backtest. Regime shift."),
 
-    # ── Asian range — backtest skipped; legacy table had n=2, EXPLORE ──────
+    # ── Asian range — live data promoted SELL from EXPLORE to ALLOW ─────────
     PolicyRow("asian",     "BUY",  "EXPLORE", 2, 50.0, +4.79,
               "Pre-mandate sample only (n=2). Allow to gather data."),
-    PolicyRow("asian",     "SELL", "EXPLORE", 0,  0.0,  0.00,
-              "No samples. Allow to discover behavior."),
+    PolicyRow("asian",     "SELL", "ALLOW",   24, 75.0, +0.512,
+              "Asian range SELL — PROMOTED 2026-08-18: live post-blacklist n=24 "
+              "shows +0.51R with 75% WR. Strong edge; was EXPLORE with n=0."),
 
     # ── Off-session — never trade ──────────────────────────────────────────
     PolicyRow("asian_early","BUY", "BLOCK",  0,  0.0,  0.00,

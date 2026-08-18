@@ -158,6 +158,7 @@ class PendingExecution(Base):
     quality_score   = Column(Integer, nullable=True)
     rr              = Column(Float, nullable=True)
     max_lot         = Column(Float, nullable=False, default=0.05)
+    lot_size        = Column(Float, nullable=False, default=0.01)    # actual lot to trade (mandate/predator size)
     reason          = Column(Text, nullable=True)                    # Setup description
     confirmations_json = Column(Text, nullable=True)                 # 3-layer confirmation snapshot
 
@@ -986,3 +987,98 @@ class TelegramCommandLog(Base):
     accepted     = Column(Boolean, nullable=False, default=True)
     reject_reason = Column(String(255), nullable=True)
     response_bytes = Column(Integer, nullable=True)
+
+
+# ── Predator DEMO sizing (P182-P185) ─────────────────────────────────────────
+
+class PredatorSignalBatch(Base):
+    """
+    One row per Predator FIRE event. Captures the planning-time context needed
+    to compare STANDARD vs EXPANSION performance later.
+
+    Individual tickets live in PredatorPosition (FK by batch_id).
+    """
+    __tablename__ = "predator_signal_batches"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    created_at        = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+
+    # Signal identity
+    signal_id         = Column(String(64), nullable=False, unique=True, index=True)
+    archetype         = Column(String(32), nullable=False)   # ASIAN_BREAKDOWN | PDL_BREAK | VOL_CONTINUATION
+    direction         = Column(String(8),  nullable=False)   # SELL (predator is SELL-only)
+    predator_version  = Column(String(16), nullable=False, default="v1")
+
+    # Trade plan (validated archetype targets)
+    entry_price       = Column(Float, nullable=False)
+    stop_loss         = Column(Float, nullable=False)
+    tp1               = Column(Float, nullable=False)
+    tp2               = Column(Float, nullable=False)
+    key_level         = Column(Float, nullable=True)         # asian_low | pdl
+
+    # Sizing decision
+    exposure_mode     = Column(String(16), nullable=False, default="STANDARD")  # STANDARD | EXPANSION
+    planned_positions = Column(Integer, nullable=False)      # 5 or 10
+    lot_per_position  = Column(Float, nullable=False, default=0.03)
+    max_exposure_lots = Column(Float, nullable=False)        # 0.15 or 0.30
+
+    # Volume expansion evidence at fire bar
+    vol_pct_at_fire   = Column(Float, nullable=True)         # 0-100 (rolling 100-M5)
+    atr20_at_fire     = Column(Float, nullable=True)
+    disp_atr_ratio    = Column(Float, nullable=True)
+    expansion_reason  = Column(String(255), nullable=True)   # "vol_pct=93 >= 90 AND disp/atr=1.4 >= 1.0"
+
+    # Regime snapshot (for post-hoc bucketing)
+    regime_direction  = Column(String(32), nullable=True)
+    regime_volatility = Column(String(16), nullable=True)
+
+    # Execution state
+    execution_status  = Column(String(32), nullable=False, default="PLANNED", index=True)
+    # PLANNED | ENQUEUING | ENQUEUED | PARTIAL | COMPLETE | ABORTED
+    positions_opened  = Column(Integer, nullable=False, default=0)
+    total_exposure    = Column(Float, nullable=False, default=0.0)
+    abort_reason      = Column(String(255), nullable=True)
+
+
+class PredatorPosition(Base):
+    """
+    One row per individual 0.03-lot ticket within a Predator batch.
+    Maps to PendingExecution.id after enqueue succeeds; ticket populated
+    once the bridge daemon reports back from MT5.
+    """
+    __tablename__ = "predator_positions"
+
+    id                    = Column(Integer, primary_key=True, autoincrement=True)
+    batch_id              = Column(Integer, nullable=False, index=True)   # → predator_signal_batches.id
+    seq_no                = Column(Integer, nullable=False)               # 1..N within the batch
+    created_at            = Column(DateTime(timezone=True), default=_now, nullable=False)
+
+    # Ticket plan
+    lot_size              = Column(Float, nullable=False, default=0.03)
+    tp_target             = Column(String(16), nullable=False)            # TP1 | TP2 | RUNNER
+    entry_price_planned   = Column(Float, nullable=False)
+    stop_loss             = Column(Float, nullable=False)
+    take_profit_planned   = Column(Float, nullable=False)
+
+    # Live conditions AT time this ticket was enqueued
+    price_at_enqueue      = Column(Float, nullable=True)
+    spread_at_enqueue     = Column(Float, nullable=True)
+    pct_consumed_at_enqueue = Column(Float, nullable=True)                # extension check
+
+    # Wiring
+    pending_execution_id  = Column(Integer, nullable=True, index=True)    # → pending_executions.id
+    mt5_ticket            = Column(Integer, nullable=True, index=True)    # populated by bridge
+
+    # Outcome (populated by bridge post-close reporter)
+    opened_at             = Column(DateTime(timezone=True), nullable=True)
+    closed_at             = Column(DateTime(timezone=True), nullable=True)
+    exit_price            = Column(Float, nullable=True)
+    outcome               = Column(String(16), nullable=True)             # TP1 | TP2 | SL | MANUAL | TIMEOUT
+    realized_pts          = Column(Float, nullable=True)
+    mfe_pts               = Column(Float, nullable=True)
+    mae_pts               = Column(Float, nullable=True)
+
+    # Status (of THIS ticket, distinct from batch-level status)
+    status                = Column(String(16), nullable=False, default="PLANNED", index=True)
+    # PLANNED | ENQUEUED | REJECTED | OPEN | CLOSED
+    reject_reason         = Column(String(255), nullable=True)

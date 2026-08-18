@@ -642,59 +642,280 @@ async def _predator_loop():
         await asyncio.sleep(interval)
 
 
+# ARMED→INVALIDATED tracking. Keyed by archetype+5pt bucket so we know when
+# a setup we alerted on has slipped away without firing.
+_PREDATOR_ARMED_TRACKING: dict[str, dict] = {}
+_PREDATOR_ARMED_STALE_S = 900   # 15 min — if ARMED >this long without FIRE, INVALIDATE
+
+
 def _run_predator_iteration():
     import time as _time
+    import hashlib as _hashlib
     from config import settings
     from database import SessionLocal
-    from services.predator_engine import evaluate, format_telegram_alert
+    from services.predator_engine import (
+        evaluate, format_telegram_alert, format_telegram_invalidated,
+        format_predator_execution_summary, _EXTENSION_LIMIT,
+        _EXPECTED_TOTAL_MOVE_PTS,
+    )
+    from services.predator_position_sizer import (
+        evaluate_volume_expansion, plan_deployment,
+    )
+    from services.predator_execution_manager import (
+        create_batch, execute_batch_staged,
+    )
 
     dedupe_s = int(getattr(settings, "predator_dedupe_cooldown_s", 3600))
     now = _time.time()
+    tele_on = bool(getattr(settings, "predator_telegram_enabled", False))
+    expansion_allowed = bool(getattr(settings, "predator_expansion_enabled", False))
+    stage_delay = float(getattr(settings, "predator_stage_delay_s", 0.5))
+
+    def _armed_key(sig):
+        bucket = round(sig.entry / 5.0) * 5
+        return f"{sig.archetype}|{sig.direction}|{bucket}"
 
     with SessionLocal() as db:
+        # Fresh regime + reference-level context for Telegram formatting
+        try:
+            from services.regime_detector import classify_current_regime
+            regime = classify_current_regime(db)
+        except Exception:
+            regime = None
+
+        # Level lookups for ARMED message context
+        try:
+            from services.predator_engine import (
+                _load_recent, _asian_range, _prev_day_hl,
+            )
+            _m5 = _load_recent(db, "M5", n=200)
+            _a_h, _a_l = _asian_range(_m5) if _m5 else (None, None)
+            _pdh, _pdl = _prev_day_hl(_m5) if _m5 else (None, None)
+        except Exception:
+            _a_l = _pdl = None
+            _m5 = []
+
         signals = evaluate(db)
+        seen_this_tick = set()
+
         for sig in signals:
+            # dedupe by fingerprint (per M5 bar)
             last = _PREDATOR_SEEN.get(sig.fingerprint)
             if last and (now - last) < dedupe_s:
-                continue    # already fired within cooldown window
+                continue
             _PREDATOR_SEEN[sig.fingerprint] = now
-            log.info("[predator] fired %s %s @ %.2f RR=1:%.2f conf=%s",
-                     sig.archetype, sig.direction, sig.entry, sig.rr,
-                     sig.confidence)
 
-            # Record to shadow_trades (grade=archetype for bucket stats)
-            try:
-                from services.shadow_trade_simulator import record_shadow_trade
-                synthetic_verdict = {
-                    "decision":   sig.direction,
-                    "archetype":  sig.archetype,
-                    "setup_score": 85 if sig.confidence == "HIGH" else 75 if sig.confidence == "MED" else 65,
-                    "conditions_passed": 4,
-                    "trade_plan": {
-                        "entry": sig.entry, "stop_loss": sig.stop_loss,
-                        "tp1": sig.tp1, "tp2": sig.tp2,
-                        "tp1_rr": abs(sig.tp1 - sig.entry) / max(abs(sig.entry - sig.stop_loss), 0.1),
-                        "tp2_rr": abs(sig.tp2 - sig.entry) / max(abs(sig.entry - sig.stop_loss), 0.1),
-                        "invalidation": sig.stop_loss,
-                        "risk_reward": sig.rr,
-                    },
+            armed_key = _armed_key(sig)
+            seen_this_tick.add(armed_key)
+
+            # Track ARMED entries for later INVALIDATED emission
+            if sig.state == "ARMED":
+                _PREDATOR_ARMED_TRACKING[armed_key] = {
+                    "armed_at":  now,
+                    "archetype": sig.archetype,
+                    "direction": sig.direction,
+                    "last_seen": now,
                 }
-                class _PredatorGrade:
-                    grade = f"PRED_{sig.archetype}_{sig.confidence}"
-                    reason = sig.thesis
-                    composite_score = 85 if sig.confidence == "HIGH" else 75
+                log.info("[predator] ARMED %s %s @ %.2f", sig.archetype, sig.direction, sig.entry)
+            elif sig.state == "FIRE":
+                # Promote — remove from ARMED tracking (setup succeeded)
+                _PREDATOR_ARMED_TRACKING.pop(armed_key, None)
+                log.info("[predator] FIRE %s %s @ %.2f RR=1:%.2f conf=%s",
+                         sig.archetype, sig.direction, sig.entry, sig.rr, sig.confidence)
 
-                record_shadow_trade(db, synthetic_verdict, grade_result=_PredatorGrade())
-            except Exception as exc:
-                log.warning("[predator] shadow-record failed: %s", exc)
+                # Record to shadow_trades ONLY for FIRE (ARMED has no plan)
+                try:
+                    from services.shadow_trade_simulator import record_shadow_trade
+                    synthetic_verdict = {
+                        "decision":   sig.direction,
+                        "archetype":  sig.archetype,
+                        "setup_score": 85 if sig.confidence == "HIGH" else 75 if sig.confidence == "MED" else 65,
+                        "conditions_passed": 4,
+                        "trade_plan": {
+                            "entry": sig.entry, "stop_loss": sig.stop_loss,
+                            "tp1": sig.tp1, "tp2": sig.tp2,
+                            "tp1_rr": abs(sig.tp1 - sig.entry) / max(abs(sig.entry - sig.stop_loss), 0.1),
+                            "tp2_rr": abs(sig.tp2 - sig.entry) / max(abs(sig.entry - sig.stop_loss), 0.1),
+                            "invalidation": sig.stop_loss,
+                            "risk_reward": sig.rr,
+                        },
+                    }
+                    class _PredatorGrade:
+                        grade = f"PRED_{sig.archetype}_{sig.confidence}"
+                        reason = sig.thesis
+                        composite_score = 85 if sig.confidence == "HIGH" else 75
 
-            # Telegram (gated)
-            if getattr(settings, "predator_telegram_enabled", False):
+                    record_shadow_trade(db, synthetic_verdict, grade_result=_PredatorGrade())
+                except Exception as exc:
+                    log.warning("[predator] shadow-record failed: %s", exc)
+
+            # ── Sizing + execution planning (ONLY on FIRE) ──────────────
+            deployment_plan = None
+            batch = None
+            exec_result = None
+            if sig.state == "FIRE":
+                try:
+                    # Restart-safe dedupe — in-memory _PREDATOR_SEEN doesn't
+                    # survive container restart, so double-check the DB before
+                    # inserting to avoid UNIQUE-constraint failures.
+                    from db_models import PredatorSignalBatch as _PSB
+                    signal_id = f"{sig.fingerprint}"
+                    existing = db.query(_PSB).filter(
+                        _PSB.signal_id == signal_id
+                    ).first()
+                    if existing:
+                        log.info("[predator] FIRE %s skipped — batch=%d already "
+                                  "exists with signal_id=%s",
+                                  sig.archetype, existing.id, signal_id)
+                        continue
+
+                    expansion = evaluate_volume_expansion(_m5, sig.archetype)
+                    deployment_plan = plan_deployment(
+                        archetype=sig.archetype,
+                        direction=sig.direction,
+                        entry=sig.entry,
+                        stop_loss=sig.stop_loss,
+                        tp1=sig.tp1,
+                        tp2=sig.tp2,
+                        expansion=expansion,
+                        expansion_mode_allowed=expansion_allowed,
+                    )
+                    regime_dir = (regime or {}).get("direction")
+                    regime_vol = (regime or {}).get("volatility")
+                    batch = create_batch(
+                        db,
+                        signal_id=signal_id,
+                        archetype=sig.archetype,
+                        direction=sig.direction,
+                        entry_price=sig.entry,
+                        stop_loss=sig.stop_loss,
+                        tp1=sig.tp1,
+                        tp2=sig.tp2,
+                        key_level=(_a_l if sig.archetype == "ASIAN_BREAKDOWN"
+                                    else _pdl),
+                        plan=deployment_plan,
+                        regime_direction=regime_dir,
+                        regime_volatility=regime_vol,
+                    )
+                except Exception as exc:
+                    log.warning("[predator] sizing/plan failed: %s", exc)
+                    try: db.rollback()
+                    except Exception: pass
+
+            # Telegram gated — signal integrity rules already enforced
+            # in evaluate() (regime gate + extension filter). Pass level +
+            # current price to formatter for ARMED context, plan for FIRE.
+            if tele_on:
                 try:
                     from services.strategist_runner import _send_plain
-                    _send_plain(format_telegram_alert(sig))
+                    key_level = None
+                    current_price = None
+                    if sig.archetype == "ASIAN_BREAKDOWN":
+                        key_level = _a_l
+                    elif sig.archetype == "PDL_BREAK":
+                        key_level = _pdl
+                    elif sig.archetype == "APPROACHING_LEVEL":
+                        # Use whichever is closer for ARMED message
+                        candidates = [x for x in (_a_l, _pdl) if x is not None]
+                        if candidates:
+                            key_level = max(candidates)   # nearest above current close (SELL setup)
+                    if _m5:
+                        current_price = _m5[-1][4]
+                    msg = format_telegram_alert(sig, regime=regime,
+                                                    key_level=key_level,
+                                                    current_price=current_price,
+                                                    deployment_plan=deployment_plan)
+                    _send_plain(msg)
                 except Exception as exc:
                     log.warning("[predator] telegram send failed: %s", exc)
+
+            # ── Staged execution (only if FIRE + batch planned + master flag on)
+            if sig.state == "FIRE" and batch is not None:
+                try:
+                    # Per-ticket revalidation callback — enforces spec §7
+                    # "Before EVERY additional 0.03 position is opened, recalculate".
+                    max_pct = _EXTENSION_LIMIT.get(sig.archetype, 0.60)
+
+                    def _revalidate(seq_no):
+                        # Reload fresh M5 for real-time price + extension recheck
+                        from services.predator_engine import _load_recent
+                        fresh_m5 = _load_recent(db, "M5", n=200)
+                        if not fresh_m5:
+                            return False, "M5 unavailable for revalidation"
+                        fresh_price = fresh_m5[-1][4]
+
+                        # Direction-aware adverse-drift check. Only block if price
+                        # moved AGAINST the trade — favorable follow-through means
+                        # a valid setup getting better, not a reason to abort.
+                        #   SELL: adverse if fresh_price > entry
+                        #   BUY:  adverse if fresh_price < entry
+                        if sig.direction == "SELL":
+                            adverse = max(0.0, fresh_price - sig.entry)
+                        else:
+                            adverse = max(0.0, sig.entry - fresh_price)
+                        if adverse > 5.0:
+                            return False, (f"adverse drift {adverse:.1f}pt against "
+                                            f"planned entry {sig.entry:.2f}")
+
+                        # Extension recheck — how much of expected FAVORABLE move
+                        # is already consumed? Too much = LATE/EXHAUSTED = abort.
+                        expected_total = _EXPECTED_TOTAL_MOVE_PTS.get(sig.archetype, 40.0)
+                        if sig.direction == "SELL":
+                            consumed = max(0.0, (sig.entry - fresh_price) / expected_total)
+                        else:
+                            consumed = max(0.0, (fresh_price - sig.entry) / expected_total)
+                        if consumed >= max_pct:
+                            return False, (f"pct_consumed {consumed*100:.0f}% "
+                                            f">= max {max_pct*100:.0f}%")
+                        return True, "ok"
+
+                    exec_result = execute_batch_staged(
+                        db, batch,
+                        revalidate_fn=_revalidate,
+                        stage_delay_s=stage_delay,
+                    )
+                    if tele_on:
+                        try:
+                            from services.strategist_runner import _send_plain
+                            # Refresh batch state (execute_batch_staged commits)
+                            db.refresh(batch)
+                            summary = format_predator_execution_summary(
+                                batch, exec_result.get("tickets") or [],
+                                skipped_reason=(exec_result.get("reason")
+                                                if batch.execution_status
+                                                    == "SHADOW_ONLY" else None),
+                            )
+                            _send_plain(summary)
+                        except Exception as exc:
+                            log.warning("[predator] execution-summary send failed: %s", exc)
+                except Exception as exc:
+                    log.error("[predator] staged execution raised: %s", exc)
+
+        # ── Emit INVALIDATED for tracked ARMED entries that went stale ──
+        stale_keys = []
+        for key, info in _PREDATOR_ARMED_TRACKING.items():
+            if key in seen_this_tick:
+                info["last_seen"] = now
+                continue
+            age = now - info["last_seen"]
+            if age >= _PREDATOR_ARMED_STALE_S:
+                stale_keys.append(key)
+
+        for key in stale_keys:
+            info = _PREDATOR_ARMED_TRACKING.pop(key)
+            reason = ("Trigger window elapsed without M5 close breaching level; "
+                      "price moved away or regime shifted")
+            log.info("[predator] INVALIDATED %s %s (armed %ds ago)",
+                     info["archetype"], info["direction"],
+                     int(now - info["armed_at"]))
+            if tele_on:
+                try:
+                    from services.strategist_runner import _send_plain
+                    _send_plain(format_telegram_invalidated(
+                        info["archetype"], info["direction"], reason,
+                    ))
+                except Exception as exc:
+                    log.warning("[predator] invalidated-send failed: %s", exc)
 
 
 # ── Phase 11: market-intelligence alert loop ──────────────────────────────

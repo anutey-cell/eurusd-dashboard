@@ -96,6 +96,9 @@ class Settings(BaseSettings):
     # Shared secret protecting the bridge endpoints. Generate with:
     #   python -c "import secrets; print(secrets.token_urlsafe(48))"
     mt5_bridge_shared_secret:     str  = ""
+    # Previous shared secret — accepted during rotation windows so the daemon
+    # can migrate without downtime. Clear once the daemon is on the new value.
+    mt5_bridge_shared_secret_prev: str  = ""
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     # Accepts a comma-separated string from .env or a JSON array
@@ -273,6 +276,25 @@ class Settings(BaseSettings):
     # agree on all shipped signals, flip shadow_mode → False and disable the
     # matching legacy path for the same strategy.
     notification_canonical_enabled: bool = True    # master switch for the new layer
+
+    # Per-message-type confidence thresholds (env override for the router's
+    # _DEFAULT_THRESHOLDS). Set MONITORING high to mute watchlist heads-ups;
+    # keep INVALIDATED >= ACTIONABLE so only real-trade candidates trigger
+    # invalidation alerts. 101 = always suppress.
+    notification_threshold_monitoring:      int = 65
+    notification_threshold_actionable:      int = 80
+    notification_threshold_high_confluence: int = 90
+    notification_threshold_invalidated:     int = 65
+    notification_threshold_expired:         int = 80
+    notification_threshold_entry_triggered: int = 80
+    notification_threshold_tp1_hit:         int = 80
+    notification_threshold_tp2_hit:         int = 80
+    notification_threshold_final_target:    int = 80
+    notification_threshold_breakeven:       int = 80
+    notification_threshold_trailing:        int = 80
+    notification_threshold_stop_hit:        int = 0
+    notification_threshold_post_trade_review: int = 0
+    notification_threshold_end_of_session:  int = 0
     notification_shadow_mode:       bool = True    # canonical is dry-run parallel to legacy
     notification_mode:              str  = "standard"  # minimal | standard | detailed
 
@@ -322,6 +344,31 @@ class Settings(BaseSettings):
     predator_telegram_enabled:     bool = False
     predator_loop_interval_s:      int  = 60
     predator_dedupe_cooldown_s:    int  = 3600      # 1 hour between same fingerprint
+
+    # DEMO execution wiring (spec §7 — Predator sizing architecture).
+    # Master gate. When False, every FIRE plans a batch + writes shadow rows
+    # (predator_signal_batches + predator_positions status=PLANNED) but sends
+    # NO MT5 orders. Flip to True to activate STANDARD-tier execution.
+    predator_execution_enabled:    bool  = False
+
+    # EXPANSION mode gate. Only takes effect when execution is enabled AND the
+    # per-archetype VOLUME_EXPANSION_CONFIRMED threshold is met on the fire bar.
+    # Kept as a separate flag so STANDARD-only rollouts are possible.
+    predator_expansion_enabled:    bool  = False
+
+    # Non-negotiable sizing constants — mirrored from predator_position_sizer.
+    # Kept here as env-visible values but the sizer treats its own module
+    # constants as authoritative; do NOT flex these to "increase" exposure.
+    predator_lot_size:             float = 0.03
+    predator_standard_max_positions: int = 5
+    predator_expansion_max_positions: int = 10
+    predator_standard_max_exposure_lots: float = 0.15
+    predator_expansion_max_exposure_lots: float = 0.30
+    predator_absolute_exposure_ceiling: float = 0.30
+
+    # Staged deployment gap between tickets (seconds). Small — gives the bridge
+    # daemon breathing room between fills without letting price drift too much.
+    predator_stage_delay_s:        float = 0.5
 
     # ── Shadow trade simulator (data source for grader calibration) ──────────
     # Records EVERY BUY/SELL verdict (all grades A+/A/B/C) with a complete
