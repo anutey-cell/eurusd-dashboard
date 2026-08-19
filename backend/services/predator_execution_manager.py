@@ -298,18 +298,27 @@ def execute_batch_staged(
 
     Returns a summary dict with counts + ticket ids.
     """
+    # Observability helper (fail-open) — persists portfolio-level rejections
+    def _obs_portfolio_reject(reason: str, detail: str) -> None:
+        try:
+            from services.predator_observability import log_portfolio_rejection
+            log_portfolio_rejection(db, batch=batch, reason=reason, detail=detail)
+        except Exception: pass
+
     # Master gate — respects the shadow-mode default (predator_execution_enabled=False)
     if not getattr(settings, "predator_execution_enabled", False):
         log.info("[predator_exec] batch=%d SHADOW-MODE — execution disabled by flag; "
                   "positions stay PLANNED", batch.id)
         _set_batch_status(db, batch, "SHADOW_ONLY",
                             abort_reason="predator_execution_enabled=false")
+        _obs_portfolio_reject("PORTFOLIO_KILL_SWITCH", "predator_execution_enabled=false")
         return {"opened": 0, "aborted_after": 0, "mode": "SHADOW_ONLY",
                 "tickets": [], "reason": "shadow mode"}
 
     if not getattr(settings, "mt5_bridge_enabled", False):
         _set_batch_status(db, batch, "ABORTED",
                             abort_reason="mt5_bridge_enabled=false")
+        _obs_portfolio_reject("PORTFOLIO_BRIDGE_DISABLED", "mt5_bridge_enabled=false")
         return {"opened": 0, "aborted_after": 0, "mode": batch.exposure_mode,
                 "tickets": [], "reason": "bridge disabled"}
 
@@ -319,6 +328,7 @@ def execute_batch_staged(
                     batch.id, demo_msg)
         _set_batch_status(db, batch, "ABORTED",
                             abort_reason=f"demo-guard: {demo_msg}")
+        _obs_portfolio_reject("PORTFOLIO_DEMO_GUARD_FAILED", demo_msg)
         return {"opened": 0, "aborted_after": 0, "mode": batch.exposure_mode,
                 "tickets": [], "reason": f"demo-guard: {demo_msg}"}
 
@@ -344,6 +354,8 @@ def execute_batch_staged(
                         batch.id, pos.seq_no, reason)
             _mark_position(db, pos, status="REJECTED",
                             reject_reason=f"exposure guard: {reason}")
+            _obs_portfolio_reject("PORTFOLIO_EXPOSURE_CAP",
+                                  f"seq={pos.seq_no} reason={reason}")
             aborted_after = pos.seq_no - 1
             break
 

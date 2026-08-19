@@ -138,6 +138,7 @@ def freeze_journal_context(
 
 
 REJECTION_REASONS = {
+    # Strategy-level (Champion said "no trade")
     "INSUFFICIENT_M5",
     "REGIME_UNFAVORABLE",
     "REGIME_ERROR",
@@ -145,7 +146,73 @@ REJECTION_REASONS = {
     "EXTENSION_EXCEEDED",
     "DUPLICATE_SIGNAL",
     "NO_FIRE",
+    # Portfolio-level (Champion said "trade" but implementation blocked it)
+    "PORTFOLIO_EXPOSURE_CAP",
+    "PORTFOLIO_DUPLICATE_GUARD",
+    "PORTFOLIO_SHADOW_MODE",
+    "PORTFOLIO_BRIDGE_DISABLED",
+    "PORTFOLIO_DEMO_GUARD_FAILED",
+    "PORTFOLIO_REVALIDATE_FAILED",
+    "PORTFOLIO_KILL_SWITCH",
+    "PORTFOLIO_MT5_ERROR",
+    "PORTFOLIO_BROKER_REJECTED",
+    "PORTFOLIO_OTHER",
 }
+STRATEGY_REJECTIONS = {r for r in REJECTION_REASONS if not r.startswith("PORTFOLIO_")}
+PORTFOLIO_REJECTIONS = {r for r in REJECTION_REASONS if r.startswith("PORTFOLIO_")}
+
+
+def log_portfolio_rejection(
+    db: Session,
+    *,
+    batch,
+    reason: str,
+    detail: Optional[str] = None,
+) -> None:
+    """Persist a portfolio/execution-level rejection to predator_rejections.
+    Reason must be one of PORTFOLIO_* constants. Fail-open."""
+    try:
+        from db_models import PredatorRejection
+        r = PredatorRejection(
+            opportunity_id=getattr(batch, "opportunity_id", None),
+            archetype=batch.archetype,
+            direction=batch.direction,
+            rejection_reason=reason,
+            rejection_detail=(detail or "")[:255],
+            hypothetical_entry=batch.entry_price,
+            hypothetical_sl=batch.stop_loss,
+            hypothetical_tp1=batch.tp1,
+            hypothetical_tp2=batch.tp2,
+            key_level=batch.key_level,
+            regime_direction=batch.regime_direction,
+            regime_volatility=batch.regime_volatility,
+            trend_context=batch.trend_context,
+            velocity_state=batch.velocity_state,
+            compression_state=batch.compression_state,
+            transition_state=batch.transition_state,
+            gc_context=batch.gc_context,
+            spread_at_decision=batch.spread_at_fire,
+        )
+        db.add(r)
+        db.commit()
+        # Also update the forward opportunity ledger row if present
+        try:
+            from db_models import PredatorForwardOpportunity
+            row = db.query(PredatorForwardOpportunity).filter(
+                PredatorForwardOpportunity.opportunity_id == batch.opportunity_id
+            ).order_by(PredatorForwardOpportunity.id.desc()).first()
+            if row:
+                row.portfolio_decision = "SKIPPED_" + reason.replace("PORTFOLIO_", "")[:20]
+                row.portfolio_skip_reason = (detail or reason)[:64]
+                row.resolved_at = datetime.now(timezone.utc)
+                row.resolution_status = "RESOLVED"
+                db.commit()
+        except Exception:
+            pass
+    except Exception as exc:
+        log.debug("[obs] portfolio rejection log failed: %s", exc)
+        try: db.rollback()
+        except Exception: pass
 
 
 def log_rejection(
