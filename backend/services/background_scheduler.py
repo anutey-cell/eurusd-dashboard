@@ -489,7 +489,7 @@ async def _candle_ingestion_slow_loop():
 
 def _run_candle_ingestion(only_tf: Optional[tuple] = None):
     from database import SessionLocal
-    from services.candle_ingestion import top_up_recent
+    from services.candle_ingestion import top_up_recent, ingest_gc_futures
     with SessionLocal() as db:
         r = top_up_recent(db, pair="xauusd", only_timeframes=only_tf)
         if r["totals"]["inserted"] or r["totals"]["errors"]:
@@ -497,6 +497,17 @@ def _run_candle_ingestion(only_tf: Optional[tuple] = None):
                      only_tf or "ALL",
                      r["totals"]["inserted"], r["totals"]["skipped"],
                      r["totals"]["errors"])
+        # P189 — independent GC=F ingestion (never contaminates XAU/USD).
+        # Only run on the fast loop (M5+M15) — enough granularity for basis work.
+        if only_tf and "M5" in only_tf:
+            try:
+                gc_r = ingest_gc_futures(db, timeframes=("M5", "M15", "H1"))
+                if gc_r["totals"]["inserted"]:
+                    log.info("[gc_ingest] inserted=%d skipped=%d errors=%d",
+                              gc_r["totals"]["inserted"], gc_r["totals"]["skipped"],
+                              gc_r["totals"]["errors"])
+            except Exception as exc:
+                log.debug("[gc_ingest] skipped: %s", exc)
 
 
 # ── P131: data-freshness sentinel loop ──────────────────────────────────────
@@ -782,6 +793,21 @@ def _run_predator_iteration():
                     )
                     regime_dir = (regime or {}).get("direction")
                     regime_vol = (regime or {}).get("volatility")
+                    # Freeze decision-journal context (observation only) — never
+                    # reconstructed later. Fail-open on any lookup failure.
+                    try:
+                        from services.predator_observability import freeze_journal_context
+                        _journal = freeze_journal_context(
+                            db,
+                            signal_direction=sig.direction,
+                            signal_archetype=sig.archetype,
+                            key_level=(_a_l if sig.archetype == "ASIAN_BREAKDOWN" else _pdl),
+                            regime=regime,
+                            m5=_m5,
+                        )
+                    except Exception as _jexc:
+                        log.debug("[predator] journal freeze failed: %s", _jexc)
+                        _journal = {}
                     batch = create_batch(
                         db,
                         signal_id=signal_id,
@@ -796,7 +822,42 @@ def _run_predator_iteration():
                         plan=deployment_plan,
                         regime_direction=regime_dir,
                         regime_volatility=regime_vol,
+                        trend_context=_journal.get("trend_context"),
+                        htf_disagreement=_journal.get("htf_disagreement"),
+                        transition_state=_journal.get("transition_state"),
+                        velocity_state=_journal.get("velocity_state"),
+                        compression_state=_journal.get("compression_state"),
+                        time_at_level_min=_journal.get("time_at_level_min"),
+                        gc_context=_journal.get("gc_context"),
+                        spread_at_fire=_journal.get("spread_at_fire"),
                     )
+
+                    # Forward opportunity ledger (observation only)
+                    try:
+                        from services.predator_observability import (
+                            record_forward_opportunity, current_predator_open_lots,
+                        )
+                        _open_lots = current_predator_open_lots(db)
+                        _avail = max(0.0, 0.15 - _open_lots)
+                        record_forward_opportunity(
+                            db,
+                            opportunity_id=batch.opportunity_id,
+                            signal_id=signal_id,
+                            archetype=sig.archetype,
+                            direction=sig.direction,
+                            model_decision="FIRE",
+                            portfolio_decision="PENDING",
+                            expected_entry=sig.entry,
+                            sl=sig.stop_loss,
+                            tp1=sig.tp1,
+                            tp2=sig.tp2,
+                            expected_tickets=len(deployment_plan.positions),
+                            expected_lots=deployment_plan.max_exposure_lots,
+                            actual_available_capacity=_avail,
+                            actual_open_exposure=_open_lots,
+                        )
+                    except Exception as _fexc:
+                        log.debug("[predator] forward ledger failed: %s", _fexc)
                 except Exception as exc:
                     log.warning("[predator] sizing/plan failed: %s", exc)
                     try: db.rollback()

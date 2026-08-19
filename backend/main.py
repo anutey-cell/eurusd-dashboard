@@ -20,6 +20,7 @@ from middleware import RequestLoggingMiddleware, AuthMiddleware
 from rate_limit import limiter
 from routers import health, candles, calendar, signal, analytics, backtest, execution, mt5 as mt5_router, telegram as telegram_router, engine as engine_router, readiness as readiness_router, risk as risk_router, scan as scan_router, observations as observations_router, prediction as prediction_router, killzones as killzones_router, institutional as institutional_router, bridge as bridge_router, diagnostics as diagnostics_router, strategist as strategist_router, summary as summary_router, vp_trap as vp_trap_router, kz_magnet as kz_magnet_router
 from routers.overview import router as overview_router
+from routers import predator_convergence as predator_convergence_router
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
 
@@ -228,6 +229,7 @@ app.include_router(killzones_router.router,    prefix=prefix)
 app.include_router(institutional_router.router, prefix=prefix)
 app.include_router(bridge_router.router,         prefix=prefix)
 app.include_router(diagnostics_router.router,    prefix=prefix)
+app.include_router(predator_convergence_router.router, prefix=prefix)
 app.include_router(strategist_router.router,     prefix=prefix)
 app.include_router(vp_trap_router.router,        prefix=prefix)
 app.include_router(kz_magnet_router.router,      prefix=prefix)

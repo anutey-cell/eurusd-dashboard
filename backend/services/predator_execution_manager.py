@@ -21,7 +21,7 @@ import json
 import logging
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from sqlalchemy import text
@@ -37,6 +37,10 @@ from services.predator_position_sizer import (
 )
 
 log = logging.getLogger(__name__)
+
+# Baseline model identifier. Any future decision-layer variant (IV, MBO, etc.)
+# MUST use a new version string so historical baseline stats remain uncontaminated.
+PREDATOR_MODEL_VERSION = "PREDATOR_v1.0_M5"
 
 
 # ── Reused helpers (mirror strategist_runner pattern) ────────────────────────
@@ -166,16 +170,67 @@ def create_batch(
     plan: DeploymentPlan,
     regime_direction: Optional[str] = None,
     regime_volatility: Optional[str] = None,
+    # Decision-journal context (observation only) — frozen at FIRE time,
+    # never reconstructed later. All optional for backward compat.
+    trend_context: Optional[str] = None,
+    htf_disagreement: Optional[int] = None,
+    transition_state: Optional[str] = None,
+    velocity_state: Optional[str] = None,
+    compression_state: Optional[str] = None,
+    time_at_level_min: Optional[float] = None,
+    gc_context: Optional[str] = None,
+    spread_at_fire: Optional[float] = None,
 ) -> PredatorSignalBatch:
     """
     Persist the batch header + all planned position rows (status=PLANNED).
     No enqueuing yet — that happens in `execute_batch_staged`.
     """
     ev = plan.expansion_evidence
+
+    # Canonical opportunity_id (P26 audit) — deterministic, uses only signal-time info.
+    # Session-reset ON + structural key level bucket. Same-level FIREs in same
+    # session on same trading day cluster into ONE opportunity.
+    _now_utc = datetime.now(timezone.utc)
+    _tday = (_now_utc.date() if _now_utc.hour < 22
+             else _now_utc.date() + timedelta(days=1))
+    _sess_hr = _now_utc.hour
+    if 0 <= _sess_hr < 7:      _sess = "ASIA"
+    elif 7 <= _sess_hr < 12:   _sess = "LONDON"
+    elif 12 <= _sess_hr < 16:  _sess = "NY_OPEN"
+    elif 16 <= _sess_hr < 22:  _sess = "NY_PM"
+    else:                       _sess = "ROLLOVER"
+    _key_bucket = round((key_level or entry_price) / 5.0) * 5.0
+    _opp_id = f"{archetype}·{direction}·{_tday}·{_key_bucket:.0f}·{_sess}"
+    # Check DB for existing opportunity with this base — if resolved primary >60pt
+    # away, treat as new; otherwise reuse.
+    from db_models import PredatorSignalBatch as _PSB
+    _existing = db.query(_PSB).filter(
+        _PSB.opportunity_id == _opp_id
+    ).order_by(_PSB.created_at.desc()).first()
+    _is_primary = True
+    _fire_seq = 1
+    _opp_created = _now_utc
+    if _existing:
+        prior_entry = _existing.entry_price
+        if abs(entry_price - prior_entry) < 60:
+            # Same opportunity — this is a subsequent FIRE
+            _is_primary = False
+            _fire_seq = (_existing.fire_sequence_within_opportunity or 1) + 1
+            _opp_created = _existing.opportunity_created_at or _existing.created_at
+        else:
+            # Structural reset — suffix the id
+            _opp_id = f"{_opp_id}·reset·{_now_utc.strftime('%H%M')}"
+
     batch = PredatorSignalBatch(
         signal_id=signal_id,
         archetype=archetype,
         direction=direction,
+        predator_version=PREDATOR_MODEL_VERSION,
+        opportunity_id=_opp_id,
+        opportunity_state="FIRE",
+        is_primary_fire=_is_primary,
+        fire_sequence_within_opportunity=_fire_seq,
+        opportunity_created_at=_opp_created,
         entry_price=entry_price,
         stop_loss=stop_loss,
         tp1=tp1,
@@ -192,6 +247,15 @@ def create_batch(
         regime_direction=regime_direction,
         regime_volatility=regime_volatility,
         execution_status="PLANNED",
+        # Decision journal (observation only)
+        trend_context=trend_context,
+        htf_disagreement=htf_disagreement,
+        transition_state=transition_state,
+        velocity_state=velocity_state,
+        compression_state=compression_state,
+        time_at_level_min=time_at_level_min,
+        gc_context=gc_context,
+        spread_at_fire=spread_at_fire,
     )
     db.add(batch)
     db.flush()   # populate batch.id
@@ -200,6 +264,7 @@ def create_batch(
         pos = PredatorPosition(
             batch_id=batch.id,
             seq_no=p.seq_no,
+            predator_version=PREDATOR_MODEL_VERSION,
             lot_size=p.lot_size,
             tp_target=p.tp_target,
             entry_price_planned=p.entry_price,

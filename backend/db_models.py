@@ -833,6 +833,8 @@ class ShadowTrade(Base):
     fingerprint           = Column(String(48), nullable=False, index=True, unique=True)
     verdict_id            = Column(Integer, nullable=True)          # optional FK to strategist_verdicts
     instrument            = Column(String(16), default="XAU/USD", nullable=False, index=True)
+    # Model version — populated for predator-sourced rows; NULL for mandate rows
+    predator_version      = Column(String(32), nullable=True)
 
     # Grading context
     grade                 = Column(String(16), nullable=False, index=True)   # A+ / A / B / C / STAND_ASIDE / INSUFFICIENT_DATA
@@ -1003,11 +1005,38 @@ class PredatorSignalBatch(Base):
     id                = Column(Integer, primary_key=True, autoincrement=True)
     created_at        = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
 
+    # Opportunity lifecycle (P26 — canonical opportunity accounting)
+    # A single "opportunity" represents ONE structural market thesis;
+    # multiple FIREs on the same key level within the same session belong
+    # to the same opportunity. Populated at FIRE time by
+    # predator_execution_manager.create_batch() using the canonical algorithm
+    # (session-reset ON, structural-reset on price drift >75pt after resolution).
+    opportunity_id            = Column(String(96), nullable=True, index=True)
+    opportunity_state         = Column(String(16), nullable=True)   # CREATED|ARMED|FIRE|ACTIVE|RESOLVED|INVALIDATED|RESET
+    is_primary_fire           = Column(Boolean, nullable=True)
+    fire_sequence_within_opportunity = Column(Integer, nullable=True)
+    opportunity_created_at    = Column(DateTime(timezone=True), nullable=True)
+    opportunity_resolved_at   = Column(DateTime(timezone=True), nullable=True)
+    opportunity_reset_reason  = Column(String(64), nullable=True)
+
+    # Decision journal — frozen at signal time (never reconstructed)
+    trend_context        = Column(String(32), nullable=True)  # WITH_TREND|HTF_DISAGREEMENT|TRANSITION
+    htf_disagreement     = Column(Boolean, nullable=True)
+    transition_state     = Column(String(32), nullable=True)  # STABLE|EARLY|MATURE
+    velocity_state       = Column(String(24), nullable=True)  # SLOW|NORMAL|ACCELERATING|EXHAUSTED
+    compression_state    = Column(String(24), nullable=True)
+    time_at_level_min    = Column(Float, nullable=True)
+    gc_context           = Column(String(24), nullable=True)  # ALIGNED|OPPOSED|NEUTRAL|NO_DATA
+    spread_at_fire       = Column(Float, nullable=True)
+
     # Signal identity
     signal_id         = Column(String(64), nullable=False, unique=True, index=True)
     archetype         = Column(String(32), nullable=False)   # ASIAN_BREAKDOWN | PDL_BREAK | VOL_CONTINUATION
     direction         = Column(String(8),  nullable=False)   # SELL (predator is SELL-only)
-    predator_version  = Column(String(16), nullable=False, default="v1")
+    # Baseline model identifier — every batch must be traceable to the exact
+    # engine version that produced it, so future decision-layer variants can
+    # be A/B compared without contaminating the baseline sample.
+    predator_version  = Column(String(32), nullable=False, default="PREDATOR_v1.0_M5")
 
     # Trade plan (validated archetype targets)
     entry_price       = Column(Float, nullable=False)
@@ -1052,6 +1081,7 @@ class PredatorPosition(Base):
     batch_id              = Column(Integer, nullable=False, index=True)   # → predator_signal_batches.id
     seq_no                = Column(Integer, nullable=False)               # 1..N within the batch
     created_at            = Column(DateTime(timezone=True), default=_now, nullable=False)
+    predator_version      = Column(String(32), nullable=False, default="PREDATOR_v1.0_M5")
 
     # Ticket plan
     lot_size              = Column(Float, nullable=False, default=0.03)
@@ -1082,3 +1112,158 @@ class PredatorPosition(Base):
     status                = Column(String(16), nullable=False, default="PLANNED", index=True)
     # PLANNED | ENQUEUED | REJECTED | OPEN | CLOSED
     reject_reason         = Column(String(255), nullable=True)
+
+
+# ── GC futures bars — independent from XAU/USD (P189) ────────────────────────
+# Yahoo GC=F used to be retagged as XAU/USD candles for freshness fallback.
+# That mixed spot and futures into the same series, contaminating any
+# future GC-vs-XAU basis analysis. This table keeps GC bars distinct.
+# Deprecates the Yahoo-as-XAUUSD-fallback path.
+
+class GcFuturesBar(Base):
+    __tablename__ = "gc_futures_bars"
+    __table_args__ = (
+        UniqueConstraint("contract", "timeframe", "candle_time",
+                          name="ux_gc_contract_tf_time"),
+    )
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    created_at  = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    contract    = Column(String(16), nullable=False, index=True, default="GC=F")
+    # "GC=F" = Yahoo's continuous front-month; when a real futures feed is added
+    # this will become the specific listed contract (e.g. "GCZ26").
+    timeframe   = Column(String(8), nullable=False, index=True)   # M5 | M15 | H1 | H4 | D1
+    candle_time = Column(DateTime(timezone=True), nullable=False, index=True)
+    open        = Column(Float, nullable=False)
+    high        = Column(Float, nullable=False)
+    low         = Column(Float, nullable=False)
+    close       = Column(Float, nullable=False)
+    volume      = Column(Float, nullable=True)
+    source      = Column(String(16), nullable=False, default="yahoo")
+
+
+# ── Predator rejections (observation-only) ────────────────────────────────
+# Every candidate that Predator considered but rejected is frozen here at
+# decision time with the hypothetical trade plan + full context. Later a
+# reconciler walks the M5 outcome path to determine what the trade WOULD
+# have paid. Enables economic evaluation of every gate/filter.
+
+class PredatorRejection(Base):
+    __tablename__ = "predator_rejections"
+
+    id                    = Column(Integer, primary_key=True, autoincrement=True)
+    created_at            = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    opportunity_id        = Column(String(96), nullable=True, index=True)
+    predator_version      = Column(String(32), nullable=False, default="PREDATOR_v1.0_M5")
+
+    # Signal identity
+    archetype             = Column(String(32), nullable=False)
+    direction             = Column(String(8),  nullable=False)
+    rejection_reason      = Column(String(64), nullable=False, index=True)
+    rejection_detail      = Column(String(255), nullable=True)
+
+    # Hypothetical trade plan (what would have been enqueued)
+    hypothetical_entry    = Column(Float, nullable=True)
+    hypothetical_sl       = Column(Float, nullable=True)
+    hypothetical_tp1      = Column(Float, nullable=True)
+    hypothetical_tp2      = Column(Float, nullable=True)
+    key_level             = Column(Float, nullable=True)
+
+    # Frozen context (never reconstructed)
+    session               = Column(String(16), nullable=True)
+    regime_direction      = Column(String(32), nullable=True)
+    regime_volatility     = Column(String(16), nullable=True)
+    extension_pct         = Column(Float, nullable=True)
+    velocity_state        = Column(String(24), nullable=True)
+    trend_context         = Column(String(32), nullable=True)
+    transition_state      = Column(String(32), nullable=True)
+    compression_state     = Column(String(24), nullable=True)
+    gc_context            = Column(String(24), nullable=True)
+    spread_at_decision    = Column(Float, nullable=True)
+
+    # Outcome walk (populated by a reconciler AFTER the fact — not at decision time)
+    outcome               = Column(String(16), nullable=True)  # TP1|TP2|SL|TIMEOUT
+    outcome_pnl_pts       = Column(Float, nullable=True)
+    outcome_walked_at     = Column(DateTime(timezone=True), nullable=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Forward convergence infrastructure (2026-08-19 launch)
+# One row per unique canonical forward opportunity from launch onward.
+# Distinguishes STRATEGY REJECTION (Champion says no trade) vs PORTFOLIO
+# REJECTION (Champion says trade but exposure/duplicate blocks it).
+# ═════════════════════════════════════════════════════════════════════════════
+
+class PredatorForwardOpportunity(Base):
+    __tablename__ = "predator_forward_opportunities"
+
+    id                          = Column(Integer, primary_key=True, autoincrement=True)
+    created_at                  = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    resolved_at                 = Column(DateTime(timezone=True), nullable=True)
+    opportunity_id              = Column(String(96), nullable=False, index=True)
+    signal_id                   = Column(String(64), nullable=True, index=True)
+    model_version               = Column(String(32), nullable=False, default="PREDATOR_v1.0_M5")
+    archetype                   = Column(String(32), nullable=False)
+    direction                   = Column(String(8),  nullable=False)
+
+    # STRATEGY level: what did Champion decide?
+    model_decision              = Column(String(16), nullable=False)   # FIRE | ARMED | REJECT
+    strategy_rejection_reason   = Column(String(64), nullable=True)
+
+    # PORTFOLIO level: could it actually execute?
+    portfolio_decision          = Column(String(24), nullable=True)     # EXECUTED | SKIPPED_EXPOSURE | DUPLICATE | ERROR | PENDING
+    portfolio_skip_reason       = Column(String(64), nullable=True)
+
+    # Frozen expected trade
+    expected_entry              = Column(Float, nullable=True)
+    sl                          = Column(Float, nullable=True)
+    tp1                         = Column(Float, nullable=True)
+    tp2                         = Column(Float, nullable=True)
+    expected_tickets            = Column(Integer, nullable=True)
+    expected_lots               = Column(Float, nullable=True)
+
+    # Portfolio state at decision time
+    actual_available_capacity   = Column(Float, nullable=True)
+    actual_open_exposure        = Column(Float, nullable=True)
+
+    # Resolution
+    resolution_status           = Column(String(16), nullable=True)     # PENDING | RESOLVED | ORPHAN
+
+
+class PredatorDemoConvergence(Base):
+    """One row per closed executed batch, pairing FORWARD_MODEL_RESULT with
+    ACTUAL_DEMO_RESULT. Populated by a resolver after batch closure."""
+    __tablename__ = "predator_demo_convergence"
+
+    id                          = Column(Integer, primary_key=True, autoincrement=True)
+    created_at                  = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    opportunity_id              = Column(String(96), nullable=False, index=True)
+    batch_id                    = Column(Integer, nullable=True, index=True)
+
+    # Model expectation
+    model_entry                 = Column(Float, nullable=True)
+    model_exit                  = Column(Float, nullable=True)
+    model_lots                  = Column(Float, nullable=True)
+    model_pnl_usd               = Column(Float, nullable=True)
+    model_pnl_pts               = Column(Float, nullable=True)
+    model_r                     = Column(Float, nullable=True)
+    model_holding_min           = Column(Float, nullable=True)
+
+    # Actual demo
+    actual_entry                = Column(Float, nullable=True)
+    actual_exit                 = Column(Float, nullable=True)
+    actual_lots                 = Column(Float, nullable=True)
+    actual_pnl_usd              = Column(Float, nullable=True)
+    actual_pnl_pts              = Column(Float, nullable=True)
+    actual_r                    = Column(Float, nullable=True)
+    actual_holding_min          = Column(Float, nullable=True)
+
+    # Deltas
+    entry_slippage_pts          = Column(Float, nullable=True)
+    exit_diff_pts               = Column(Float, nullable=True)
+    cost_diff_usd               = Column(Float, nullable=True)
+    ticket_count_diff           = Column(Integer, nullable=True)
+    execution_latency_ms        = Column(Integer, nullable=True)
+
+    # Classification: MATCH | ECONOMIC_DRIFT | OUTCOME_DIVERGENCE | EXECUTION_MISS | ORPHAN_EXECUTION
+    convergence_class           = Column(String(24), nullable=True, index=True)

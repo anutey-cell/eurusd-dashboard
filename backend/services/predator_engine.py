@@ -465,6 +465,13 @@ def evaluate(db: Session) -> list[PredatorSignal]:
     m5 = _load_recent(db, "M5", n=300)      # ≥250 for lookback + 50 vol window
     if len(m5) < 80:
         log.debug("[predator] insufficient M5 bars (%d)", len(m5))
+        # OBSERVATION only — never changes control flow
+        try:
+            from services.predator_observability import log_rejection
+            log_rejection(db, archetype="ANY", direction="SELL",
+                          rejection_reason="INSUFFICIENT_M5",
+                          rejection_detail=f"m5_count={len(m5)}", m5=m5)
+        except Exception: pass
         return []
 
     # Regime gate
@@ -477,12 +484,25 @@ def evaluate(db: Session) -> list[PredatorSignal]:
         allowed, reason = is_predator_favorable_regime(regime)
         if not allowed:
             log.debug("[predator] suppressed by regime gate: %s", reason)
+            try:
+                from services.predator_observability import log_rejection
+                log_rejection(db, archetype="ANY", direction="SELL",
+                              rejection_reason="REGIME_UNFAVORABLE",
+                              rejection_detail=str(reason)[:255],
+                              regime=regime, m5=m5)
+            except Exception: pass
             return []
         regime_mult = regime_confidence_multiplier(
             regime.get("direction"), regime.get("volatility"),
         )
     except Exception as exc:
         log.warning("[predator] regime gate errored: %s", exc)
+        try:
+            from services.predator_observability import log_rejection
+            log_rejection(db, archetype="ANY", direction="SELL",
+                          rejection_reason="REGIME_ERROR",
+                          rejection_detail=str(exc)[:255], m5=m5)
+        except Exception: pass
         return []
 
     rsi_h1 = _last_h1_rsi(db)
