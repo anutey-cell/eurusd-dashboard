@@ -1408,3 +1408,63 @@ class LifecycleCanonicalOpportunity(Base):
     first_sl               = Column(Float, nullable=True)
     first_tp1              = Column(Float, nullable=True)
     first_tp2              = Column(Float, nullable=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Forward opportunity coverage ledger (2026-08-21 observation sprint)
+# One row per canonical UP/DOWN market expansion. Retrospective coverage
+# classification against Predator + Strategist detection. Never a signal
+# source — purely measurement.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class XauusdForwardCoverage(Base):
+    __tablename__ = "xauusd_forward_coverage"
+
+    id                          = Column(Integer, primary_key=True, autoincrement=True)
+    created_at                  = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    updated_at                  = Column(DateTime(timezone=True), nullable=True)
+
+    # Canonical event
+    event_id                    = Column(String(96), nullable=False, unique=True, index=True)
+    direction                   = Column(String(8),  nullable=False, index=True)   # UP | DOWN
+    threshold_pts               = Column(Integer, nullable=False, index=True)      # 20 | 30 | 50 | 70
+    expansion_start_at          = Column(DateTime(timezone=True), nullable=False, index=True)
+    expansion_start_price       = Column(Float, nullable=False)
+    expansion_peak_at           = Column(DateTime(timezone=True), nullable=True)
+    expansion_peak_price        = Column(Float, nullable=True)
+    total_excursion_pts         = Column(Float, nullable=True)
+    session                     = Column(String(16), nullable=True)
+
+    # Coverage classification (ONE primary)
+    classification              = Column(String(48), nullable=True, index=True)
+    # EXECUTED_OPPORTUNITY | DETECTED_NOT_EXECUTED_PORTFOLIO | DETECTED_SHADOW_ONLY |
+    # DETECTED_BELOW_EXECUTION_THRESHOLD | MARKET_STATE_ONLY | UNREPRESENTED_MARKET_MOVE
+
+    # Attribution (any engine that detected before/during expansion)
+    predator_detected           = Column(Integer, default=0)         # boolean
+    predator_executed           = Column(Integer, default=0)
+    strategist_detected         = Column(Integer, default=0)
+    strategist_executed         = Column(Integer, default=0)
+    strategist_below_threshold  = Column(Integer, default=0)
+    strategist_sell_shadow      = Column(Integer, default=0)
+
+    # First relevant detection
+    first_detection_engine      = Column(String(32), nullable=True)
+    first_detection_at          = Column(DateTime(timezone=True), nullable=True)
+    lead_time_min               = Column(Float, nullable=True)       # negative → detected AFTER expansion started
+
+    # Execution (if applicable)
+    execution_at                = Column(DateTime(timezone=True), nullable=True)
+    execution_engine            = Column(String(24), nullable=True)
+    capture_ratio               = Column(Float, nullable=True)       # realized pts / available pts after entry
+
+    # Market-state at expansion start
+    regime_direction            = Column(String(24), nullable=True)
+    regime_volatility           = Column(String(16), nullable=True)
+
+    # Portfolio state at expansion start (for BLOCKED classification)
+    gross_lots_at_start         = Column(Float, nullable=True)
+    remaining_capacity          = Column(Float, nullable=True)
+
+    # Unrepresented context (only populated when classification == UNREPRESENTED_MARKET_MOVE)
+    prior_regime_snapshot       = Column(String(255), nullable=True)

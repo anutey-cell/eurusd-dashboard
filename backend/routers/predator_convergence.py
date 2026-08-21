@@ -530,6 +530,48 @@ def dual_mandate_health(db: Session = Depends(get_db)):
     }
 
 
+@router.get("/xauusd-coverage")
+def xauusd_coverage(db: Session = Depends(get_db), days: int = 7):
+    """Forward-coverage report: what fraction of meaningful market moves
+    did the strategy library recognize? Read-only observation."""
+    from services.forward_coverage import coverage_summary, latest_unrepresented
+    from services.portfolio_governor import snapshot as gov_snapshot, MAX_GROSS_LOTS
+    snap = gov_snapshot(db)
+    summary = coverage_summary(db, since_days=days)
+    unrep_up = latest_unrepresented(db, "UP", 10)
+    unrep_down = latest_unrepresented(db, "DOWN", 10)
+
+    # Silence classification for the operator
+    if snap["mt5_authoritative"] is False:
+        silence_status = "MT5_STATE_STALE — governor blocking new orders"
+    elif snap.get("committed_gross", 0) >= MAX_GROSS_LOTS - 0.001:
+        silence_status = "PORTFOLIO_FULL — valid setups blocked until capacity frees"
+    else:
+        silence_status = "READY — awaiting next valid strategy setup"
+
+    return {
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "period_days": days,
+        "coverage": summary,
+        "unrepresented_recent": {
+            "UP":   unrep_up,
+            "DOWN": unrep_down,
+        },
+        "silence_status": silence_status,
+        "engines": {
+            "PREDATOR_SELL":               "detection+execution ACTIVE",
+            "STRATEGIST_BUY":              "detection+execution ACTIVE",
+            "STRATEGIST_SELL":             "detection ACTIVE, execution DISABLED (shadow only)",
+        },
+        "portfolio": snap,
+        "note": ("Coverage is a MEASUREMENT layer. Never triggers signal generation. "
+                 "Detection = 'engine produced pre-move opportunity'. "
+                 "Execution = 'engine actually filled'. "
+                 "UNREPRESENTED = 'no engine had a valid opportunity within the detection window'. "
+                 "Coverage ≠ profitability."),
+    }
+
+
 @router.get("/predator-convergence/traceability/{batch_id}")
 def traceability(batch_id: int, db: Session = Depends(get_db)):
     """Demonstrate the full chain for one batch."""

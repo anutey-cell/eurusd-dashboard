@@ -678,6 +678,21 @@ async def _strategist_ledger_resolver_loop():
                                 log.info("[lifecycle_canon] %s: verdicts=%d → lifecycle_ops=%d",
                                           eng, r["verdicts_scanned"], r["lifecycle_ops"])
                     except Exception as _l: log.debug("[lifecycle_canon]: %s", _l)
+                # Forward coverage detection + classification every 15 min
+                if _lifecycle_pass % 15 == 0:
+                    try:
+                        from services.forward_coverage import (
+                            detect_and_seed_expansions, classify_pending_events,
+                        )
+                        r = detect_and_seed_expansions(db, since_days=2)
+                        if r.get("events_created"):
+                            log.info("[forward_coverage] detected %d new expansions",
+                                      r["events_created"])
+                        r = classify_pending_events(db, limit=500)
+                        if r.get("classified"):
+                            log.info("[forward_coverage] classified %d events: %s",
+                                      r["classified"], r.get("per_class"))
+                    except Exception as _c: log.debug("[forward_coverage]: %s", _c)
         except asyncio.CancelledError:
             log.info("[scheduler] strategist ledger resolver cancelled"); break
         except Exception as exc:
