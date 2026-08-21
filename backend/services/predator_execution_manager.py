@@ -359,6 +359,30 @@ def execute_batch_staged(
             aborted_after = pos.seq_no - 1
             break
 
+        # ── UNIFIED GLOBAL GOVERNOR ─────────────────────────────────────────
+        # Account-wide 0.15 gross cap across BOTH Predator AND Strategist.
+        # This runs AFTER Predator's own local cap so both must pass.
+        try:
+            from services.portfolio_governor import check_new_order
+            gov_ok, gov_reason, gov_snap = check_new_order(
+                db, engine="PREDATOR", direction=batch.direction,
+                proposed_lots=pos.lot_size,
+                opportunity_id=batch.opportunity_id,
+                signal_id=batch.signal_id,
+            )
+            if not gov_ok:
+                log.error("GLOBAL_GOVERNOR_BLOCK  batch=%d seq=%d %s snap=%s",
+                          batch.id, pos.seq_no, gov_reason, gov_snap)
+                _mark_position(db, pos, status="REJECTED",
+                               reject_reason=f"global governor: {gov_reason}")
+                _obs_portfolio_reject("PORTFOLIO_GLOBAL_CAP",
+                                      f"{gov_reason} pred={gov_snap.get('predator_lots')} "
+                                      f"strat={gov_snap.get('strategist_lots')}")
+                aborted_after = pos.seq_no - 1
+                break
+        except Exception as _gexc:
+            log.warning("[predator_exec] global governor check failed: %s", _gexc)
+
         # Caller-supplied re-validation (price/spread/extension/regime/vol)
         if revalidate_fn:
             try:

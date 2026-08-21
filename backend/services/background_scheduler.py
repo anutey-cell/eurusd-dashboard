@@ -679,7 +679,11 @@ def _run_predator_iteration():
     dedupe_s = int(getattr(settings, "predator_dedupe_cooldown_s", 3600))
     now = _time.time()
     tele_on = bool(getattr(settings, "predator_telegram_enabled", False))
-    expansion_allowed = bool(getattr(settings, "predator_expansion_enabled", False))
+    # HARDGUARD 2026-08-21 — Predator PRESS/expansion explicitly disabled at
+    # code level regardless of PREDATOR_EXPANSION_ENABLED env flag. Global
+    # portfolio governor (0.15 gross cap) makes 0.30 impossible in aggregate
+    # anyway; this belt-and-braces removes even the theoretical path.
+    expansion_allowed = False
     stage_delay = float(getattr(settings, "predator_stage_delay_s", 0.5))
 
     def _armed_key(sig):

@@ -65,6 +65,11 @@ from config import settings   # P133: hoisted from make_decision() — was scope
 
 log = logging.getLogger(__name__)
 
+# Baseline model identifier — frozen 2026-08-21. Any future decision-layer
+# change (new condition, threshold tweak, sizing rule) MUST bump the version
+# so historical validation stats remain uncontaminated.
+STRATEGIST_MODEL_VERSION = "STRATEGIST_v1.0_BASELINE"
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # VWAP helper (session-anchored)
@@ -1762,7 +1767,10 @@ def make_decision(db: Session) -> dict:
     # Position-cap snapshot from bridge heartbeat — drives the risk gate
     pos_snap = _get_open_positions_snapshot()
     base_cap = getattr(settings, "max_concurrent_positions", 5)
-    extended_cap = getattr(settings, "max_positions_extended", 10)
+    # HARDGUARD 2026-08-21 — Strategist 5→10 pyramid disabled at code level
+    # pending independent BUY/SELL historical validation. extended_cap forced
+    # equal to base_cap so effective cap never exceeds 5. Env flag ignored.
+    extended_cap = base_cap
     profit_threshold = getattr(settings, "extended_cap_profit_usd", 300.0)
     vol_ratio_threshold = getattr(settings, "extended_cap_volume_ratio", 1.2)
 

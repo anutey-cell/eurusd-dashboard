@@ -781,9 +781,9 @@ def _format_position_cap_alert(verdict: dict) -> str:
         )
 
     return (
-        f"🔒 XAUUSD POSITION CAP REACHED ({open_n}/{max_n})\n"
+        f"[STRATEGIST] 🔒 XAUUSD LOCAL POSITION CAP REACHED ({open_n}/{max_n})\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Engine wanted: {arrow} {decision}  ·  {cp}/5 conditions\n"
+        f"Engine: STRATEGIST v1.0 · wanted: {arrow} {decision}  ·  {cp}/5 conditions\n"
         f"  Suggested entry: ${tp.get('entry', '—')}\n"
         f"  SL ${tp.get('stop_loss', '—')}  ·  TP1 ${tp.get('tp1', '—')}  ·  TP2 ${tp.get('tp2', '—')}\n"
         f"\n"
@@ -1356,6 +1356,26 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
                     "one position at a time",
                     current_exposure, lot, ceiling)
         return None
+
+    # ── UNIFIED GLOBAL GOVERNOR (2026-08-21) ─────────────────────────────
+    # Account-wide 0.15 gross cap across BOTH Strategist AND Predator.
+    # Runs AFTER Strategist's local cap so both must pass. Fail-open on
+    # governor errors — never let a governor bug block trading.
+    try:
+        from services.portfolio_governor import check_new_order
+        gov_ok, gov_reason, gov_snap = check_new_order(
+            db, engine="STRATEGIST",
+            direction=mt5_obj.get("action", "?"),
+            proposed_lots=lot,
+            opportunity_id=verdict.get("verdict_id"),
+            signal_id=str(verdict.get("verdict_id", "")),
+        )
+        if not gov_ok:
+            log.error("[strategist_runner] GLOBAL_GOVERNOR_BLOCK  %s snap=%s",
+                      gov_reason, gov_snap)
+            return None
+    except Exception as _gexc:
+        log.warning("[strategist_runner] global governor check errored: %s", _gexc)
 
     # ── HARD DEMO-ACCOUNT GUARD (mandate section 12) ────────────────────
     # Absolutely refuse to enqueue if the daemon isn't on the sanctioned
