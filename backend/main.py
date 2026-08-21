@@ -87,6 +87,16 @@ async def lifespan(app: FastAPI):
     except Exception as _arc_exc:
         log.debug("Startup archival skipped (non-fatal): %s", _arc_exc)
 
+    # ── Portfolio governor startup reconciliation (2026-08-21 hardening) ─────
+    # Governor stays NOT READY until MT5 heartbeat + persisted SENT reservations
+    # are reconstructed. All new-order requests refuse until then.
+    try:
+        from services.portfolio_governor import startup_reconcile
+        _r = startup_reconcile()
+        log.info("Governor startup reconcile: %s", _r)
+    except Exception as _gov_exc:
+        log.warning("Governor startup reconcile failed: %s", _gov_exc)
+
     # ── Phase Final: spawn background loops for autonomous live operation ────
     try:
         from services.background_scheduler import start_background_loops, stop_background_loops

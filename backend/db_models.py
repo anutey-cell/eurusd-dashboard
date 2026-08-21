@@ -1352,3 +1352,59 @@ class StrategistSellShadow(Base):
     mae_pts                   = Column(Float, nullable=True)
     holding_min               = Column(Float, nullable=True)
     resolution_status         = Column(String(16), nullable=True, index=True)  # PENDING|RESOLVED
+    canonicalization_version  = Column(String(24), nullable=True, default="PROVISIONAL_V0")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Durable capacity reservations (2026-08-21 hardening)
+# SENT reservations MUST survive process restart so the governor can
+# reconstruct effective gross exposure and not release capacity for orders
+# whose broker outcome is still pending.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class CapacityReservation(Base):
+    __tablename__ = "capacity_reservations"
+
+    id                     = Column(Integer, primary_key=True, autoincrement=True)
+    reservation_id         = Column(String(32), nullable=False, unique=True, index=True)
+    engine                 = Column(String(24), nullable=False, index=True)
+    direction              = Column(String(8),  nullable=False)
+    opportunity_id         = Column(String(96), nullable=True)
+    requested_lots         = Column(Float,      nullable=False)
+    state                  = Column(String(16), nullable=False, index=True)
+    # states: RESERVED | SENT | FILLED | REJECTED | ABANDONED
+    broker_ticket          = Column(Integer,    nullable=True, index=True)
+    created_at             = Column(DateTime(timezone=True), default=_now, nullable=False)
+    sent_at                = Column(DateTime(timezone=True), nullable=True)
+    resolved_at            = Column(DateTime(timezone=True), nullable=True)
+    resolution             = Column(String(32), nullable=True)
+    process_instance_id    = Column(String(32), nullable=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Lifecycle canonicalization v1 (2026-08-21 hardening)
+# Groups per-minute Strategist verdicts into structurally coherent opportunities.
+# See services/lifecycle_canonicalization.py for the deterministic algorithm.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class LifecycleCanonicalOpportunity(Base):
+    __tablename__ = "lifecycle_canonical_opportunities"
+
+    id                     = Column(Integer, primary_key=True, autoincrement=True)
+    canonical_id           = Column(String(96), nullable=False, unique=True, index=True)
+    canon_version          = Column(String(24), nullable=False, default="LIFECYCLE_CANON_v1")
+    engine                 = Column(String(24), nullable=False, index=True)   # STRATEGIST_BUY | STRATEGIST_SELL_SHADOW
+    direction              = Column(String(8),  nullable=False)
+    setup_signature        = Column(String(96), nullable=True)                # direction·session·structural key
+    lifecycle_state        = Column(String(24), nullable=False, index=True)   # ACTIVE | INVALIDATED | RESOLVED
+    lifecycle_start        = Column(DateTime(timezone=True), nullable=False)
+    lifecycle_end          = Column(DateTime(timezone=True), nullable=True)
+    reset_reason           = Column(String(64), nullable=True)
+    first_verdict_id       = Column(Integer, nullable=True)
+    last_verdict_id        = Column(Integer, nullable=True)
+    n_raw_verdicts         = Column(Integer, default=0)
+    provisional_v0_id      = Column(String(96), nullable=True)                # audit link
+    first_entry            = Column(Float, nullable=True)
+    first_sl               = Column(Float, nullable=True)
+    first_tp1              = Column(Float, nullable=True)
+    first_tp2              = Column(Float, nullable=True)

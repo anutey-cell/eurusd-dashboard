@@ -51,7 +51,110 @@ _GOVERNOR_LOCK = threading.RLock()
 #   ABANDONED → post-reconciliation cleanup for expired-RESERVED entries
 #
 # In-memory: {reservation_id: (engine, direction, lots, state, expires_at, mt5_ticket)}
+# Mirrored to capacity_reservations DB table for restart durability.
 _RESERVATIONS: dict[str, list] = {}
+
+# Recovery mode — set to False on process start; flips True after
+# startup_reconcile() successfully reads MT5 open positions + any persisted
+# SENT reservations. Until then, no new orders authorized.
+_GOVERNOR_READY = False
+_PROCESS_INSTANCE_ID = uuid.uuid4().hex[:16]
+
+
+def is_ready() -> bool:
+    return _GOVERNOR_READY
+
+
+def _persist_reservation(row_dict: dict) -> None:
+    """Insert or update capacity_reservations DB row. Fail-open."""
+    try:
+        from database import SessionLocal
+        with SessionLocal() as db:
+            db.execute(text("""
+                INSERT INTO capacity_reservations
+                  (reservation_id, engine, direction, opportunity_id,
+                   requested_lots, state, broker_ticket, created_at,
+                   sent_at, resolved_at, resolution, process_instance_id)
+                VALUES
+                  (:rid, :eng, :dir, :oi, :lots, :st, :tk, :ca,
+                   :sa, :ra, :res, :pi)
+                ON CONFLICT(reservation_id) DO UPDATE SET
+                  state = :st, broker_ticket = :tk,
+                  sent_at = :sa, resolved_at = :ra, resolution = :res
+            """), row_dict)
+            db.commit()
+    except Exception as exc:
+        log.debug("[portfolio_governor] persist failed: %s", exc)
+
+
+def startup_reconcile() -> dict:
+    """Called once at process start. Reads persisted SENT reservations
+    from capacity_reservations, reconstructs in-memory state, then verifies
+    against MT5. Sets _GOVERNOR_READY when done. Fail-safe: if reconciliation
+    cannot complete, governor stays NOT READY and refuses new orders."""
+    global _GOVERNOR_READY
+    result = dict(recovered_reservations=0, mt5_authoritative=False,
+                  mt5_positions=0, ready=False, reasons=[])
+    try:
+        from database import SessionLocal
+        with SessionLocal() as db:
+            # Recover SENT reservations from DB
+            rows = db.execute(text("""
+                SELECT reservation_id, engine, direction, requested_lots,
+                       state, broker_ticket
+                FROM capacity_reservations
+                WHERE state IN ('RESERVED','SENT')
+                  AND created_at >= datetime('now', '-1 day')
+            """)).fetchall()
+            with _GOVERNOR_LOCK:
+                for r in rows:
+                    rid, eng, dr, lots, st, tk = r
+                    # RESERVED can be safely abandoned (no broker knew about it)
+                    # SENT must be preserved until MT5 confirms outcome
+                    if st == "SENT":
+                        _RESERVATIONS[rid] = [eng, dr, float(lots), "SENT",
+                                              time.time() + 3600*24, tk]  # long expiry safety net
+                        result["recovered_reservations"] += 1
+                    elif st == "RESERVED":
+                        # Mark abandoned in DB
+                        try:
+                            db.execute(text(
+                                "UPDATE capacity_reservations SET state='ABANDONED', "
+                                "resolved_at=:now, resolution='startup_orphan_abandon' "
+                                "WHERE reservation_id=:rid"
+                            ), {"now": datetime.now(timezone.utc), "rid": rid})
+                            db.commit()
+                        except Exception: pass
+            # Verify MT5 authoritative
+            mt5_lots, mt5_auth, mt5_reason = _mt5_authoritative_lots()
+            result["mt5_authoritative"] = mt5_auth
+            result["mt5_positions"] = mt5_lots if mt5_auth else 0
+            if not mt5_auth:
+                result["reasons"].append(f"MT5 not authoritative: {mt5_reason}")
+                log.warning("[portfolio_governor] startup: MT5 not yet authoritative (%s) — "
+                            "governor remains NOT READY until next reconcile pass", mt5_reason)
+            else:
+                _GOVERNOR_READY = True
+                result["ready"] = True
+                log.info("[portfolio_governor] startup reconcile: recovered %d SENT reservations, "
+                          "MT5 shows %.4f lots — GOVERNOR READY",
+                          result["recovered_reservations"], mt5_lots)
+    except Exception as exc:
+        log.warning("[portfolio_governor] startup reconcile failed: %s", exc)
+        result["reasons"].append(str(exc))
+    return result
+
+
+def retry_ready() -> bool:
+    """Idempotent — called by scheduler loop to promote governor from
+    NOT_READY → READY once MT5 heartbeat arrives."""
+    global _GOVERNOR_READY
+    if _GOVERNOR_READY: return True
+    _mt5_lots, mt5_auth, _ = _mt5_authoritative_lots()
+    if mt5_auth:
+        _GOVERNOR_READY = True
+        log.info("[portfolio_governor] promoted to READY on retry (MT5 heartbeat arrived)")
+    return _GOVERNOR_READY
 
 
 def _prune_expired_reservations() -> None:
@@ -80,12 +183,25 @@ def _sum_reservations() -> float:
 
 
 def mark_sent(reservation_id: str, mt5_ticket: Optional[int] = None) -> bool:
-    """Transition RESERVED → SENT. TTL no longer applies after this."""
+    """Transition RESERVED → SENT. TTL no longer applies after this.
+    Persist to DB so a restart preserves the reservation."""
     with _GOVERNOR_LOCK:
         row = _RESERVATIONS.get(reservation_id)
         if not row: return False
         row[3] = "SENT"
         if mt5_ticket is not None: row[5] = mt5_ticket
+        # Persist state transition
+        try:
+            from database import SessionLocal
+            with SessionLocal() as db:
+                db.execute(text("""
+                    UPDATE capacity_reservations
+                    SET state='SENT', sent_at=:sa, broker_ticket=:tk
+                    WHERE reservation_id=:rid
+                """), dict(sa=datetime.now(timezone.utc), tk=mt5_ticket, rid=reservation_id))
+                db.commit()
+        except Exception as exc:
+            log.debug("[portfolio_governor] mark_sent persist failed: %s", exc)
         log.info("[portfolio_governor] rid=%s → SENT (ticket=%s)", reservation_id[:8], mt5_ticket)
         return True
 
@@ -208,6 +324,16 @@ def reserve_capacity(
     Reservation auto-expires after RESERVATION_TTL_SEC as a safety net.
     """
     with _GOVERNOR_LOCK:
+        # HARD GUARD: governor not READY until startup reconciliation completes
+        if not _GOVERNOR_READY:
+            # Attempt promote (fresh heartbeat may have arrived)
+            if not retry_ready():
+                snap = snapshot(db)
+                _log_reject(db, engine, direction, abs(float(proposed_lots)),
+                            opportunity_id, signal_id, "GOVERNOR_NOT_READY",
+                            "Awaiting startup MT5 reconciliation")
+                return False, "GOVERNOR_NOT_READY", snap, None
+
         snap = snapshot(db)
         proposed = abs(float(proposed_lots))
 
@@ -247,6 +373,13 @@ def reserve_capacity(
         rid = uuid.uuid4().hex
         _RESERVATIONS[rid] = [engine, direction, proposed, "RESERVED",
                               time.time() + RESERVATION_TTL_SEC, None]
+        # Persist to durable table so a restart mid-flight can recover state
+        _persist_reservation(dict(
+            rid=rid, eng=engine, dir=direction, oi=opportunity_id,
+            lots=proposed, st="RESERVED", tk=None,
+            ca=datetime.now(timezone.utc), sa=None, ra=None, res=None,
+            pi=_PROCESS_INSTANCE_ID,
+        ))
         log.info("[portfolio_governor] RESERVED %s %s %.4f lots (rid=%s) — "
                  "committed after=%.4f/%.2f",
                  engine, direction, proposed, rid[:8],
@@ -261,6 +394,15 @@ def release_reservation(reservation_id: str, reason: str = "release") -> None:
         if row:
             log.info("[portfolio_governor] RELEASED rid=%s reason=%s",
                      reservation_id[:8], reason)
+            try:
+                from database import SessionLocal
+                with SessionLocal() as db:
+                    db.execute(text(
+                        "UPDATE capacity_reservations SET state='REJECTED', "
+                        "resolved_at=:ra, resolution=:res WHERE reservation_id=:rid"
+                    ), dict(ra=datetime.now(timezone.utc), res=reason[:32], rid=reservation_id))
+                    db.commit()
+            except Exception: pass
 
 
 def commit_reservation(reservation_id: str, mt5_ticket: Optional[int] = None) -> None:
@@ -271,6 +413,16 @@ def commit_reservation(reservation_id: str, mt5_ticket: Optional[int] = None) ->
         if row:
             log.info("[portfolio_governor] COMMITTED rid=%s ticket=%s",
                      reservation_id[:8], mt5_ticket)
+            try:
+                from database import SessionLocal
+                with SessionLocal() as db:
+                    db.execute(text(
+                        "UPDATE capacity_reservations SET state='FILLED', "
+                        "resolved_at=:ra, resolution='committed', broker_ticket=:tk "
+                        "WHERE reservation_id=:rid"
+                    ), dict(ra=datetime.now(timezone.utc), tk=mt5_ticket, rid=reservation_id))
+                    db.commit()
+            except Exception: pass
 
 
 # Legacy non-atomic check_new_order — kept for backwards compatibility

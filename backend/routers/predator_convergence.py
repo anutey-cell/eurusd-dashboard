@@ -432,14 +432,27 @@ def convergence_sample(db: Session = Depends(get_db), limit: int = 20):
 def dual_mandate_health(db: Session = Depends(get_db)):
     """Full health block for the dual-mandate architecture.
     Split into granular status per §1 of validation-completion spec."""
-    from services.portfolio_governor import snapshot as gov_snapshot, MAX_GROSS_LOTS
+    from services.portfolio_governor import snapshot as gov_snapshot, MAX_GROSS_LOTS, is_ready
     from services.strategist import STRATEGIST_MODEL_VERSION
     from services.strategist_buy_resolver import (
         fully_instrumented_closed_count, resolved_sell_shadow_count,
     )
+    from services.lifecycle_canonicalization import lifecycle_forward_closed_count, CANON_VERSION
     snap = gov_snapshot(db)
     fwd_closed = fully_instrumented_closed_count(db)
     sell_resolved = resolved_sell_shadow_count(db)
+    lifecycle_buy = lifecycle_forward_closed_count(db, "STRATEGIST_BUY")
+    lifecycle_sell = lifecycle_forward_closed_count(db, "STRATEGIST_SELL_SHADOW")
+    gov_ready = is_ready()
+    # Reservation state counts
+    active_reservations = {"RESERVED": 0, "SENT": 0}
+    try:
+        for r in db.execute(text(
+            "SELECT state, COUNT(*) FROM capacity_reservations "
+            "WHERE state IN ('RESERVED','SENT') GROUP BY state"
+        )).fetchall():
+            active_reservations[r[0]] = int(r[1])
+    except Exception: pass
 
     pre_cohort_n = 0
     try:
@@ -460,6 +473,11 @@ def dual_mandate_health(db: Session = Depends(get_db)):
         },
         "governance": {
             "GLOBAL_GOVERNOR":                       "ACTIVE",
+            "GOVERNOR_READY":                        gov_ready,
+            "GOVERNOR_RESTART_RECOVERY":             "ACTIVE (startup_reconcile in main.py lifespan)",
+            "RESERVATIONS_DURABLE_ACROSS_RESTART":   "ACTIVE (capacity_reservations DB table)",
+            "SENT_RECOVERY":                         "ACTIVE (SENT reservations restored on startup)",
+            "MT5_ORPHAN_RECOVERY":                   "ACTIVE (broker positions counted immediately)",
             "GOVERNOR_EXECUTION_TOPOLOGY":           "SINGLE PROCESS (uvicorn 1 worker)",
             "CROSS_PROCESS_ATOMICITY":               "NOT REQUIRED (single-process deploy)",
             "RESERVATION_STATE_MACHINE":             "ACTIVE (RESERVED → SENT → FILLED/REJECTED/ABANDONED)",
@@ -469,13 +487,19 @@ def dual_mandate_health(db: Session = Depends(get_db)):
             "GLOBAL_XAUUSD_GROSS_MAX":               MAX_GROSS_LOTS,
             "PREDATOR_PRESS_0_30":                   "DISABLED",
             "STRATEGIST_PYRAMID":                    "DISABLED",
+            "ACTIVE_RESERVATIONS":                   active_reservations,
         },
         "ledgers": {
             "STRATEGIST_BUY_OPPORTUNITY_CAPTURE":    "ACTIVE",
             "STRATEGIST_BUY_CLOSURE_RESOLVER":       "ACTIVE (60s loop)",
             "STRATEGIST_BUY_FULL_OUTCOME_LEDGER":    "ACTIVE",
+            "FIRST_REAL_BUY_CLOSURE_PROOF":          ("VERIFIED" if fwd_closed > 0 else "AWAITING NATURAL CLOSURE"),
             "STRATEGIST_SELL_SHADOW_RESOLVER":       "ACTIVE (60s loop)",
-            "CANONICALIZATION":                      "PROVISIONAL_V0 (15-min bucket × entry)",
+            "CANONICALIZATION":                      f"{CANON_VERSION} (also emitting PROVISIONAL_V0 in parallel)",
+        },
+        "lifecycle_counts": {
+            "buy_forward_closed_canonical_n":         lifecycle_buy,
+            "sell_shadow_resolved_canonical_n":       lifecycle_sell,
         },
         "cohorts": {
             "FULLY_INSTRUMENTED_FORWARD_CLOSED":     fwd_closed,

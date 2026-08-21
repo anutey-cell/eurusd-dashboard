@@ -637,12 +637,20 @@ _PREDATOR_SEEN: dict[str, float] = {}   # fingerprint -> unix ts
 
 
 async def _strategist_ledger_resolver_loop():
-    """Runs every 60s: resolves closed strategist BUYs + resolves SELL shadows.
+    """Runs every 60s: promotes governor READY (retry), resolves closed
+    strategist BUYs, resolves SELL shadows, refreshes lifecycle canonicalization.
     Fail-open — a resolver failure never blocks trading."""
     log.info("[scheduler] strategist ledger resolver loop started (60s)")
     await asyncio.sleep(45)  # let other loops warm up first
+    _lifecycle_pass = 0
     while True:
         try:
+            # First: try to promote governor from NOT_READY once heartbeat arrives
+            try:
+                from services.portfolio_governor import retry_ready
+                retry_ready()
+            except Exception: pass
+
             from database import SessionLocal
             with SessionLocal() as db:
                 try:
@@ -659,6 +667,17 @@ async def _strategist_ledger_resolver_loop():
                         log.info("[strategist_resolver] SELL shadow resolved=%d scanned=%d",
                                   r["resolved"], r["scanned"])
                 except Exception as _s: log.debug("[strategist_resolver] SELL: %s", _s)
+                # Lifecycle recanonicalization every 15 minutes (15 × 60s iterations)
+                _lifecycle_pass += 1
+                if _lifecycle_pass % 15 == 0:
+                    try:
+                        from services.lifecycle_canonicalization import recanonicalize_all
+                        for eng in ("STRATEGIST_BUY", "STRATEGIST_SELL_SHADOW"):
+                            r = recanonicalize_all(db, engine_filter=eng)
+                            if r.get("lifecycle_ops"):
+                                log.info("[lifecycle_canon] %s: verdicts=%d → lifecycle_ops=%d",
+                                          eng, r["verdicts_scanned"], r["lifecycle_ops"])
+                    except Exception as _l: log.debug("[lifecycle_canon]: %s", _l)
         except asyncio.CancelledError:
             log.info("[scheduler] strategist ledger resolver cancelled"); break
         except Exception as exc:
