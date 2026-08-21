@@ -1327,6 +1327,22 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
     if not mt5_obj:
         return None
 
+    # ── DIRECTIONAL EXECUTION MANDATE (2026-08-21) ────────────────────────
+    # STRATEGIST executes BUYs only. SELL verdicts continue to be scored,
+    # persisted to strategist_verdicts, and shadow-tracked, but they never
+    # reach MT5. Predator owns SELL execution.
+    _direction = str(mt5_obj.get("action", "")).upper()
+    if _direction == "SELL":
+        log.info("[strategist_runner] STRATEGIST_SELL_SHADOW_ONLY — verdict %s SELL "
+                 "scored but not enqueued (Predator owns SELL execution)",
+                 verdict.get("verdict_id"))
+        try:
+            from services.strategist_shadow_ledger import record_sell_shadow
+            record_sell_shadow(db, verdict=verdict, mt5_obj=mt5_obj)
+        except Exception as _sexc:
+            log.debug("[strategist_runner] shadow-ledger write failed: %s", _sexc)
+        return None
+
     # Defence-in-depth: even though _decide_execution_status already gates
     # on these, double-check here so a stale verdict can't slip through.
     if is_monday_observation():
@@ -1357,13 +1373,13 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
                     current_exposure, lot, ceiling)
         return None
 
-    # ── UNIFIED GLOBAL GOVERNOR (2026-08-21) ─────────────────────────────
-    # Account-wide 0.15 gross cap across BOTH Strategist AND Predator.
-    # Runs AFTER Strategist's local cap so both must pass. Fail-open on
-    # governor errors — never let a governor bug block trading.
+    # ── UNIFIED GLOBAL GOVERNOR — ATOMIC (2026-08-21 v2) ─────────────────
+    # Account-wide 0.15 gross cap across BOTH engines with atomic reservation.
+    # Reserved capacity is released on any failure below.
+    _reservation_id = None
     try:
-        from services.portfolio_governor import check_new_order
-        gov_ok, gov_reason, gov_snap = check_new_order(
+        from services.portfolio_governor import reserve_capacity, release_reservation, commit_reservation
+        gov_ok, gov_reason, gov_snap, _reservation_id = reserve_capacity(
             db, engine="STRATEGIST",
             direction=mt5_obj.get("action", "?"),
             proposed_lots=lot,
@@ -1469,6 +1485,26 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
         db.refresh(row)
         _last_enqueue_fingerprint = fp
         _last_enqueue_at          = time.time()
+
+        # Commit the governor reservation (broker now knows about the order
+        # via PendingExecution; daemon will pick it up next poll).
+        if _reservation_id:
+            try:
+                commit_reservation(_reservation_id, mt5_ticket=None)
+            except Exception: pass
+
+        # Record BUY opportunity into strategist_buy_outcomes ledger for
+        # forward P&L tracking (resolver populates outcome later).
+        try:
+            from services.strategist_shadow_ledger import record_buy_opportunity_at_enqueue
+            record_buy_opportunity_at_enqueue(
+                db, verdict=verdict, mt5_obj=mt5_obj,
+                pending_execution_id=row.id, lot_size=lot,
+                reservation_id=_reservation_id,
+            )
+        except Exception as _bexc:
+            log.debug("[strategist_runner] BUY opportunity ledger write failed: %s", _bexc)
+
         log.info(
             "[strategist_runner] ENQUEUED #%d %s xauusd grade=%s lot=%.2f "
             "(exposure %.2f→%.2f/%.2f) entry=%s SL=%s TP1=%s TP2=%s",
@@ -1480,6 +1516,10 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
         return row.id
     except Exception as exc:
         log.warning("[strategist_runner] enqueue failed (non-fatal): %s", exc)
+        # Release governor reservation on failure
+        if _reservation_id:
+            try: release_reservation(_reservation_id, "enqueue_failed")
+            except Exception: pass
         try: db.rollback()
         except Exception: pass
         return None

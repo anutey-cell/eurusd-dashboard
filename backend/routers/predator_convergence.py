@@ -428,6 +428,47 @@ def convergence_sample(db: Session = Depends(get_db), limit: int = 20):
             for r in rows]
 
 
+@router.get("/dual-mandate-health")
+def dual_mandate_health(db: Session = Depends(get_db)):
+    """Startup-and-runtime health block for the dual-mandate architecture."""
+    from services.portfolio_governor import snapshot as gov_snapshot, MAX_GROSS_LOTS
+    from services.strategist import STRATEGIST_MODEL_VERSION
+    snap = gov_snapshot(db)
+    return {
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "engines": {
+            "PREDATOR_SELL_MT5":        "ACTIVE",
+            "PREDATOR_BUY_MT5":         "DISABLED",
+            "STRATEGIST_BUY_MT5":       "ACTIVE",
+            "STRATEGIST_SELL_MT5":      "DISABLED — SHADOW ONLY",
+            "STRATEGIST_SELL_OBSERVE":  "ACTIVE",
+        },
+        "governance": {
+            "GLOBAL_GOVERNOR":                    "ACTIVE",
+            "ATOMIC_CAPACITY_RESERVATION":        "ACTIVE",
+            "MT5_AUTHORITATIVE_RECONCILIATION":   ("ACTIVE" if snap["mt5_authoritative"] else "PARTIAL"),
+            "GLOBAL_XAUUSD_GROSS_MAX":            MAX_GROSS_LOTS,
+            "PREDATOR_PRESS_0_30":                "DISABLED",
+            "STRATEGIST_PYRAMID":                 "DISABLED",
+        },
+        "ledgers": {
+            "STRATEGIST_BUY_OUTCOME_LEDGER":  "ACTIVE",
+            "STRATEGIST_SELL_SHADOW_LEDGER":  "ACTIVE",
+        },
+        "parked": {
+            "VAL_RECLAIM":                   "PARKED",
+            "NEW_BUY_CONTINUATION":          "PARKED",
+        },
+        "spend":  "$0",
+        "regime": "DEMO ONLY",
+        "versions": {
+            "predator":   "PREDATOR_v1.0_M5",
+            "strategist": STRATEGIST_MODEL_VERSION,
+        },
+        "exposure": snap,
+    }
+
+
 @router.get("/predator-convergence/traceability/{batch_id}")
 def traceability(batch_id: int, db: Session = Depends(get_db)):
     """Demonstrate the full chain for one batch."""

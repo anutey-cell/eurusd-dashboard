@@ -1267,3 +1267,85 @@ class PredatorDemoConvergence(Base):
 
     # Classification: MATCH | ECONOMIC_DRIFT | OUTCOME_DIVERGENCE | EXECUTION_MISS | ORPHAN_EXECUTION
     convergence_class           = Column(String(24), nullable=True, index=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Strategist ledgers (2026-08-21) — BUY outcomes + SELL shadow
+# BUY: actual demo outcomes from strategist-originated MT5 tickets
+# SELL: hypothetical outcomes for verdicts blocked by shadow-only mandate
+# ═════════════════════════════════════════════════════════════════════════════
+
+class StrategistBuyOutcome(Base):
+    __tablename__ = "strategist_buy_outcomes"
+
+    id                        = Column(Integer, primary_key=True, autoincrement=True)
+    created_at                = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    resolved_at               = Column(DateTime(timezone=True), nullable=True)
+    opportunity_id            = Column(String(96), nullable=False, unique=True, index=True)
+    verdict_id                = Column(Integer, nullable=True)
+    pending_execution_id      = Column(Integer, nullable=True, index=True)
+    follow_on_execution_ids   = Column(String(255), nullable=True)  # comma-sep additional pending_execution_ids
+    reservation_id            = Column(String(32), nullable=True)
+    mt5_ticket                = Column(Integer, nullable=True, index=True)
+
+    # Frozen decision context
+    conditions_passed         = Column(Integer, nullable=True)
+    setup_score               = Column(Integer, nullable=True)
+    quality_band              = Column(String(24), nullable=True)
+    market_state              = Column(String(64), nullable=True)
+
+    # Plan
+    entry                     = Column(Float, nullable=True)
+    sl                        = Column(Float, nullable=True)
+    tp1                       = Column(Float, nullable=True)
+    tp2                       = Column(Float, nullable=True)
+    rr                        = Column(Float, nullable=True)
+    lot_size                  = Column(Float, nullable=True)
+
+    # Actual demo outcome
+    actual_entry              = Column(Float, nullable=True)
+    actual_exit               = Column(Float, nullable=True)
+    actual_pnl_usd            = Column(Float, nullable=True)
+    actual_pnl_pts            = Column(Float, nullable=True)
+    actual_r                  = Column(Float, nullable=True)
+    mfe_pts                   = Column(Float, nullable=True)
+    mae_pts                   = Column(Float, nullable=True)
+    holding_min               = Column(Float, nullable=True)
+    slippage_pts              = Column(Float, nullable=True)
+    commission_usd            = Column(Float, nullable=True)
+    swap_usd                  = Column(Float, nullable=True)
+
+    outcome                   = Column(String(16), nullable=True)   # TP1|TP2|SL|TIMEOUT|MANUAL_CLOSE
+    resolution_status         = Column(String(16), nullable=True, index=True)  # OPEN|RESOLVED|ORPHAN
+
+
+class StrategistSellShadow(Base):
+    __tablename__ = "strategist_sell_shadow"
+
+    id                        = Column(Integer, primary_key=True, autoincrement=True)
+    created_at                = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    resolved_at               = Column(DateTime(timezone=True), nullable=True)
+    opportunity_id            = Column(String(96), nullable=False, unique=True, index=True)
+    verdict_id                = Column(Integer, nullable=True)
+
+    # Frozen decision context
+    conditions_passed         = Column(Integer, nullable=True)
+    setup_score               = Column(Integer, nullable=True)
+    quality_band              = Column(String(24), nullable=True)
+    market_state              = Column(String(64), nullable=True)
+
+    # Hypothetical plan (what would have been enqueued if execution allowed)
+    hypothetical_entry        = Column(Float, nullable=True)
+    sl                        = Column(Float, nullable=True)
+    tp1                       = Column(Float, nullable=True)
+    tp2                       = Column(Float, nullable=True)
+    rr                        = Column(Float, nullable=True)
+
+    # Resolved outcome (from forward M5 walk)
+    outcome                   = Column(String(16), nullable=True)   # TP1|TP2|SL|TIMEOUT|STILL_OPEN
+    exit_price                = Column(Float, nullable=True)
+    hypothetical_pnl_pts      = Column(Float, nullable=True)
+    mfe_pts                   = Column(Float, nullable=True)
+    mae_pts                   = Column(Float, nullable=True)
+    holding_min               = Column(Float, nullable=True)
+    resolution_status         = Column(String(16), nullable=True, index=True)  # PENDING|RESOLVED
