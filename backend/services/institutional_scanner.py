@@ -198,12 +198,70 @@ def _run_scan(scan_mode: str = "auto", db=None) -> dict:
     # ── 1. Fetch multi-timeframe candles ─────────────────────────────────────
     # In live mode, reject synthetic candles outright — feeding fake data into
     # the scanner would pollute paper observations and the learning dataset.
+    #
+    # Preference order (2026-08-21 fix): historical_candles (MT5 daemon push)
+    # first — that is the freshest live feed we own, and the scanner previously
+    # was flipping DATA_STALE because get_candles() went to TradingView which
+    # lags H4 by several bars via the nologin path. Fall back to get_candles()
+    # only when the MT5 rows for a timeframe are missing or a fresh MT5 bar
+    # hasn't been received in a while.
     from config import settings as _cfg
     LIVE_SOURCES = {"tradingview", "mt5", "tradingview-cached", "mt5-cached"}
     tf_limits = {"D1": 100, "H4": 200, "H1": 200, "M15": 200, "M5": 100}
     candles_by_tf: dict[str, list] = {}
     synthetic_seen: list[str] = []
+
+    # Freshness threshold used to decide whether MT5 rows are "good enough"
+    # to skip the TradingView fallback. Same "2× period" grace the freshness
+    # sentinel uses for MT5.
+    _TF_PERIOD_MIN = {"M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
+
+    def _load_from_historical(tf: str, limit: int):
+        """Load candles from historical_candles preferring MT5 (daemon push).
+        Returns list[Candle] or [] if unavailable / too stale."""
+        if db is None: return []
+        try:
+            from models.candle import Candle
+            from sqlalchemy import text
+            rows = db.execute(text(
+                "SELECT candle_time, open, high, low, close, volume, source "
+                "FROM historical_candles "
+                "WHERE instrument='XAU/USD' AND timeframe=:tf "
+                "  AND source IN ('mt5','mt5_backfill') "
+                "ORDER BY candle_time DESC LIMIT :n"
+            ), {"tf": tf, "n": limit}).fetchall()
+            if not rows: return []
+            # Rows are DESC — reverse to ascending time
+            rows = list(reversed(rows))
+            # Freshness check on latest bar
+            latest_str = str(rows[-1][0]).replace("T", " ").split(".")[0]
+            try:
+                latest_dt = datetime.strptime(latest_str, "%Y-%m-%d %H:%M:%S")
+                latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+                age_min = (now - latest_dt).total_seconds() / 60
+                # 2× period + safety = "we trust MT5 for this TF if under this"
+                max_age = _TF_PERIOD_MIN.get(tf, 60) * 2.5
+                if age_min > max_age:
+                    return []  # MT5 rows too old → let fallback try TV
+            except Exception:
+                return []
+            return [Candle(
+                time=datetime.strptime(str(r[0]).replace("T"," ").split(".")[0],
+                                        "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
+                open=float(r[1]), high=float(r[2]), low=float(r[3]),
+                close=float(r[4]), volume=int(r[5] or 0),
+            ) for r in rows]
+        except Exception as e:
+            log.debug("[scanner] historical_candles load failed for %s: %s", tf, e)
+            return []
+
     for tf, limit in tf_limits.items():
+        # 1) Prefer MT5-daemon rows if fresh enough
+        mt5_candles = _load_from_historical(tf, limit)
+        if mt5_candles:
+            candles_by_tf[tf] = mt5_candles
+            continue
+        # 2) Fall back to get_candles (TV / TD / cached / synthetic)
         try:
             resp = get_candles(interval=tf, limit=limit, pair="xauusd")
             src = getattr(resp, "source", "unknown")
