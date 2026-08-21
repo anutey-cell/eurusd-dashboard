@@ -430,34 +430,71 @@ def convergence_sample(db: Session = Depends(get_db), limit: int = 20):
 
 @router.get("/dual-mandate-health")
 def dual_mandate_health(db: Session = Depends(get_db)):
-    """Startup-and-runtime health block for the dual-mandate architecture."""
+    """Full health block for the dual-mandate architecture.
+    Split into granular status per §1 of validation-completion spec."""
     from services.portfolio_governor import snapshot as gov_snapshot, MAX_GROSS_LOTS
     from services.strategist import STRATEGIST_MODEL_VERSION
+    from services.strategist_buy_resolver import (
+        fully_instrumented_closed_count, resolved_sell_shadow_count,
+    )
     snap = gov_snapshot(db)
+    fwd_closed = fully_instrumented_closed_count(db)
+    sell_resolved = resolved_sell_shadow_count(db)
+
+    pre_cohort_n = 0
+    try:
+        pre_cohort_n = int(db.execute(text(
+            "SELECT COUNT(*) FROM strategist_buy_outcomes "
+            "WHERE cohort='PRE_INSTRUMENTATION_ACTUAL_DEMO'"
+        )).fetchone()[0] or 0)
+    except Exception: pass
+
     return {
         "as_of": datetime.now(timezone.utc).isoformat(),
         "engines": {
             "PREDATOR_SELL_MT5":        "ACTIVE",
             "PREDATOR_BUY_MT5":         "DISABLED",
             "STRATEGIST_BUY_MT5":       "ACTIVE",
-            "STRATEGIST_SELL_MT5":      "DISABLED — SHADOW ONLY",
-            "STRATEGIST_SELL_OBSERVE":  "ACTIVE",
+            "STRATEGIST_SELL_MT5":      "DISABLED",
+            "STRATEGIST_SELL_SHADOW":   "ACTIVE",
         },
         "governance": {
-            "GLOBAL_GOVERNOR":                    "ACTIVE",
-            "ATOMIC_CAPACITY_RESERVATION":        "ACTIVE",
-            "MT5_AUTHORITATIVE_RECONCILIATION":   ("ACTIVE" if snap["mt5_authoritative"] else "PARTIAL"),
-            "GLOBAL_XAUUSD_GROSS_MAX":            MAX_GROSS_LOTS,
-            "PREDATOR_PRESS_0_30":                "DISABLED",
-            "STRATEGIST_PYRAMID":                 "DISABLED",
+            "GLOBAL_GOVERNOR":                       "ACTIVE",
+            "GOVERNOR_EXECUTION_TOPOLOGY":           "SINGLE PROCESS (uvicorn 1 worker)",
+            "CROSS_PROCESS_ATOMICITY":               "NOT REQUIRED (single-process deploy)",
+            "RESERVATION_STATE_MACHINE":             "ACTIVE (RESERVED → SENT → FILLED/REJECTED/ABANDONED)",
+            "SENT_ORDER_CAPACITY_PROTECTION":        "ACTIVE (TTL applies only to RESERVED)",
+            "MT5_AUTHORITATIVE_RECONCILIATION":      ("ACTIVE" if snap["mt5_authoritative"] else "PARTIAL — heartbeat stale"),
+            "FAIL_CLOSED_GOVERNOR":                  "ACTIVE",
+            "GLOBAL_XAUUSD_GROSS_MAX":               MAX_GROSS_LOTS,
+            "PREDATOR_PRESS_0_30":                   "DISABLED",
+            "STRATEGIST_PYRAMID":                    "DISABLED",
         },
         "ledgers": {
-            "STRATEGIST_BUY_OUTCOME_LEDGER":  "ACTIVE",
-            "STRATEGIST_SELL_SHADOW_LEDGER":  "ACTIVE",
+            "STRATEGIST_BUY_OPPORTUNITY_CAPTURE":    "ACTIVE",
+            "STRATEGIST_BUY_CLOSURE_RESOLVER":       "ACTIVE (60s loop)",
+            "STRATEGIST_BUY_FULL_OUTCOME_LEDGER":    "ACTIVE",
+            "STRATEGIST_SELL_SHADOW_RESOLVER":       "ACTIVE (60s loop)",
+            "CANONICALIZATION":                      "PROVISIONAL_V0 (15-min bucket × entry)",
+        },
+        "cohorts": {
+            "FULLY_INSTRUMENTED_FORWARD_CLOSED":     fwd_closed,
+            "PRE_INSTRUMENTATION_ACTUAL_DEMO":       pre_cohort_n,
+        },
+        "checkpoints": {
+            "buy_closed_forward":                    fwd_closed,
+            "distance_to_30_buy":                    max(0, 30 - fwd_closed),
+            "distance_to_60_buy":                    max(0, 60 - fwd_closed),
+            "distance_to_100_buy":                   max(0, 100 - fwd_closed),
+            "sell_shadow_resolved":                  sell_resolved,
+            "distance_to_30_sell_shadow":            max(0, 30 - sell_resolved),
+            "distance_to_60_sell_shadow":            max(0, 60 - sell_resolved),
+            "distance_to_100_sell_shadow":           max(0, 100 - sell_resolved),
         },
         "parked": {
-            "VAL_RECLAIM":                   "PARKED",
-            "NEW_BUY_CONTINUATION":          "PARKED",
+            "VAL_RECLAIM":                           "PARKED",
+            "NEW_BUY_CONTINUATION":                  "PARKED",
+            "CAPACITY_EXPANSION":                    "PARKED",
         },
         "spend":  "$0",
         "regime": "DEMO ONLY",

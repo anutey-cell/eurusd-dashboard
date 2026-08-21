@@ -122,10 +122,11 @@ def record_buy_opportunity_at_enqueue(
               (created_at, opportunity_id, verdict_id, pending_execution_id,
                reservation_id, conditions_passed, setup_score, quality_band,
                market_state, entry, sl, tp1, tp2, rr, lot_size,
-               resolution_status)
+               resolution_status, cohort, canonicalization_version)
             VALUES
               (:ca, :oi, :vi, :pi, :ri, :cp, :ss, :qb, :ms,
-               :en, :sl, :t1, :t2, :rr, :ls, 'OPEN')
+               :en, :sl, :t1, :t2, :rr, :ls, 'OPEN',
+               'FULLY_INSTRUMENTED_FORWARD', 'PROVISIONAL_V0')
         """), dict(
             ca=now.strftime("%Y-%m-%d %H:%M:%S"),
             oi=opp_id,

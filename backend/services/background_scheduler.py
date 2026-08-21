@@ -636,6 +636,36 @@ def _run_shadow_trade_advance():
 _PREDATOR_SEEN: dict[str, float] = {}   # fingerprint -> unix ts
 
 
+async def _strategist_ledger_resolver_loop():
+    """Runs every 60s: resolves closed strategist BUYs + resolves SELL shadows.
+    Fail-open — a resolver failure never blocks trading."""
+    log.info("[scheduler] strategist ledger resolver loop started (60s)")
+    await asyncio.sleep(45)  # let other loops warm up first
+    while True:
+        try:
+            from database import SessionLocal
+            with SessionLocal() as db:
+                try:
+                    from services.strategist_buy_resolver import resolve_closed_buys
+                    r = resolve_closed_buys(db, limit=100)
+                    if r.get("resolved"):
+                        log.info("[strategist_resolver] BUY resolved=%d scanned=%d",
+                                  r["resolved"], r["scanned"])
+                except Exception as _b: log.debug("[strategist_resolver] BUY: %s", _b)
+                try:
+                    from services.strategist_shadow_ledger import resolve_sell_shadows
+                    r = resolve_sell_shadows(db, limit=200)
+                    if r.get("resolved"):
+                        log.info("[strategist_resolver] SELL shadow resolved=%d scanned=%d",
+                                  r["resolved"], r["scanned"])
+                except Exception as _s: log.debug("[strategist_resolver] SELL: %s", _s)
+        except asyncio.CancelledError:
+            log.info("[scheduler] strategist ledger resolver cancelled"); break
+        except Exception as exc:
+            log.warning("[scheduler] strategist ledger resolver error: %s", exc)
+        await asyncio.sleep(60)
+
+
 async def _predator_loop():
     from config import settings
     interval = getattr(settings, "predator_loop_interval_s", 60)
@@ -1266,6 +1296,7 @@ async def start_background_loops():
         asyncio.create_task(_market_intel_loop(),          name="market_intel_loop"),
         asyncio.create_task(_shadow_trade_advance_loop(),  name="shadow_trade_advance_loop"),
         asyncio.create_task(_predator_loop(),              name="predator_loop"),
+        asyncio.create_task(_strategist_ledger_resolver_loop(), name="strategist_ledger_resolver_loop"),
     ]
 
     # Pick exactly ONE execution authority — never both, or they'll fight.

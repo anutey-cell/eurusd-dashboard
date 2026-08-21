@@ -1317,6 +1317,9 @@ class StrategistBuyOutcome(Base):
 
     outcome                   = Column(String(16), nullable=True)   # TP1|TP2|SL|TIMEOUT|MANUAL_CLOSE
     resolution_status         = Column(String(16), nullable=True, index=True)  # OPEN|RESOLVED|ORPHAN
+    cohort                    = Column(String(48), nullable=True, index=True)
+    #  cohorts: FULLY_INSTRUMENTED_FORWARD | PRE_INSTRUMENTATION_ACTUAL_DEMO | HISTORICAL_RESEARCH
+    canonicalization_version  = Column(String(24), nullable=True, default="PROVISIONAL_V0")
 
 
 class StrategistSellShadow(Base):

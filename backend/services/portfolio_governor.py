@@ -43,24 +43,51 @@ RESERVATION_TTL_SEC = 30
 # Atomic gate — serializes concurrent Predator + Strategist submissions
 _GOVERNOR_LOCK = threading.RLock()
 
-# In-memory reservations {reservation_id: (engine, direction, lots, expires_at)}
-_RESERVATIONS: dict[str, tuple] = {}
+# Reservation state machine:
+#   RESERVED  → capacity claimed but no MT5 order yet (TTL applies)
+#   SENT      → order submitted to broker, awaiting fill (TTL DOES NOT apply)
+#   FILLED    → position exists in DB → reservation retired
+#   REJECTED  → broker rejected → reservation released
+#   ABANDONED → post-reconciliation cleanup for expired-RESERVED entries
+#
+# In-memory: {reservation_id: (engine, direction, lots, state, expires_at, mt5_ticket)}
+_RESERVATIONS: dict[str, list] = {}
 
 
 def _prune_expired_reservations() -> None:
-    """Remove any reservations that outlived their TTL. Cheap; called on every
-    snapshot so a crashed enqueuer can't permanently occupy capacity."""
+    """Remove RESERVED (not-yet-SENT) reservations that outlived TTL.
+    SENT reservations are NEVER auto-expired — a delayed broker fill must
+    not release capacity that may still land as a real position.
+    Only reconciliation against MT5 state can retire SENT reservations."""
     now_ts = time.time()
-    stale = [rid for rid, (_e, _d, _l, expires) in _RESERVATIONS.items() if expires < now_ts]
+    stale = []
+    for rid, row in _RESERVATIONS.items():
+        engine, direction, lots, state, expires_at, ticket = row
+        if state == "RESERVED" and expires_at < now_ts:
+            stale.append(rid)
     for rid in stale:
-        engine, direction, lots, _ = _RESERVATIONS.pop(rid)
-        log.warning("[portfolio_governor] reservation expired %s %s %s lots=%.4f",
-                    rid[:8], engine, direction, lots)
+        row = _RESERVATIONS.pop(rid)
+        engine, direction, lots, state, expires_at, ticket = row
+        log.warning("[portfolio_governor] RESERVED expired (auto-abandon) rid=%s "
+                    "%s %s lots=%.4f", rid[:8], engine, direction, lots)
 
 
 def _sum_reservations() -> float:
+    """Sum lots across ALL active reservations (RESERVED + SENT).
+    SENT reservations are counted because the broker may still fill them."""
     _prune_expired_reservations()
-    return sum(lots for (_e, _d, lots, _exp) in _RESERVATIONS.values())
+    return sum(row[2] for row in _RESERVATIONS.values())
+
+
+def mark_sent(reservation_id: str, mt5_ticket: Optional[int] = None) -> bool:
+    """Transition RESERVED → SENT. TTL no longer applies after this."""
+    with _GOVERNOR_LOCK:
+        row = _RESERVATIONS.get(reservation_id)
+        if not row: return False
+        row[3] = "SENT"
+        if mt5_ticket is not None: row[5] = mt5_ticket
+        log.info("[portfolio_governor] rid=%s → SENT (ticket=%s)", reservation_id[:8], mt5_ticket)
+        return True
 
 
 def _sum_predator_open(db: Session) -> float:
@@ -218,7 +245,8 @@ def reserve_capacity(
             return False, "GLOBAL_EXPOSURE_REJECT", snap, None
 
         rid = uuid.uuid4().hex
-        _RESERVATIONS[rid] = (engine, direction, proposed, time.time() + RESERVATION_TTL_SEC)
+        _RESERVATIONS[rid] = [engine, direction, proposed, "RESERVED",
+                              time.time() + RESERVATION_TTL_SEC, None]
         log.info("[portfolio_governor] RESERVED %s %s %.4f lots (rid=%s) — "
                  "committed after=%.4f/%.2f",
                  engine, direction, proposed, rid[:8],

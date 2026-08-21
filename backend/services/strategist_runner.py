@@ -1486,11 +1486,13 @@ def _maybe_enqueue_demo_order(db: Session, verdict: dict) -> int | None:
         _last_enqueue_fingerprint = fp
         _last_enqueue_at          = time.time()
 
-        # Commit the governor reservation (broker now knows about the order
-        # via PendingExecution; daemon will pick it up next poll).
+        # State transition: RESERVED → SENT (broker is now aware via
+        # PendingExecution; daemon will pick up next poll). TTL no longer
+        # applies — the reservation is now protected by broker outcome.
         if _reservation_id:
             try:
-                commit_reservation(_reservation_id, mt5_ticket=None)
+                from services.portfolio_governor import mark_sent
+                mark_sent(_reservation_id, mt5_ticket=None)
             except Exception: pass
 
         # Record BUY opportunity into strategist_buy_outcomes ledger for
