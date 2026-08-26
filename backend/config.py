@@ -124,6 +124,10 @@ class Settings(BaseSettings):
     telegram_alerts_enabled:         bool = False
     telegram_bot_token:              str  = ""   # NEVER logged or returned in API responses
     telegram_chat_id:                str  = ""
+    # Secondary (backup) recipient — separate bot + chat. _send_plain broadcasts
+    # to both if configured. Independent try/except per recipient.
+    telegram_bot_token_2:            str  = ""   # NEVER logged or returned in API responses
+    telegram_chat_id_2:              str  = ""
     telegram_parse_mode:             str  = "HTML"
     telegram_alert_cooldown_minutes: int  = 15   # suppress duplicate alerts within window
     telegram_signal_alerts:          bool = True   # alert when BUY/SELL signal fires

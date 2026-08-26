@@ -1202,22 +1202,37 @@ def _format_momentum_message(result, verdict: dict) -> str:
 
 
 def _send_plain(text: str) -> None:
-    """Send Telegram in plain-text mode so emojis + dashes render exactly."""
-    try:
-        import httpx
-        if not (settings.telegram_bot_token and settings.telegram_chat_id):
-            return
-        url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
-        resp = httpx.post(url, json={
-            "chat_id":                  settings.telegram_chat_id,
-            "text":                     text,
-            "disable_web_page_preview": True,
-        }, timeout=10.0)
-        if not resp.is_success:
-            log.warning("[strategist_runner] Telegram send failed status=%s",
-                        resp.status_code)
-    except Exception as exc:
-        log.warning("[strategist_runner] Telegram plain send error: %s", exc)
+    """Send Telegram in plain-text mode so emojis + dashes render exactly.
+    Broadcasts to primary bot+chat AND, if configured, to a secondary
+    bot+chat pair (backup recipient). Each recipient is sent independently
+    with its own try/except — a failed delivery to one does not block the
+    other.
+    """
+    import httpx
+    # (bot_token, chat_id, label) pairs. Secondary is optional.
+    recipients: list[tuple[str, str, str]] = []
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        recipients.append((settings.telegram_bot_token,
+                           settings.telegram_chat_id, "primary"))
+    tok2 = getattr(settings, "telegram_bot_token_2", None)
+    cid2 = getattr(settings, "telegram_chat_id_2", None)
+    if tok2 and cid2:
+        recipients.append((tok2, cid2, "secondary"))
+
+    for bot_token, chat_id, label in recipients:
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            resp = httpx.post(url, json={
+                "chat_id":                  chat_id,
+                "text":                     text,
+                "disable_web_page_preview": True,
+            }, timeout=10.0)
+            if not resp.is_success:
+                log.warning("[strategist_runner] Telegram send failed "
+                            "recipient=%s status=%s", label, resp.status_code)
+        except Exception as exc:
+            log.warning("[strategist_runner] Telegram plain send error "
+                        "recipient=%s: %s", label, exc)
 
 
 # ── MT5 enqueue side-effect ──────────────────────────────────────────────────
