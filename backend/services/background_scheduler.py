@@ -722,6 +722,13 @@ async def _predator_loop():
 _PREDATOR_ARMED_TRACKING: dict[str, dict] = {}
 _PREDATOR_ARMED_STALE_S = 900   # 15 min — if ARMED >this long without FIRE, INVALIDATE
 
+# Telegram FIRE-alert dedup: {opportunity_id: last_sent_unix_ts}
+# Suppresses repeat FIRE Telegrams for the same canonical opportunity within
+# the cooldown window. First FIRE goes out with full context; subsequent M5-close
+# re-fires on the same setup stay silent (still logged to DB).
+_PREDATOR_FIRE_TELEGRAM_LAST: dict[str, float] = {}
+_PREDATOR_FIRE_TELEGRAM_COOLDOWN_S = 1800   # 30 min per opportunity_id
+
 
 def _run_predator_iteration():
     import time as _time
@@ -935,28 +942,45 @@ def _run_predator_iteration():
             # in evaluate() (regime gate + extension filter). Pass level +
             # current price to formatter for ARMED context, plan for FIRE.
             if tele_on:
-                try:
-                    from services.strategist_runner import _send_plain
-                    key_level = None
-                    current_price = None
-                    if sig.archetype == "ASIAN_BREAKDOWN":
-                        key_level = _a_l
-                    elif sig.archetype == "PDL_BREAK":
-                        key_level = _pdl
-                    elif sig.archetype == "APPROACHING_LEVEL":
-                        # Use whichever is closer for ARMED message
-                        candidates = [x for x in (_a_l, _pdl) if x is not None]
-                        if candidates:
-                            key_level = max(candidates)   # nearest above current close (SELL setup)
-                    if _m5:
-                        current_price = _m5[-1][4]
-                    msg = format_telegram_alert(sig, regime=regime,
-                                                    key_level=key_level,
-                                                    current_price=current_price,
-                                                    deployment_plan=deployment_plan)
-                    _send_plain(msg)
-                except Exception as exc:
-                    log.warning("[predator] telegram send failed: %s", exc)
+                # Option B: suppress duplicate FIRE Telegram for the same
+                # canonical opportunity within cooldown. First FIRE gets full
+                # context; subsequent M5-close re-fires on same setup stay
+                # silent (DB records still land). ARMED alerts are unaffected.
+                _skip_fire_telegram = False
+                if sig.state == "FIRE" and batch is not None and batch.opportunity_id:
+                    _last = _PREDATOR_FIRE_TELEGRAM_LAST.get(batch.opportunity_id)
+                    if _last and (now - _last) < _PREDATOR_FIRE_TELEGRAM_COOLDOWN_S:
+                        _skip_fire_telegram = True
+                        log.info("[predator] FIRE Telegram suppressed — same "
+                                  "opportunity_id=%s fired %.0fs ago",
+                                  batch.opportunity_id, now - _last)
+                if not _skip_fire_telegram:
+                    try:
+                        from services.strategist_runner import _send_plain
+                        key_level = None
+                        current_price = None
+                        if sig.archetype == "ASIAN_BREAKDOWN":
+                            key_level = _a_l
+                        elif sig.archetype == "PDL_BREAK":
+                            key_level = _pdl
+                        elif sig.archetype == "APPROACHING_LEVEL":
+                            # Use whichever is closer for ARMED message
+                            candidates = [x for x in (_a_l, _pdl) if x is not None]
+                            if candidates:
+                                key_level = max(candidates)   # nearest above current close (SELL setup)
+                        if _m5:
+                            current_price = _m5[-1][4]
+                        msg = format_telegram_alert(sig, regime=regime,
+                                                        key_level=key_level,
+                                                        current_price=current_price,
+                                                        deployment_plan=deployment_plan)
+                        _send_plain(msg)
+                        # Record send so cooldown starts. Only track FIRE alerts
+                        # so we don't mute ARMED-state transitions.
+                        if sig.state == "FIRE" and batch is not None and batch.opportunity_id:
+                            _PREDATOR_FIRE_TELEGRAM_LAST[batch.opportunity_id] = now
+                    except Exception as exc:
+                        log.warning("[predator] telegram send failed: %s", exc)
 
             # ── Staged execution (only if FIRE + batch planned + master flag on)
             if sig.state == "FIRE" and batch is not None:
@@ -1003,7 +1027,13 @@ def _run_predator_iteration():
                         revalidate_fn=_revalidate,
                         stage_delay_s=stage_delay,
                     )
-                    if tele_on:
+                    # Option A: only send an Execution Summary Telegram when
+                    # something actually opened. If the batch aborted at
+                    # revalidation before any ticket landed, the FIRE alert
+                    # already told the operator the plan — a second alert
+                    # saying "0 opened" is pure noise.
+                    _opened = int(exec_result.get("opened", 0) or 0)
+                    if tele_on and _opened > 0:
                         try:
                             from services.strategist_runner import _send_plain
                             # Refresh batch state (execute_batch_staged commits)
@@ -1017,6 +1047,10 @@ def _run_predator_iteration():
                             _send_plain(summary)
                         except Exception as exc:
                             log.warning("[predator] execution-summary send failed: %s", exc)
+                    elif tele_on and _opened == 0:
+                        log.info("[predator] execution-summary suppressed — "
+                                  "batch=%d opened=0 (Option A noise mute)",
+                                  batch.id if batch else -1)
                 except Exception as exc:
                     log.error("[predator] staged execution raised: %s", exc)
 
