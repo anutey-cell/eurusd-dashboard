@@ -448,14 +448,21 @@ def _armed_status(m5_bars: list[tuple], rsi_h1: Optional[float]) -> Optional[dic
 
     # Distance from each relevant level (SELL: below asian_low or PDL)
     armed_reasons = []
+    level_proximate = False
     if a_low is not None and 0 < close - a_low <= 5.0:
         armed_reasons.append(f"within 5pt of asian_low {a_low:.2f}")
+        level_proximate = True
     if prev_l is not None and 0 < close - prev_l <= 5.0:
         armed_reasons.append(f"within 5pt of prev_day_low {prev_l:.2f}")
+        level_proximate = True
+    # RSI weakness is confluence, NOT a standalone ARMED trigger — a
+    # persistent bear macro can hold RSI < 45 for hours with no imminent
+    # setup, and ARMEDing on that alone was flooding the operator with
+    # "watching" alerts for setups nowhere near forming.
     if rsi_h1 is not None and rsi_h1 < 45:
         armed_reasons.append(f"RSI H1 {rsi_h1:.0f} weak")
 
-    if not armed_reasons:
+    if not level_proximate:
         return None
     return {
         "reasons":     armed_reasons,
