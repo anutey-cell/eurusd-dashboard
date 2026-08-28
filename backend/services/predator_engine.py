@@ -552,6 +552,7 @@ def evaluate(db: Session) -> list[PredatorSignal]:
 def format_telegram_alert(sig: PredatorSignal, regime: Optional[dict] = None,
                              key_level: Optional[float] = None,
                              current_price: Optional[float] = None,
+                             current_price_ts=None,
                              deployment_plan=None) -> str:
     """
     Two message shapes — ARMED (pre-signal awareness) and FIRE (executable
@@ -570,13 +571,21 @@ def format_telegram_alert(sig: PredatorSignal, regime: Optional[dict] = None,
     if sig.state == "ARMED":
         cur = current_price or sig.entry
         distance = abs(key_level - cur) if key_level else "—"
+        # "as of" tag reveals how stale the price is — droplet captures
+        # candles at M5 close so live MT5 chart may be up to ~5 min ahead.
+        cur_as_of = ""
+        if current_price_ts is not None:
+            try:
+                cur_as_of = f"  (as of {current_price_ts:%H:%M} UTC · M5 close)"
+            except Exception:
+                cur_as_of = ""
         lines = [
             f"👁 PREDATOR ARMED — XAUUSD",
             f"Direction: {sig.direction}",
             f"Archetype: {sig.archetype}",
             f"Regime: {regime_str}",
             f"Key Level: {key_level:.2f}" if key_level else "Key Level: —",
-            f"Current Price: {cur:.2f}",
+            f"Current Price: {cur:.2f}{cur_as_of}",
             f"Distance to Trigger: {distance:.1f} pts" if isinstance(distance, (int, float)) else f"Distance to Trigger: {distance}",
             f"Setup Edge: {sig.confidence}",
             (f"Entry Extension: {(sig.pct_consumed or 0)*100:.0f}%"

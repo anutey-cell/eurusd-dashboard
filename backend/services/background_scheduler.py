@@ -729,6 +729,15 @@ _PREDATOR_ARMED_STALE_S = 900   # 15 min — if ARMED >this long without FIRE, I
 _PREDATOR_FIRE_TELEGRAM_LAST: dict[str, float] = {}
 _PREDATOR_FIRE_TELEGRAM_COOLDOWN_S = 1800   # 30 min per opportunity_id
 
+# Telegram ARMED-alert dedup: {armed_key: last_sent_unix_ts}
+# Same rule as FIRE — only one ARMED Telegram per (archetype+dir+5pt bucket)
+# within cooldown. Subsequent ARMED signals for the same bucket update the
+# in-memory tracker silently. INVALIDATED sends are gated on this dict:
+# if we suppressed the ARMED for a bucket, we also suppress its INVALIDATED,
+# so the user only ever sees a paired alert → trigger (or alert → invalidated).
+_PREDATOR_ARMED_TELEGRAM_LAST: dict[str, float] = {}
+_PREDATOR_ARMED_TELEGRAM_COOLDOWN_S = 1800   # 30 min per armed_key
+
 
 def _run_predator_iteration():
     import time as _time
@@ -942,23 +951,31 @@ def _run_predator_iteration():
             # in evaluate() (regime gate + extension filter). Pass level +
             # current price to formatter for ARMED context, plan for FIRE.
             if tele_on:
-                # Option B: suppress duplicate FIRE Telegram for the same
-                # canonical opportunity within cooldown. First FIRE gets full
-                # context; subsequent M5-close re-fires on same setup stay
-                # silent (DB records still land). ARMED alerts are unaffected.
-                _skip_fire_telegram = False
+                # Per-state Telegram cooldown. Same canonical setup only pings
+                # the user ONCE per 30 min — first ARMED goes out with full
+                # context, first FIRE goes out with plan; subsequent M5-close
+                # re-fires on the same setup stay silent (DB records still land).
+                _skip_telegram = False
                 if sig.state == "FIRE" and batch is not None and batch.opportunity_id:
                     _last = _PREDATOR_FIRE_TELEGRAM_LAST.get(batch.opportunity_id)
                     if _last and (now - _last) < _PREDATOR_FIRE_TELEGRAM_COOLDOWN_S:
-                        _skip_fire_telegram = True
+                        _skip_telegram = True
                         log.info("[predator] FIRE Telegram suppressed — same "
                                   "opportunity_id=%s fired %.0fs ago",
                                   batch.opportunity_id, now - _last)
-                if not _skip_fire_telegram:
+                elif sig.state == "ARMED":
+                    _last = _PREDATOR_ARMED_TELEGRAM_LAST.get(armed_key)
+                    if _last and (now - _last) < _PREDATOR_ARMED_TELEGRAM_COOLDOWN_S:
+                        _skip_telegram = True
+                        log.info("[predator] ARMED Telegram suppressed — same "
+                                  "bucket=%s armed %.0fs ago",
+                                  armed_key, now - _last)
+                if not _skip_telegram:
                     try:
                         from services.strategist_runner import _send_plain
                         key_level = None
                         current_price = None
+                        current_price_ts = None
                         if sig.archetype == "ASIAN_BREAKDOWN":
                             key_level = _a_l
                         elif sig.archetype == "PDL_BREAK":
@@ -970,15 +987,18 @@ def _run_predator_iteration():
                                 key_level = max(candidates)   # nearest above current close (SELL setup)
                         if _m5:
                             current_price = _m5[-1][4]
+                            current_price_ts = _m5[-1][0]
                         msg = format_telegram_alert(sig, regime=regime,
                                                         key_level=key_level,
                                                         current_price=current_price,
+                                                        current_price_ts=current_price_ts,
                                                         deployment_plan=deployment_plan)
                         _send_plain(msg)
-                        # Record send so cooldown starts. Only track FIRE alerts
-                        # so we don't mute ARMED-state transitions.
+                        # Record send so cooldown starts.
                         if sig.state == "FIRE" and batch is not None and batch.opportunity_id:
                             _PREDATOR_FIRE_TELEGRAM_LAST[batch.opportunity_id] = now
+                        elif sig.state == "ARMED":
+                            _PREDATOR_ARMED_TELEGRAM_LAST[armed_key] = now
                     except Exception as exc:
                         log.warning("[predator] telegram send failed: %s", exc)
 
@@ -1071,7 +1091,12 @@ def _run_predator_iteration():
             log.info("[predator] INVALIDATED %s %s (armed %ds ago)",
                      info["archetype"], info["direction"],
                      int(now - info["armed_at"]))
-            if tele_on:
+            # Pair 1:1 with ARMED Telegram — only send INVALIDATED if we
+            # actually sent an ARMED Telegram for this bucket. If the ARMED
+            # was suppressed by cooldown, the user was never told, so the
+            # INVALIDATED would be orphan noise.
+            _armed_was_sent_at = _PREDATOR_ARMED_TELEGRAM_LAST.pop(key, None)
+            if tele_on and _armed_was_sent_at is not None:
                 try:
                     from services.strategist_runner import _send_plain
                     _send_plain(format_telegram_invalidated(
