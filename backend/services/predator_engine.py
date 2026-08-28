@@ -280,10 +280,16 @@ def detect_asian_breakdown(m5_bars: list[tuple],
 
     t = hit["time"]; c = hit["close"]
 
-    # Extension filter — only fire if not already over-consumed
-    passes, pct = _apply_extension_filter("ASIAN_BREAKDOWN", a_low, hit["close"], c)
+    # Extension filter — measure consumption against the LIVE M5 close,
+    # not the historical hit-bar close. Without this, a break that
+    # happened hours ago and has run far past the level keeps re-emitting
+    # FIRE with a stale entry because pct is measured at the break bar.
+    current_close = m5_bars[-1][4]
+    passes, pct = _apply_extension_filter("ASIAN_BREAKDOWN", a_low, hit["close"], current_close)
     if not passes:
-        log.debug("[predator/asian] extension filter rejected: pct_consumed=%.2f", pct)
+        log.debug("[predator/asian] extension filter rejected: pct_consumed=%.2f "
+                  "(hit_close=%.2f current=%.2f level=%.2f)",
+                  pct, hit["close"], current_close, a_low)
         return None
 
     entry = c
@@ -346,9 +352,15 @@ def detect_pdl_break(m5_bars: list[tuple],
     if not (has_vol or stacked):
         return None
 
-    passes, pct = _apply_extension_filter("PDL_BREAK", prev_l, c, c)
+    # Measure against the LIVE M5 close, not the hit-bar close — a break
+    # that happened hours ago and has run past the level must not re-fire
+    # as if the entry were still fresh at the break bar's price.
+    current_close = m5_bars[-1][4]
+    passes, pct = _apply_extension_filter("PDL_BREAK", prev_l, c, current_close)
     if not passes:
-        log.debug("[predator/pdl] extension filter rejected: pct=%.2f", pct)
+        log.debug("[predator/pdl] extension filter rejected: pct=%.2f "
+                  "(hit_close=%.2f current=%.2f level=%.2f)",
+                  pct, c, current_close, prev_l)
         return None
 
     entry = c
