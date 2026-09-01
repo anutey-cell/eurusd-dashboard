@@ -1669,3 +1669,50 @@ def provider_health(
         },
         source="diagnostics",
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Predator notification gateway diagnostics (P233)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/predator-notifications")
+def diag_predator_notifications(
+    hours: int = Query(24, ge=1, le=168),
+    db=Depends(get_db),
+):
+    """
+    Gateway-driven notification-quality metrics.
+
+    Fields:
+      - internal_candidates_detected: total signals evaluated in window
+      - setup_ids_created: unique setups touched
+      - average_observations_per_setup: how many M5 evaluations per hypothesis
+      - telegram_messages_sent: actual Telegram sends by gateway
+      - telegram_messages_would_send_shadow: shadow-mode "would send" counter
+      - telegram_messages_suppressed: total (either mode)
+      - telegram_suppression_rate: suppressed / all decisions
+      - candidate_to_actionable_ratio: how noisy the pre-refactor world was
+      - actionable_signals_suppressed: legit gate failures (rr/stale/overext)
+      - suppression_reason_breakdown: {reason: count}
+      - decision_breakdown: {SENT/SUPPRESSED/WOULD_SEND/WOULD_SUPPRESS: count}
+      - msg_type_breakdown: {ACTIONABLE/INVALIDATION/...: count}
+    """
+    from services.predator_notification_gateway import notification_metrics
+    metrics = notification_metrics(db, hours=hours)
+    from config import settings as _cfg
+    metrics["current_architecture_mode"] = getattr(
+        _cfg, "predator_notification_architecture", "unknown"
+    )
+    metrics["current_notification_mode"] = getattr(
+        _cfg, "predator_notification_mode", "unknown"
+    )
+    metrics["setup_price_bucket_pts"] = getattr(
+        _cfg, "predator_setup_price_bucket", None
+    )
+    metrics["min_rr_gate"] = getattr(
+        _cfg, "predator_notification_min_rr", None
+    )
+    metrics["max_bar_age_min"] = getattr(
+        _cfg, "predator_notification_max_bar_age_min", None
+    )
+    return APIResponse(data=metrics, source="predator_notification_gateway")

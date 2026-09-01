@@ -1468,3 +1468,88 @@ class XauusdForwardCoverage(Base):
 
     # Unrepresented context (only populated when classification == UNREPRESENTED_MARKET_MOVE)
     prior_regime_snapshot       = Column(String(255), nullable=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Predator notification architecture (2026-08-28 refactor)
+# Persistent setup identity + notification state machine so Telegram receives
+# only trader-facing actionable events, never internal candidate lifecycle noise.
+# See services/predator_setup_registry.py + services/predator_notification_gateway.py
+# ═════════════════════════════════════════════════════════════════════════════
+
+class PredatorSetup(Base):
+    """
+    One row per persistent market hypothesis. Identity is deterministic across
+    restarts and does NOT include bar_time — a new M5 candle is an observation
+    against the same setup, not a new setup.
+
+    internal_state (strategy layer) is decoupled from notification_state
+    (Telegram layer). Only notification_state transitions produce sends.
+    """
+    __tablename__ = "predator_setups"
+
+    id                     = Column(Integer, primary_key=True, autoincrement=True)
+    setup_id               = Column(String(160), nullable=False, unique=True, index=True)
+
+    # Persistent identity components (bar_time NEVER included)
+    strategy               = Column(String(24), nullable=False, default="PREDATOR")
+    instrument             = Column(String(16), nullable=False, default="XAUUSD")
+    direction              = Column(String(8),  nullable=False)                    # BUY | SELL
+    archetype              = Column(String(32), nullable=False)                    # ASIAN_BREAKDOWN | PDL_BREAK | VOL_CONTINUATION | APPROACHING_LEVEL
+    reference_level_type   = Column(String(24), nullable=False)                    # ASIAN_LOW | PDL | NONE
+    normalized_price_bucket = Column(Float, nullable=False)                        # rounded key_level per bucket_pts
+    session                = Column(String(16), nullable=False)                    # ASIA | LONDON | NY_OPEN | NY_PM | ROLLOVER
+    trading_date           = Column(String(10), nullable=False, index=True)        # YYYY-MM-DD
+
+    # Internal strategy lifecycle — observability only, NOT a Telegram trigger
+    internal_state         = Column(String(24), nullable=False, default="DETECTED")
+    # DETECTED | CANDIDATE | APPROACHING | ARMED | CONFIRMING | FIRE | REJECTED | INVALIDATED | EXPIRED
+
+    # Notification lifecycle — governs Telegram sends
+    notification_state     = Column(String(32), nullable=False, default="NOT_SENT", index=True)
+    # NOT_SENT | ACTIONABLE_SENT | ENTRY_SENT | TP1_SENT | TP2_SENT | TP3_SENT |
+    # BREAKEVEN_SENT | TRAILING_SENT | STOPPED_SENT | INVALIDATED_SENT | CLOSED
+
+    # Observation counters
+    observation_count      = Column(Integer, nullable=False, default=1)
+    first_seen_at          = Column(DateTime(timezone=True), default=_now, nullable=False)
+    last_seen_at           = Column(DateTime(timezone=True), default=_now, nullable=False)
+    last_evaluated_bar     = Column(DateTime(timezone=True), nullable=True)
+
+    # Latest observation snapshot (updated per M5 tick; NOT alertable)
+    latest_price           = Column(Float, nullable=True)
+    latest_distance        = Column(Float, nullable=True)
+    latest_confidence      = Column(String(16), nullable=True)
+    latest_regime          = Column(String(64), nullable=True)
+    latest_score           = Column(Integer, nullable=True)
+
+    # Notification history (JSON list serialized as text for SQLite compat)
+    # [{"msg_type": ..., "sent_at": ..., "message_hash": ..., "opportunity_id": ...}, ...]
+    notifications_sent     = Column(Text, nullable=False, default="[]")
+
+    # Suppression log for diagnostics
+    # [{"reason": ..., "at": ..., "count": ...}, ...]
+    suppressions           = Column(Text, nullable=False, default="[]")
+
+    # Cross-links (optional — populated once actionable batch is created)
+    linked_opportunity_id  = Column(String(96), nullable=True, index=True)
+    linked_batch_id        = Column(Integer,    nullable=True)
+
+
+class PredatorNotificationEvent(Base):
+    """
+    Append-only audit log of every gateway decision. Powers the
+    /diagnostics/predator-notifications endpoint.
+    """
+    __tablename__ = "predator_notification_events"
+
+    id                     = Column(Integer, primary_key=True, autoincrement=True)
+    created_at             = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    setup_id               = Column(String(160), nullable=False, index=True)
+    architecture_mode      = Column(String(16), nullable=False)     # legacy | shadow | gateway
+    decision               = Column(String(16), nullable=False, index=True)     # SENT | SUPPRESSED | WOULD_SEND | WOULD_SUPPRESS
+    reason                 = Column(String(64), nullable=True, index=True)
+    msg_type               = Column(String(32), nullable=True)      # ACTIONABLE | INVALIDATION | ENTRY | TP1 | ...
+    internal_state         = Column(String(24), nullable=True)
+    notification_state     = Column(String(32), nullable=True)
+    message_hash           = Column(String(64), nullable=True)

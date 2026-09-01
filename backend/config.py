@@ -137,6 +137,23 @@ class Settings(BaseSettings):
     telegram_hourly_briefing:        bool = False  # hourly structured market briefing on NN:00 UTC
     telegram_preformation_alerts:    bool = True   # heads-up 1 hour before each major killzone opens
 
+    # ── Predator notification architecture (2026-08-28 refactor) ─────────────
+    # legacy   → current direct _send_plain paths (pre-refactor behaviour, kept for rollback only)
+    # shadow   → gateway computes decision + logs but never sends; legacy path still runs
+    # gateway  → gateway is the sole sender; legacy direct-send paths become no-ops
+    # Production target: `gateway`. Default until shadow validates: `shadow`.
+    predator_notification_architecture: str  = "shadow"
+    # ACTIONABLE_ONLY → only qualifying FIREs + their lifecycle (default, matches user mandate)
+    # PRE_ALERT       → reserved; currently not implemented (design defers PRE_ALERT)
+    predator_notification_mode:         str   = "ACTIONABLE_ONLY"
+    # Setup identity — price zone bucket in points. Prevents 4430.07 vs 4429.99
+    # from creating separate hypotheses. Configurable so we can tighten later.
+    predator_setup_price_bucket:        float = 5.0
+    # Actionability gate — minimum RR to Telegram. Signals below this stay silent.
+    predator_notification_min_rr:       float = 1.2
+    # Freshness threshold for the last M5 candle (minutes). Older = data_stale → silent.
+    predator_notification_max_bar_age_min: int = 15
+
     # ── VP Trap strategy (Previous-Day Volume Profile + Trapped Traders) ─────
     # Independent secondary strategy that identifies failed breakouts of prev-day
     # PDH/PDL/VAH/VAL and generates high-conviction reversal signals only when

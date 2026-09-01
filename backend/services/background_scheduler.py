@@ -805,10 +805,21 @@ def _run_predator_iteration():
 
             # Track ARMED entries for later INVALIDATED emission
             if sig.state == "ARMED":
+                # Capture key_level so the invalidation loop below can
+                # reconstruct the gateway setup_id deterministically.
+                _armed_key_level = None
+                if sig.archetype == "ASIAN_BREAKDOWN":
+                    _armed_key_level = _a_l
+                elif sig.archetype == "PDL_BREAK":
+                    _armed_key_level = _pdl
+                elif sig.archetype == "APPROACHING_LEVEL":
+                    _cands = [x for x in (_a_l, _pdl) if x is not None]
+                    _armed_key_level = max(_cands) if _cands else None
                 _PREDATOR_ARMED_TRACKING[armed_key] = {
                     "armed_at":  now,
                     "archetype": sig.archetype,
                     "direction": sig.direction,
+                    "key_level": _armed_key_level,
                     "last_seen": now,
                 }
                 log.info("[predator] ARMED %s %s @ %.2f", sig.archetype, sig.direction, sig.entry)
@@ -947,14 +958,56 @@ def _run_predator_iteration():
                     try: db.rollback()
                     except Exception: pass
 
-            # Telegram gated — signal integrity rules already enforced
-            # in evaluate() (regime gate + extension filter). Pass level +
-            # current price to formatter for ARMED context, plan for FIRE.
-            if tele_on:
-                # Per-state Telegram cooldown. Same canonical setup only pings
-                # the user ONCE per 30 min — first ARMED goes out with full
-                # context, first FIRE goes out with plan; subsequent M5-close
-                # re-fires on the same setup stay silent (DB records still land).
+            # ── Notification gateway (P233 refactor) ───────────────────────
+            # Sole route from PREDATOR signals to Telegram.
+            #   mode=legacy   → legacy code below sends; gateway is inert
+            #   mode=shadow   → gateway records decision; legacy still sends
+            #   mode=gateway  → gateway is sole sender; legacy path is skipped
+            _arch_mode = getattr(settings, "predator_notification_architecture", "shadow")
+            _gw_key_level = None
+            if sig.archetype == "ASIAN_BREAKDOWN":
+                _gw_key_level = _a_l
+            elif sig.archetype == "PDL_BREAK":
+                _gw_key_level = _pdl
+            elif sig.archetype == "APPROACHING_LEVEL":
+                candidates = [x for x in (_a_l, _pdl) if x is not None]
+                if candidates:
+                    _gw_key_level = max(candidates)
+
+            _gw_current_price = _m5[-1][4] if _m5 else None
+            _gw_current_price_ts = _m5[-1][0] if _m5 else None
+
+            def _gw_build_message(_sig, _setup):
+                return format_telegram_alert(
+                    _sig, regime=regime,
+                    key_level=_gw_key_level,
+                    current_price=_gw_current_price,
+                    current_price_ts=_gw_current_price_ts,
+                    deployment_plan=deployment_plan,
+                )
+
+            try:
+                from services.predator_notification_gateway import route_signal
+                _gw_result = route_signal(
+                    db, sig, key_level=_gw_key_level,
+                    message_builder=_gw_build_message,
+                    opportunity_id=(batch.opportunity_id if batch else None),
+                    settings=settings,
+                )
+                log.debug("[predator/gateway] setup=%s mode=%s eligible=%s "
+                          "reason=%s sent=%s",
+                          _gw_result.get("setup_id"), _gw_result.get("mode"),
+                          _gw_result.get("eligible"), _gw_result.get("reason"),
+                          _gw_result.get("sent"))
+            except Exception as _gwexc:
+                log.warning("[predator/gateway] route_signal errored: %s", _gwexc)
+
+            # Legacy path — only runs when mode == "legacy" or "shadow".
+            # In "gateway" mode the gateway is the sole sender and this whole
+            # block is skipped so we cannot double-send.
+            if tele_on and _arch_mode != "gateway":
+                # Per-state Telegram cooldown (legacy behavior — kept for
+                # shadow/legacy parity only). Gateway mode ignores this.
                 _skip_telegram = False
                 if sig.state == "FIRE" and batch is not None and batch.opportunity_id:
                     _last = _PREDATOR_FIRE_TELEGRAM_LAST.get(batch.opportunity_id)
@@ -973,21 +1026,9 @@ def _run_predator_iteration():
                 if not _skip_telegram:
                     try:
                         from services.strategist_runner import _send_plain
-                        key_level = None
-                        current_price = None
-                        current_price_ts = None
-                        if sig.archetype == "ASIAN_BREAKDOWN":
-                            key_level = _a_l
-                        elif sig.archetype == "PDL_BREAK":
-                            key_level = _pdl
-                        elif sig.archetype == "APPROACHING_LEVEL":
-                            # Use whichever is closer for ARMED message
-                            candidates = [x for x in (_a_l, _pdl) if x is not None]
-                            if candidates:
-                                key_level = max(candidates)   # nearest above current close (SELL setup)
-                        if _m5:
-                            current_price = _m5[-1][4]
-                            current_price_ts = _m5[-1][0]
+                        key_level = _gw_key_level
+                        current_price = _gw_current_price
+                        current_price_ts = _gw_current_price_ts
                         msg = format_telegram_alert(sig, regime=regime,
                                                         key_level=key_level,
                                                         current_price=current_price,
@@ -1053,7 +1094,35 @@ def _run_predator_iteration():
                     # already told the operator the plan — a second alert
                     # saying "0 opened" is pure noise.
                     _opened = int(exec_result.get("opened", 0) or 0)
-                    if tele_on and _opened > 0:
+                    # In gateway mode, only send the exec summary if the parent
+                    # FIRE was actually sent to Telegram — otherwise the user
+                    # gets an orphan "N tickets opened" with no context.
+                    _summary_ok = True
+                    if _arch_mode == "gateway" and batch is not None:
+                        try:
+                            from services.predator_notification_gateway import (
+                                _LIFECYCLE_ELIGIBLE_STATES
+                            )
+                            from services.predator_setup_registry import setup_id_for
+                            from db_models import PredatorSetup as _PS
+                            _sid = setup_id_for(
+                                direction=batch.direction,
+                                archetype=batch.archetype,
+                                key_level=batch.key_level,
+                                bucket_pts=float(getattr(settings,
+                                    "predator_setup_price_bucket", 5.0)),
+                            )
+                            _row = db.query(_PS).filter(
+                                _PS.setup_id == _sid
+                            ).first()
+                            if _row is None or _row.notification_state \
+                                    not in _LIFECYCLE_ELIGIBLE_STATES:
+                                _summary_ok = False
+                                log.info("[predator] exec-summary suppressed "
+                                          "(gateway mode, setup not actionable-sent)")
+                        except Exception:
+                            _summary_ok = False
+                    if tele_on and _opened > 0 and _summary_ok:
                         try:
                             from services.strategist_runner import _send_plain
                             # Refresh batch state (execute_batch_staged commits)
@@ -1075,6 +1144,10 @@ def _run_predator_iteration():
                     log.error("[predator] staged execution raised: %s", exc)
 
         # ── Emit INVALIDATED for tracked ARMED entries that went stale ──
+        # In legacy/shadow: the paired-with-ARMED cooldown check runs and may
+        # send. In gateway mode: the gateway is authoritative — it looks up
+        # the setup_id's notification_state and only sends INVALIDATION if
+        # we previously sent an actionable/lifecycle Telegram.
         stale_keys = []
         for key, info in _PREDATOR_ARMED_TRACKING.items():
             if key in seen_this_tick:
@@ -1084,6 +1157,7 @@ def _run_predator_iteration():
             if age >= _PREDATOR_ARMED_STALE_S:
                 stale_keys.append(key)
 
+        _arch_mode = getattr(settings, "predator_notification_architecture", "shadow")
         for key in stale_keys:
             info = _PREDATOR_ARMED_TRACKING.pop(key)
             reason = ("Trigger window elapsed without M5 close breaching level; "
@@ -1091,12 +1165,38 @@ def _run_predator_iteration():
             log.info("[predator] INVALIDATED %s %s (armed %ds ago)",
                      info["archetype"], info["direction"],
                      int(now - info["armed_at"]))
-            # Pair 1:1 with ARMED Telegram — only send INVALIDATED if we
-            # actually sent an ARMED Telegram for this bucket. If the ARMED
-            # was suppressed by cooldown, the user was never told, so the
-            # INVALIDATED would be orphan noise.
+
+            # Route through the gateway. It enforces the "NOT_SENT invalidation
+            # is silent" rule; nothing to check here.
+            try:
+                from services.predator_notification_gateway import (
+                    route_invalidation
+                )
+                from services.predator_setup_registry import setup_id_for
+                _stale_setup_id = setup_id_for(
+                    direction=info["direction"],
+                    archetype=info["archetype"],
+                    key_level=info.get("key_level"),
+                    bucket_pts=float(getattr(settings,
+                                              "predator_setup_price_bucket", 5.0)),
+                )
+
+                def _inv_builder(_setup, _reason):
+                    return format_telegram_invalidated(
+                        _setup.archetype, _setup.direction, _reason,
+                    )
+
+                route_invalidation(
+                    db, setup_id=_stale_setup_id, reason_text=reason,
+                    message_builder=_inv_builder, settings=settings,
+                )
+            except Exception as _gwexc:
+                log.warning("[predator/gateway] invalidation routing failed: %s",
+                            _gwexc)
+
+            # Legacy path — only runs when mode != gateway.
             _armed_was_sent_at = _PREDATOR_ARMED_TELEGRAM_LAST.pop(key, None)
-            if tele_on and _armed_was_sent_at is not None:
+            if tele_on and _arch_mode != "gateway" and _armed_was_sent_at is not None:
                 try:
                     from services.strategist_runner import _send_plain
                     _send_plain(format_telegram_invalidated(
