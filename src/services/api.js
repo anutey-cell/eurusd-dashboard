@@ -1,7 +1,13 @@
 // ─── Base config ──────────────────────────────────────────────────────────────
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 const PREFIX = '/api/v1';
-const DEFAULT_TIMEOUT_MS = 8000;
+// /api/v1/summary has an internal cache. Cold-cache hits take 6-10s
+// (aggregates strategist, predator, VP-trap, briefing, calendar etc.);
+// warm hits are ~0.2s. 8000ms landed right on the cold-hit boundary and
+// caused "backend offline / request timed out" flashes on first load and
+// after cache expiry. 20s gives comfortable headroom without masking
+// genuine backend failures.
+const DEFAULT_TIMEOUT_MS = 20000;
 
 async function apiFetch(path, options = {}) {
   const url = `${API_BASE}${PREFIX}${path}`;
