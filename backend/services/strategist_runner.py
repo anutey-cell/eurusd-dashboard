@@ -1201,15 +1201,22 @@ def _format_momentum_message(result, verdict: dict) -> str:
     )
 
 
-def _send_plain(text: str) -> None:
-    """Send Telegram in plain-text mode so emojis + dashes render exactly.
-    Broadcasts to primary bot+chat AND, if configured, to a secondary
-    bot+chat pair (backup recipient). Each recipient is sent independently
-    with its own try/except — a failed delivery to one does not block the
-    other.
+def deliver_plain(text: str) -> tuple[bool, str]:
+    """
+    Attempt to deliver a plain-text Telegram message. Returns
+    (any_recipient_succeeded, diagnostic).
+
+    Delivery is considered successful if at least one recipient returned
+    HTTP 2xx. If every recipient fails (HTTP non-2xx, timeout, network
+    exception), returns (False, joined_failure_reasons). Callers that
+    need to persist "message actually delivered" state (the predator
+    notification gateway) MUST use this variant so a failed HTTP POST
+    does not falsely advance notification_state to ACTIONABLE_SENT.
+
+    Callers that fire-and-forget (weekly digest, briefing, VP trap etc.)
+    keep using `_send_plain` which discards the status.
     """
     import httpx
-    # (bot_token, chat_id, label) pairs. Secondary is optional.
     recipients: list[tuple[str, str, str]] = []
     if settings.telegram_bot_token and settings.telegram_chat_id:
         recipients.append((settings.telegram_bot_token,
@@ -1218,7 +1225,11 @@ def _send_plain(text: str) -> None:
     cid2 = getattr(settings, "telegram_chat_id_2", None)
     if tok2 and cid2:
         recipients.append((tok2, cid2, "secondary"))
+    if not recipients:
+        return False, "no_recipients_configured"
 
+    any_success = False
+    failures: list[str] = []
     for bot_token, chat_id, label in recipients:
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -1227,12 +1238,30 @@ def _send_plain(text: str) -> None:
                 "text":                     text,
                 "disable_web_page_preview": True,
             }, timeout=10.0)
-            if not resp.is_success:
+            if resp.is_success:
+                any_success = True
+            else:
+                failures.append(f"{label}:HTTP{resp.status_code}")
                 log.warning("[strategist_runner] Telegram send failed "
                             "recipient=%s status=%s", label, resp.status_code)
         except Exception as exc:
+            failures.append(f"{label}:{type(exc).__name__}")
             log.warning("[strategist_runner] Telegram plain send error "
                         "recipient=%s: %s", label, exc)
+
+    if any_success:
+        return True, "ok" if not failures else f"partial:{'; '.join(failures)}"
+    return False, "; ".join(failures) or "unknown"
+
+
+def _send_plain(text: str) -> None:
+    """Fire-and-forget wrapper for legacy callers that don't check status.
+
+    Preserved for backward compat with weekly digest, hourly briefing,
+    VP trap alerts, etc. — these don't gate DB state on delivery.
+    For the notification gateway use `deliver_plain` which returns status.
+    """
+    deliver_plain(text)
 
 
 # ── MT5 enqueue side-effect ──────────────────────────────────────────────────

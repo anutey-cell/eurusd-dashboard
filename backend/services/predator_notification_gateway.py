@@ -66,10 +66,17 @@ def _persist_event(
         log.debug("[predator/gateway] event persist failed: %s", exc)
 
 
-def _send_via_telegram(text: str) -> None:
-    """Late import to avoid circular dependency; also lets tests stub."""
-    from services.strategist_runner import _send_plain
-    _send_plain(text)
+def _send_via_telegram(text: str) -> tuple[bool, str]:
+    """
+    Late import to avoid circular dependency; also lets tests stub.
+    Returns (delivery_succeeded, diagnostic). Delivery is considered
+    successful iff at least one Telegram recipient returned HTTP 2xx.
+    A failed delivery here MUST NOT advance the real notification_state
+    — the retry window stays open on the next observation of the same
+    setup.
+    """
+    from services.strategist_runner import deliver_plain
+    return deliver_plain(text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,21 +295,35 @@ def route_signal(
 
     mhash = _hash_message(message)
     try:
-        _send_via_telegram(message)
+        delivered, delivery_note = _send_via_telegram(message)
     except Exception as exc:
         log.warning("[predator/gateway] telegram send failed: %s", exc)
-        registry.record_suppression(db, setup, reason="send_error",
+        delivered, delivery_note = False, f"exception:{type(exc).__name__}"
+
+    if not delivered:
+        # Delivery-verification failure — notification_state is NOT advanced.
+        # The setup remains eligible for retry on the next observation.
+        log.warning("[predator/gateway] delivery_failed setup=%s note=%s",
+                    setup_id, delivery_note)
+        registry.record_suppression(db, setup, reason="delivery_failed",
                                      msg_type="ACTIONABLE",
                                      now_utc=now_utc)
         _persist_event(db, setup_id=setup_id, mode=mode,
-                       decision="SUPPRESSED", reason="send_error",
+                       decision="SUPPRESSED", reason="delivery_failed",
                        msg_type="ACTIONABLE",
                        internal_state=setup.internal_state,
                        notification_state=setup.notification_state,
                        message_hash=mhash)
         db.flush()
+        # Surface the delivery failure on the return payload so callers can
+        # act on it. sent stays False; eligible stays True (the SIGNAL was
+        # actionable — only the delivery failed).
+        result["sent"] = False
+        result["reason"] = "delivery_failed"
+        result["delivery_note"] = delivery_note
         return result
 
+    # Positive delivery confirmed — advance the real notification_state.
     registry.mark_notification(db, setup, new_state="ACTIONABLE_SENT",
                                 msg_type="ACTIONABLE",
                                 message_hash=mhash,
@@ -474,15 +495,55 @@ def notification_metrics(db: Session, *, hours: int = 24) -> dict:
     if denom_supp > 0:
         suppression_rate = (actionable_suppressed + would_suppress) / denom_supp
 
-    # actionable_signals_suppressed = SENT that WOULD have gone but were
-    # blocked by legitimate gate (rr_below_min, stale_data, overextended,
-    # duplicate_setup, send_error). "never_actionable_invalidation" and
-    # "no_setup" are not "suppressed actionable signals" — they are
-    # by-design silence.
-    actionable_gate_failures = sum(
+    # ── Metric semantics (locked-in definitions) ────────────────────────────
+    # A FIRE candidate rejected by the actionability gate is NOT yet an
+    # actionable signal — it never passed the mandatory fields test. Its
+    # rejection is by design, not incidental suppression. Report it under a
+    # distinct name with a full breakdown.
+    _GATE_FAILURE_REASONS = {
+        "not_actionable",  # signal.state != "FIRE"
+        "no_entry", "no_stop", "no_target",
+        "rr_below_min",
+        "stale_data",
+        "overextended",
+    }
+    gate_failure_breakdown = {
+        r: n for r, n in reasons.items() if r in _GATE_FAILURE_REASONS
+    }
+    fire_candidates_rejected_by_gate = sum(gate_failure_breakdown.values())
+
+    # actionable_signals_suppressed is RESERVED for a signal that PASSED
+    # the actionability gate but was subsequently not delivered because of
+    # notification-layer behaviour (upstream send failure, build error,
+    # future retryable delivery-verification failure). It EXCLUDES
+    # duplicate_setup — deliberate dedup of an already-delivered identical
+    # signal is by design, not incidental suppression. Long-term expected
+    # value ≈ 0; any non-zero value means the notification layer failed
+    # to deliver something it had qualified as trader-facing.
+    _ACTIONABLE_LAYER_SUPPRESSION_REASONS = {
+        "send_error",           # exception during Telegram POST
+        "builder_error",        # exception constructing the message
+        "delivery_failed",      # positive delivery-verification failure
+    }
+    actionable_signals_suppressed = sum(
         n for r, n in reasons.items()
-        if r in {"rr_below_min", "stale_data", "overextended", "send_error"}
+        if r in _ACTIONABLE_LAYER_SUPPRESSION_REASONS
     )
+    actionable_suppression_breakdown = {
+        r: n for r, n in reasons.items()
+        if r in _ACTIONABLE_LAYER_SUPPRESSION_REASONS
+    }
+
+    # Silent-by-design rejections (never-actionable invalidations, no_setup)
+    # and dedup — separated so they don't inflate the noise/failure metrics.
+    _SILENT_BY_DESIGN = {
+        "duplicate_setup",
+        "never_actionable_invalidation",
+        "no_setup",
+    }
+    silent_by_design_breakdown = {
+        r: n for r, n in reasons.items() if r in _SILENT_BY_DESIGN
+    }
 
     ratio_events_to_sent = ((len(events) / actionable_sent)
                              if actionable_sent > 0 else None)
@@ -500,7 +561,15 @@ def notification_metrics(db: Session, *, hours: int = 24) -> dict:
         "candidate_to_actionable_ratio": (
             round(len(events) / max(actionable_sent + would_send, 1), 2)
         ),
-        "actionable_signals_suppressed": actionable_gate_failures,
+        # NEW: gate rejections (not yet actionable — by-design)
+        "fire_candidates_rejected_by_actionability_gate": fire_candidates_rejected_by_gate,
+        "gate_failure_breakdown": gate_failure_breakdown,
+        # RESERVED: signals that passed gate but layer failed to deliver
+        "actionable_signals_suppressed": actionable_signals_suppressed,
+        "actionable_suppression_breakdown": actionable_suppression_breakdown,
+        # Silent-by-design rejections, separated to keep failure metrics clean
+        "silent_by_design_breakdown": silent_by_design_breakdown,
+        # Legacy fields kept for continuity + full raw view
         "suppression_reason_breakdown": reasons,
         "msg_type_breakdown": msg_types,
         "decision_breakdown": counts,
