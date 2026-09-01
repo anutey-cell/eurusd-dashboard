@@ -1040,6 +1040,23 @@ def _run_predator_iteration():
                             _PREDATOR_FIRE_TELEGRAM_LAST[batch.opportunity_id] = now
                         elif sig.state == "ARMED":
                             _PREDATOR_ARMED_TELEGRAM_LAST[armed_key] = now
+                        # Legacy-send instrumentation: mirror the fact of the
+                        # legacy send into the gateway events table so the
+                        # /diagnostics endpoint can produce a side-by-side
+                        # legacy-vs-gateway comparison during shadow validation.
+                        try:
+                            from services.predator_notification_gateway import (
+                                record_legacy_send
+                            )
+                            record_legacy_send(
+                                db,
+                                setup_id=(_gw_result.get("setup_id") if _gw_result else "unknown"),
+                                msg_type=("ACTIONABLE_FIRE" if sig.state == "FIRE"
+                                          else "ACTIONABLE_ARMED"),
+                                internal_state=sig.state,
+                            )
+                        except Exception:
+                            pass
                     except Exception as exc:
                         log.warning("[predator] telegram send failed: %s", exc)
 
@@ -1134,6 +1151,19 @@ def _run_predator_iteration():
                                                     == "SHADOW_ONLY" else None),
                             )
                             _send_plain(summary)
+                            try:
+                                from services.predator_notification_gateway import (
+                                    record_legacy_send
+                                )
+                                record_legacy_send(
+                                    db,
+                                    setup_id=(_gw_result.get("setup_id")
+                                              if _gw_result else "unknown"),
+                                    msg_type="EXECUTION_SUMMARY",
+                                    internal_state="FIRE",
+                                )
+                            except Exception:
+                                pass
                         except Exception as exc:
                             log.warning("[predator] execution-summary send failed: %s", exc)
                     elif tele_on and _opened == 0:
@@ -1202,6 +1232,17 @@ def _run_predator_iteration():
                     _send_plain(format_telegram_invalidated(
                         info["archetype"], info["direction"], reason,
                     ))
+                    try:
+                        from services.predator_notification_gateway import (
+                            record_legacy_send
+                        )
+                        record_legacy_send(
+                            db, setup_id=_stale_setup_id,
+                            msg_type="INVALIDATION",
+                            internal_state="INVALIDATED",
+                        )
+                    except Exception:
+                        pass
                 except Exception as exc:
                     log.warning("[predator] invalidated-send failed: %s", exc)
 

@@ -1203,18 +1203,36 @@ def _format_momentum_message(result, verdict: dict) -> str:
 
 def deliver_plain(text: str) -> tuple[bool, str]:
     """
-    Attempt to deliver a plain-text Telegram message. Returns
-    (any_recipient_succeeded, diagnostic).
+    Attempt to deliver a plain-text Telegram message.
 
-    Delivery is considered successful if at least one recipient returned
-    HTTP 2xx. If every recipient fails (HTTP non-2xx, timeout, network
-    exception), returns (False, joined_failure_reasons). Callers that
-    need to persist "message actually delivered" state (the predator
-    notification gateway) MUST use this variant so a failed HTTP POST
-    does not falsely advance notification_state to ACTIONABLE_SENT.
+    DELIVERY POLICY: ANY_RECIPIENT_SUCCESS.
 
-    Callers that fire-and-forget (weekly digest, briefing, VP trap etc.)
-    keep using `_send_plain` which discards the status.
+    Returns (True, ...) iff at least one Telegram recipient returned
+    HTTP 2xx. Returns (False, joined_failure_reasons) iff every
+    configured recipient failed.
+
+    Current PREDATOR deployment recipient inventory:
+      REQUIRED : primary bot+chat  (settings.telegram_bot_token / chat_id)
+                 — the trader's own destination
+      BACKUP   : secondary bot+chat (settings.telegram_bot_token_2 /
+                 chat_id_2) — mirror to a designated backup viewer,
+                 configured for continuity but not part of the trader's
+                 critical path
+
+    Under ANY_RECIPIENT_SUCCESS, a delivery to backup alone would return
+    True even if the primary recipient failed. This is acceptable ONLY
+    while there is exactly one REQUIRED recipient — the backup is not
+    a required destination, so its delivery is best-effort.
+
+    If the deployment ever requires "trader must positively receive
+    each actionable alert" (i.e., primary must succeed), switch to a
+    PRIMARY_RECIPIENT_SUCCESS variant that ignores backup status when
+    computing the truth value. That is a policy change, not a code
+    change — the recipient loop is already labelled.
+
+    Callers that persist delivery-gated state (the predator notification
+    gateway) MUST use this variant. Fire-and-forget callers (weekly
+    digest, briefing, VP trap etc.) can keep using `_send_plain`.
     """
     import httpx
     recipients: list[tuple[str, str, str]] = []

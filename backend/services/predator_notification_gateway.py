@@ -66,6 +66,31 @@ def _persist_event(
         log.debug("[predator/gateway] event persist failed: %s", exc)
 
 
+def record_legacy_send(
+    db: Session, *,
+    setup_id: str,
+    msg_type: str,
+    internal_state: Optional[str] = None,
+) -> None:
+    """
+    Instrumentation-only helper. Records that the LEGACY PREDATOR send
+    path (background_scheduler) actually invoked Telegram for a signal.
+    Used during shadow-mode validation so the diagnostics endpoint can
+    produce a legacy-vs-gateway side-by-side. Does not send anything;
+    does not advance any notification_state. Fail-open on error.
+    """
+    try:
+        db.add(PredatorNotificationEvent(
+            setup_id=setup_id, architecture_mode="legacy",
+            decision="LEGACY_ACTUAL_SEND", reason=None,
+            msg_type=msg_type,
+            internal_state=internal_state,
+            notification_state=None, message_hash=None,
+        ))
+    except Exception as exc:
+        log.debug("[predator/gateway] legacy-send instrumentation failed: %s", exc)
+
+
 def _send_via_telegram(text: str) -> tuple[bool, str]:
     """
     Late import to avoid circular dependency; also lets tests stub.
@@ -548,32 +573,99 @@ def notification_metrics(db: Session, *, hours: int = 24) -> dict:
     ratio_events_to_sent = ((len(events) / actionable_sent)
                              if actionable_sent > 0 else None)
 
+    # ── User-requested named metric surface ─────────────────────────────────
+    # Counts derived from event.internal_state (as populated by route_signal).
+    approaching_or_armed_observations = sum(
+        1 for e in events
+        if (e.internal_state or "") in ("APPROACHING", "ARMED")
+    )
+    fire_candidates = sum(
+        1 for e in events if (e.internal_state or "") == "FIRE"
+    )
+    # actionability_passes = a FIRE candidate that passed the gate. In
+    # gateway mode this becomes SENT (or delivery_failed); in shadow mode
+    # this becomes WOULD_SEND.
+    actionability_passes = actionable_sent + would_send
+    # delivery_failures = a signal that passed the gate but the notification
+    # layer could not confirm delivery. Kept separate from gate rejections.
+    delivery_failures = reasons.get("delivery_failed", 0)
+    # legacy path instrumentation — counts LEGACY_ACTUAL_SEND events written
+    # by background_scheduler when the pre-refactor send-paths actually fire
+    legacy_messages_actually_sent = counts.get("LEGACY_ACTUAL_SEND", 0)
+    legacy_actual_send_by_type = {
+        m: n for m, n in msg_types.items()
+    }
+    # projected_gateway_messages = what gateway would deliver during shadow,
+    # or actually delivered during gateway mode.
+    projected_gateway_messages = would_send + actionable_sent
+
+    definitions = {
+        "observation":
+            "One call to route_signal / route_invalidation — an "
+            "interpreted event about a persistent market hypothesis. "
+            "Multiple observations per M5 bar are common; they collapse "
+            "into a single setup identity.",
+        "candidate":
+            "Any observation whose internal_state is DETECTED, "
+            "CANDIDATE, APPROACHING, ARMED, or CONFIRMING. Not yet a "
+            "FIRE. Never trader-facing under ACTIONABLE_ONLY.",
+        "unique setup":
+            "One row in predator_setups. Deterministic identity = "
+            "strategy·instrument·direction·archetype·ref_level·bucket·"
+            "session·trading_date. bar_time is NOT part of identity.",
+        "FIRE candidate":
+            "An observation whose internal_state is FIRE — the "
+            "detector believes trading conditions are met, but the "
+            "actionability gate has not yet run.",
+        "actionable signal":
+            "A FIRE candidate that passed the full actionability gate "
+            "(mandatory fields present, RR >= min, bar fresh, not "
+            "overextended, not a duplicate). Eligible for Telegram.",
+        "Telegram notification":
+            "A message the notification gateway has confirmed was "
+            "delivered to at least one Telegram recipient (HTTP 2xx). "
+            "Only a successful delivery advances notification_state "
+            "past NOT_SENT.",
+    }
+
     return {
         "window_hours": hours,
-        "internal_candidates_detected": len(events),
-        "setup_ids_created": setup_ids_created,
+        # ── User-requested named metric surface (validation report) ────────
+        "internal_observations": len(events),
+        "unique_setup_ids": setup_ids_created,
+        "approaching_or_armed_observations": approaching_or_armed_observations,
+        "fire_candidates": fire_candidates,
+        "fire_candidates_rejected_by_actionability_gate": fire_candidates_rejected_by_gate,
+        "gate_failure_breakdown": gate_failure_breakdown,
+        "actionability_passes": actionability_passes,
+        "would_send": would_send,
+        "would_suppress": would_suppress,
+        "legacy_messages_actually_sent": legacy_messages_actually_sent,
+        "legacy_actual_send_by_msg_type": legacy_actual_send_by_type,
+        "projected_gateway_messages": projected_gateway_messages,
+        "actionable_signals_suppressed": actionable_signals_suppressed,
+        "actionable_suppression_breakdown": actionable_suppression_breakdown,
+        "delivery_failures": delivery_failures,
+        "silent_by_design_breakdown": silent_by_design_breakdown,
+        # ── Aggregate / derived ────────────────────────────────────────────
         "total_observations": total_observations,
         "average_observations_per_setup": round(average_obs, 2),
-        "telegram_messages_sent": actionable_sent,
-        "telegram_messages_would_send_shadow": would_send,
-        "telegram_messages_suppressed": actionable_suppressed + would_suppress,
-        "telegram_suppression_rate": round(suppression_rate, 4),
         "candidate_to_actionable_ratio": (
             round(len(events) / max(actionable_sent + would_send, 1), 2)
         ),
-        # NEW: gate rejections (not yet actionable — by-design)
-        "fire_candidates_rejected_by_actionability_gate": fire_candidates_rejected_by_gate,
-        "gate_failure_breakdown": gate_failure_breakdown,
-        # RESERVED: signals that passed gate but layer failed to deliver
-        "actionable_signals_suppressed": actionable_signals_suppressed,
-        "actionable_suppression_breakdown": actionable_suppression_breakdown,
-        # Silent-by-design rejections, separated to keep failure metrics clean
-        "silent_by_design_breakdown": silent_by_design_breakdown,
-        # Legacy fields kept for continuity + full raw view
-        "suppression_reason_breakdown": reasons,
-        "msg_type_breakdown": msg_types,
-        "decision_breakdown": counts,
+        "telegram_suppression_rate": round(suppression_rate, 4),
         "alerts_per_actionable_signal": (
             round(ratio_events_to_sent, 2) if ratio_events_to_sent else None
         ),
+        # ── Raw distributions ──────────────────────────────────────────────
+        "suppression_reason_breakdown": reasons,
+        "msg_type_breakdown": msg_types,
+        "decision_breakdown": counts,
+        "definitions": definitions,
+        # ── Backward-compat aliases (do not remove) ────────────────────────
+        "internal_candidates_detected": len(events),
+        "setup_ids_created": setup_ids_created,
+        "telegram_messages_sent": actionable_sent,
+        "telegram_messages_would_send_shadow": would_send,
+        "telegram_messages_suppressed": actionable_suppressed + would_suppress,
     }
