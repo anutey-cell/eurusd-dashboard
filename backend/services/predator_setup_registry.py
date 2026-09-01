@@ -202,7 +202,10 @@ def mark_notification(
     opportunity_id: Optional[str] = None,
     now_utc: Optional[datetime] = None,
 ) -> None:
-    """Record that a Telegram message was actually sent for this setup."""
+    """
+    Record that a REAL Telegram message was actually delivered for this setup.
+    Advances the real notification_state. Call ONLY after successful send.
+    """
     now_utc = now_utc or datetime.now(timezone.utc)
     setup.notification_state = new_state
     setup.notifications_sent = _append_json_list(
@@ -213,6 +216,38 @@ def mark_notification(
             "message_hash": message_hash,
             "opportunity_id": opportunity_id,
             "state_after": new_state,
+            "shadow": False,
+        },
+    )
+
+
+def mark_shadow_notification(
+    db: Session,
+    setup: PredatorSetup,
+    *,
+    new_state: str,
+    msg_type: str,
+    opportunity_id: Optional[str] = None,
+    now_utc: Optional[datetime] = None,
+) -> None:
+    """
+    Record that shadow mode WOULD have delivered a Telegram of this msg_type
+    for this setup — never touches the real notification_state. Used so
+    subsequent shadow observations on the same setup correctly report
+    duplicate_setup and the shadow projection reflects what gateway mode
+    would actually do, WITHOUT contaminating the real production state.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    setup.shadow_notification_state = new_state
+    setup.notifications_sent = _append_json_list(
+        setup.notifications_sent,
+        {
+            "msg_type": msg_type,
+            "sent_at": now_utc.isoformat(),
+            "message_hash": "SHADOW",
+            "opportunity_id": opportunity_id,
+            "state_after": new_state,
+            "shadow": True,
         },
     )
 

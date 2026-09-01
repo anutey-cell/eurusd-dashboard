@@ -78,6 +78,7 @@ def _send_via_telegram(text: str) -> None:
 
 def check_actionability(
     signal: Any, setup: PredatorSetup, *,
+    effective_notification_state: str = "NOT_SENT",
     min_rr: float = 1.2,
     max_bar_age_min: int = 15,
     now_utc: Optional[datetime] = None,
@@ -85,8 +86,14 @@ def check_actionability(
     """
     Returns (eligible, reason). If eligible is False, reason names the
     first failing check. Ordering is stable so diagnostics can trend.
+
+    The caller passes the STATE THIS MODE OWNS:
+      - gateway mode → setup.notification_state (real deliveries)
+      - shadow mode  → setup.shadow_notification_state (projected)
+    This keeps the gate mode-agnostic; the caller decides which column
+    represents "already sent" for the current mode.
     """
-    if setup.notification_state != "NOT_SENT":
+    if effective_notification_state != "NOT_SENT":
         return False, "duplicate_setup"
 
     if getattr(signal, "state", None) != "FIRE":
@@ -193,8 +200,16 @@ def route_signal(
     if opportunity_id:
         setup.linked_opportunity_id = opportunity_id
 
+    # Pick the state column this mode owns. Shadow observations must NEVER
+    # be treated as real deliveries — that is the whole point of shadow mode.
+    if mode == "shadow":
+        effective_state = setup.shadow_notification_state or "NOT_SENT"
+    else:
+        effective_state = setup.notification_state or "NOT_SENT"
+
     eligible, reason = check_actionability(
         signal, setup,
+        effective_notification_state=effective_state,
         min_rr=min_rr, max_bar_age_min=max_bar_age, now_utc=now_utc,
     )
 
@@ -215,12 +230,11 @@ def route_signal(
         db.flush()
         return result
 
-    # Shadow mode → gateway records decision but does not send. To make the
-    # shadow projection accurately mirror what gateway mode WOULD do, we also
-    # mark our own registry state — so the SECOND observation of a WOULD_SEND
-    # setup correctly reports duplicate_setup instead of leaking a second
-    # would-send count. Marking our own table is not "sending"; it is
-    # bookkeeping the gateway owns.
+    # Shadow mode → gateway records the projected decision but does not send.
+    # Advances shadow_notification_state so a second observation of the same
+    # setup correctly reports duplicate_setup. Real notification_state is
+    # NEVER touched — the trader has received nothing, so from production's
+    # point of view the setup remains NOT_SENT.
     if mode == "shadow":
         decision = "WOULD_SEND" if eligible else "WOULD_SUPPRESS"
         _persist_event(db, setup_id=setup_id, mode=mode, decision=decision,
@@ -230,11 +244,11 @@ def route_signal(
                        notification_state=setup.notification_state,
                        message_hash=None)
         if eligible:
-            registry.mark_notification(db, setup, new_state="ACTIONABLE_SENT",
-                                        msg_type="ACTIONABLE",
-                                        message_hash="SHADOW",
-                                        opportunity_id=opportunity_id,
-                                        now_utc=now_utc)
+            registry.mark_shadow_notification(
+                db, setup, new_state="ACTIONABLE_SENT",
+                msg_type="ACTIONABLE",
+                opportunity_id=opportunity_id, now_utc=now_utc,
+            )
         else:
             registry.record_suppression(db, setup, reason=reason,
                                          msg_type="ACTIONABLE",
@@ -338,7 +352,15 @@ def route_invalidation(
         return {"setup_id": setup_id, "sent": False, "reason": "no_setup"}
 
     setup.internal_state = "INVALIDATED"
-    if setup.notification_state not in _LIFECYCLE_ELIGIBLE_STATES:
+    # Pick the state column this mode owns. Shadow invalidations must be
+    # judged against shadow_notification_state so the projection is
+    # accurate; real invalidations against notification_state so we never
+    # accidentally send an invalidation for a setup no user ever heard of.
+    if mode == "shadow":
+        _effective_ns = setup.shadow_notification_state or "NOT_SENT"
+    else:
+        _effective_ns = setup.notification_state or "NOT_SENT"
+    if _effective_ns not in _LIFECYCLE_ELIGIBLE_STATES:
         registry.record_suppression(db, setup,
                                      reason="never_actionable_invalidation",
                                      msg_type="INVALIDATION", now_utc=now_utc)
@@ -348,7 +370,7 @@ def route_invalidation(
                         reason="never_actionable_invalidation",
                         msg_type="INVALIDATION",
                         internal_state=setup.internal_state,
-                        notification_state=setup.notification_state,
+                        notification_state=_effective_ns,
                         message_hash=None)
         db.flush()
         return {"setup_id": setup_id, "sent": False,
@@ -371,6 +393,11 @@ def route_invalidation(
                        internal_state=setup.internal_state,
                        notification_state=setup.notification_state,
                        message_hash=None)
+        # Advance shadow lifecycle state; real state untouched.
+        registry.mark_shadow_notification(
+            db, setup, new_state="INVALIDATED_SENT",
+            msg_type="INVALIDATION", now_utc=now_utc,
+        )
         db.flush()
         return {"setup_id": setup_id, "sent": False, "reason": "shadow"}
 

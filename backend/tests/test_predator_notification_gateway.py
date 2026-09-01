@@ -143,7 +143,7 @@ def test_4_candidate_invalidated_never_actionable(db):
 
 def test_5_restart_preserves_notification_state(db):
     """Simulate restart by re-instantiating a session against the same DB;
-    setup + notification_state must persist and prevent resend."""
+    setup + notification_state must persist and prevent resend (gateway mode)."""
     engine = db.bind
     from sqlalchemy.orm import sessionmaker
     SessionLocal = sessionmaker(bind=engine)
@@ -167,6 +167,97 @@ def test_5_restart_preserves_notification_state(db):
                                   settings=FakeSettings())
         mock.assert_not_called()
     assert r["reason"] == "duplicate_setup"
+
+
+def test_shadow_never_advances_real_notification_state(db):
+    """Shadow mode must NEVER touch the real notification_state column."""
+    sig = FakeSignal(state="FIRE")
+    with patch.object(gateway, "_send_via_telegram") as mock:
+        r = gateway.route_signal(db, sig, key_level=4430.0,
+                                  message_builder=_msg_builder,
+                                  settings=FakeSettings(mode="shadow"))
+        mock.assert_not_called()
+    assert r["would_send"] is True
+    setup = db.query(PredatorSetup).one()
+    assert setup.notification_state == "NOT_SENT"           # untouched
+    assert setup.shadow_notification_state == "ACTIONABLE_SENT"
+
+
+def test_shadow_duplicate_uses_shadow_state_not_real_state(db):
+    """Second FIRE in shadow reports duplicate_setup off shadow state."""
+    sig = FakeSignal(state="FIRE")
+    with patch.object(gateway, "_send_via_telegram"):
+        r1 = gateway.route_signal(db, sig, key_level=4430.0,
+                                    message_builder=_msg_builder,
+                                    settings=FakeSettings(mode="shadow"))
+        r2 = gateway.route_signal(db, sig, key_level=4432.0,
+                                    message_builder=_msg_builder,
+                                    settings=FakeSettings(mode="shadow"))
+    assert r1["would_send"] is True
+    assert r2["would_send"] is False
+    assert r2["reason"] == "duplicate_setup"
+    setup = db.query(PredatorSetup).one()
+    assert setup.notification_state == "NOT_SENT"           # still untouched
+
+
+def test_cutover_shadow_only_setup_is_treated_as_unsent_by_gateway(db):
+    """
+    ACCEPTANCE — the user-specified cutover regression.
+    Setup A observed as FIRE while mode=SHADOW → WOULD_SEND recorded.
+    Same setup observed again in SHADOW → WOULD_SUPPRESS duplicate_setup.
+    Mode flips to GATEWAY.
+    Same setup observed again → gateway SENDS (real notification_state was
+    never touched by shadow, so the first real actionable qualification
+    post-cutover is genuinely new to the user).
+    """
+    sig = FakeSignal(state="FIRE", entry=4430.0)
+
+    # 1. FIRE while mode=SHADOW
+    with patch.object(gateway, "_send_via_telegram") as mock:
+        r1 = gateway.route_signal(db, sig, key_level=4430.0,
+                                    message_builder=_msg_builder,
+                                    settings=FakeSettings(mode="shadow"))
+        mock.assert_not_called()
+    assert r1["would_send"] is True
+    assert r1["sent"] is False
+
+    setup = db.query(PredatorSetup).one()
+    assert setup.notification_state == "NOT_SENT"
+    assert setup.shadow_notification_state == "ACTIONABLE_SENT"
+
+    # 2. Same FIRE again in shadow → duplicate
+    with patch.object(gateway, "_send_via_telegram") as mock:
+        r2 = gateway.route_signal(db, sig, key_level=4431.0,
+                                    message_builder=_msg_builder,
+                                    settings=FakeSettings(mode="shadow"))
+        mock.assert_not_called()
+    assert r2["would_send"] is False
+    assert r2["reason"] == "duplicate_setup"
+
+    # 3. FLIP mode to gateway. Real state still NOT_SENT.
+    setup = db.query(PredatorSetup).one()
+    assert setup.notification_state == "NOT_SENT", \
+        "shadow observations must NOT have advanced real state"
+
+    # 4. Same FIRE now qualifies under real gateway — must SEND
+    with patch.object(gateway, "_send_via_telegram") as mock:
+        r3 = gateway.route_signal(db, sig, key_level=4430.5,
+                                    message_builder=_msg_builder,
+                                    settings=FakeSettings(mode="gateway"))
+        mock.assert_called_once()
+    assert r3["sent"] is True
+
+    # 5. Real state advances now — first time
+    setup = db.query(PredatorSetup).one()
+    assert setup.notification_state == "ACTIONABLE_SENT"
+
+    # 6. Same setup again in gateway → real duplicate now
+    with patch.object(gateway, "_send_via_telegram") as mock:
+        r4 = gateway.route_signal(db, sig, key_level=4431.0,
+                                    message_builder=_msg_builder,
+                                    settings=FakeSettings(mode="gateway"))
+        mock.assert_not_called()
+    assert r4["reason"] == "duplicate_setup"
 
 
 def test_6_minor_confidence_shift_no_send(db):

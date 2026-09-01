@@ -1505,10 +1505,19 @@ class PredatorSetup(Base):
     internal_state         = Column(String(24), nullable=False, default="DETECTED")
     # DETECTED | CANDIDATE | APPROACHING | ARMED | CONFIRMING | FIRE | REJECTED | INVALIDATED | EXPIRED
 
-    # Notification lifecycle — governs Telegram sends
+    # Notification lifecycle — governs REAL Telegram sends. Advances only on
+    # a successful real delivery in legacy or gateway mode. Shadow mode does
+    # NOT touch this column.
     notification_state     = Column(String(32), nullable=False, default="NOT_SENT", index=True)
     # NOT_SENT | ACTIONABLE_SENT | ENTRY_SENT | TP1_SENT | TP2_SENT | TP3_SENT |
     # BREAKEVEN_SENT | TRAILING_SENT | STOPPED_SENT | INVALIDATED_SENT | CLOSED
+
+    # Shadow-mode projected state — records what the gateway WOULD have sent
+    # in shadow observation. Kept strictly separate from the real
+    # notification_state so a shadow-only observation cannot be misinterpreted
+    # as a delivered message at production cutover.
+    shadow_notification_state = Column(String(32), nullable=False,
+                                        default="NOT_SENT", index=True)
 
     # Observation counters
     observation_count      = Column(Integer, nullable=False, default=1)
