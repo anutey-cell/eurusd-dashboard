@@ -457,3 +457,128 @@ def test_metrics_endpoint_counts_correctly(db):
     assert m["telegram_messages_sent"] == 1
     assert m["telegram_messages_suppressed"] >= 5
     assert m["setup_ids_created"] == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Delivery policy — PRIMARY_RECIPIENT_SUCCESS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _MockResp:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        self.is_success = 200 <= status_code < 300
+
+
+def _stub_settings(tok1="TOK1", cid1="CID1", tok2="TOK2", cid2="CID2"):
+    from services import strategist_runner
+    s = strategist_runner.settings
+    s.telegram_bot_token = tok1
+    s.telegram_chat_id = cid1
+    s.telegram_bot_token_2 = tok2
+    s.telegram_chat_id_2 = cid2
+    return s
+
+
+def test_deliver_plain_primary_fail_secondary_success_returns_false():
+    """
+    Primary fails + secondary succeeds under PRIMARY_RECIPIENT_SUCCESS:
+      delivered = False, retry-eligible.
+    Secondary success must NOT substitute for a failed primary.
+    """
+    from services import strategist_runner
+    _stub_settings()
+
+    def _side_effect(url, **kwargs):
+        return _MockResp(500) if "TOK1" in url else _MockResp(200)
+
+    with patch("httpx.post", side_effect=_side_effect):
+        delivered, diag = strategist_runner.deliver_plain("hello")
+    assert delivered is False
+    assert "primary_failed" in diag
+    assert "secondary_ok_but_ignored" in diag
+
+
+def test_deliver_plain_primary_success_secondary_fail_returns_true():
+    """
+    Primary succeeds + secondary fails under PRIMARY_RECIPIENT_SUCCESS:
+      delivered = True (secondary is best-effort).
+      Secondary failure is surfaced in the diagnostic but does not
+      block advancing notification_state.
+    """
+    from services import strategist_runner
+    _stub_settings()
+
+    def _side_effect(url, **kwargs):
+        return _MockResp(200) if "TOK1" in url else _MockResp(500)
+
+    with patch("httpx.post", side_effect=_side_effect):
+        delivered, diag = strategist_runner.deliver_plain("hello")
+    assert delivered is True
+    assert "primary_ok" in diag
+    assert "secondary_failed" in diag
+
+
+def test_deliver_plain_both_ok_returns_true():
+    from services import strategist_runner
+    _stub_settings()
+    with patch("httpx.post", return_value=_MockResp(200)):
+        delivered, diag = strategist_runner.deliver_plain("hello")
+    assert delivered is True
+    assert diag == "ok"
+
+
+def test_deliver_plain_both_fail_returns_false():
+    from services import strategist_runner
+    _stub_settings()
+    with patch("httpx.post", return_value=_MockResp(500)):
+        delivered, diag = strategist_runner.deliver_plain("hello")
+    assert delivered is False
+    assert "primary_failed" in diag
+    assert "secondary_failed" in diag
+
+
+def test_deliver_plain_no_recipients_returns_false():
+    from services import strategist_runner
+    _stub_settings(tok1="", cid1="", tok2="", cid2="")
+    delivered, diag = strategist_runner.deliver_plain("hello")
+    assert delivered is False
+    assert diag == "no_recipients_configured"
+
+
+def test_gateway_state_untouched_when_primary_fails_but_secondary_ok(db):
+    """
+    Full integration: when deliver_plain reports (False, ...) because primary
+    failed even though secondary succeeded, the gateway leaves real
+    notification_state = NOT_SENT so the setup remains retry-eligible.
+    """
+    sig = FakeSignal(state="FIRE")
+    with patch.object(gateway, "_send_via_telegram",
+                       return_value=(False, "primary_failed:HTTP500;secondary_ok_but_ignored")):
+        r = gateway.route_signal(db, sig, key_level=4430.0,
+                                  message_builder=_msg_builder,
+                                  settings=FakeSettings(mode="gateway"))
+    assert r["sent"] is False
+    assert r["reason"] == "delivery_failed"
+    row = db.query(PredatorSetup).one()
+    assert row.notification_state == "NOT_SENT"
+
+
+def test_legacy_metric_labelled_as_send_attempt_not_delivery(db):
+    """
+    Legacy instrumentation must be labelled as SEND ATTEMPT, not confirmed
+    delivery, since the legacy _send_plain path cannot report HTTP status
+    at its call site.
+    """
+    from services.predator_notification_gateway import record_legacy_send
+    record_legacy_send(db, setup_id="TEST_SETUP", msg_type="ACTIONABLE_FIRE",
+                        internal_state="FIRE")
+    db.commit()
+    m = gateway.notification_metrics(db, hours=24)
+    assert m["legacy_send_attempts"] == 1
+    # Old misleading field name must be gone.
+    assert "legacy_messages_actually_sent" not in m
+    # Decision label in the underlying event
+    row = db.query(PredatorNotificationEvent).filter_by(
+        setup_id="TEST_SETUP"
+    ).one()
+    assert row.decision == "LEGACY_SEND_ATTEMPT"

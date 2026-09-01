@@ -74,15 +74,24 @@ def record_legacy_send(
 ) -> None:
     """
     Instrumentation-only helper. Records that the LEGACY PREDATOR send
-    path (background_scheduler) actually invoked Telegram for a signal.
-    Used during shadow-mode validation so the diagnostics endpoint can
-    produce a legacy-vs-gateway side-by-side. Does not send anything;
-    does not advance any notification_state. Fail-open on error.
+    path (background_scheduler) INVOKED Telegram for a signal.
+
+    IMPORTANT: this records a SEND ATTEMPT, not a confirmed successful
+    delivery. The legacy code path calls `_send_plain(...)` which
+    swallows HTTP failures internally and returns None; there is no way
+    to distinguish "the Telegram was accepted by the API" from "the API
+    returned 5xx or timed out" at the legacy call site without a
+    disproportionate refactor. The event decision is therefore labelled
+    `LEGACY_SEND_ATTEMPT`. If you need confirmed legacy deliveries,
+    route the legacy path through `deliver_plain` instead.
+
+    Does not send anything; does not advance any notification_state.
+    Fail-open on error.
     """
     try:
         db.add(PredatorNotificationEvent(
             setup_id=setup_id, architecture_mode="legacy",
-            decision="LEGACY_ACTUAL_SEND", reason=None,
+            decision="LEGACY_SEND_ATTEMPT", reason=None,
             msg_type=msg_type,
             internal_state=internal_state,
             notification_state=None, message_hash=None,
@@ -589,10 +598,13 @@ def notification_metrics(db: Session, *, hours: int = 24) -> dict:
     # delivery_failures = a signal that passed the gate but the notification
     # layer could not confirm delivery. Kept separate from gate rejections.
     delivery_failures = reasons.get("delivery_failed", 0)
-    # legacy path instrumentation — counts LEGACY_ACTUAL_SEND events written
-    # by background_scheduler when the pre-refactor send-paths actually fire
-    legacy_messages_actually_sent = counts.get("LEGACY_ACTUAL_SEND", 0)
-    legacy_actual_send_by_type = {
+    # legacy path instrumentation — counts LEGACY_SEND_ATTEMPT events written
+    # by background_scheduler when the pre-refactor send-paths fire. These
+    # count INVOCATIONS of the legacy send call, not confirmed HTTP 2xx —
+    # the legacy _send_plain path swallows failures internally. Naming
+    # reflects that ambiguity so downstream reports don't misclaim.
+    legacy_send_attempts = counts.get("LEGACY_SEND_ATTEMPT", 0)
+    legacy_send_attempts_by_type = {
         m: n for m, n in msg_types.items()
     }
     # projected_gateway_messages = what gateway would deliver during shadow,
@@ -600,6 +612,12 @@ def notification_metrics(db: Session, *, hours: int = 24) -> dict:
     projected_gateway_messages = would_send + actionable_sent
 
     definitions = {
+        "legacy_send_attempts":
+            "Count of times the legacy PREDATOR code path called "
+            "_send_plain(...). This is an ATTEMPT count, not a "
+            "confirmed-delivery count — the legacy sender swallows HTTP "
+            "failures internally and cannot report success/failure at "
+            "the call site.",
         "observation":
             "One call to route_signal / route_invalidation — an "
             "interpreted event about a persistent market hypothesis. "
@@ -640,8 +658,8 @@ def notification_metrics(db: Session, *, hours: int = 24) -> dict:
         "actionability_passes": actionability_passes,
         "would_send": would_send,
         "would_suppress": would_suppress,
-        "legacy_messages_actually_sent": legacy_messages_actually_sent,
-        "legacy_actual_send_by_msg_type": legacy_actual_send_by_type,
+        "legacy_send_attempts": legacy_send_attempts,
+        "legacy_send_attempts_by_msg_type": legacy_send_attempts_by_type,
         "projected_gateway_messages": projected_gateway_messages,
         "actionable_signals_suppressed": actionable_signals_suppressed,
         "actionable_suppression_breakdown": actionable_suppression_breakdown,

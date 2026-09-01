@@ -1205,30 +1205,31 @@ def deliver_plain(text: str) -> tuple[bool, str]:
     """
     Attempt to deliver a plain-text Telegram message.
 
-    DELIVERY POLICY: ANY_RECIPIENT_SUCCESS.
+    DELIVERY POLICY: PRIMARY_RECIPIENT_SUCCESS.
 
-    Returns (True, ...) iff at least one Telegram recipient returned
-    HTTP 2xx. Returns (False, joined_failure_reasons) iff every
-    configured recipient failed.
+    Only the PRIMARY recipient's HTTP 2xx counts toward the truth value.
+    The SECONDARY recipient (Lynn's backup channel) is best-effort mirror
+    delivery: its failure is logged but never substitutes for a successful
+    primary delivery, and its success never masks a primary failure.
+
+    Truth table:
+      primary OK   + secondary OK      → (True, "ok")
+      primary OK   + secondary FAIL    → (True, "primary_ok;secondary_failed:...")
+                                          + WARNING logged for secondary
+      primary FAIL + secondary OK      → (False, "primary_failed:...")
+                                          — retry-eligible; secondary success DOES NOT
+                                          advance real notification_state
+      primary FAIL + secondary FAIL    → (False, "primary_failed:...;secondary_failed:...")
+      no primary configured            → (False, "no_primary_configured")
+      no recipients configured         → (False, "no_recipients_configured")
 
     Current PREDATOR deployment recipient inventory:
       REQUIRED : primary bot+chat  (settings.telegram_bot_token / chat_id)
-                 — the trader's own destination
+                 — the trader's own destination; delivery MUST succeed here
+                 for the actionable alert to be considered delivered.
       BACKUP   : secondary bot+chat (settings.telegram_bot_token_2 /
-                 chat_id_2) — mirror to a designated backup viewer,
-                 configured for continuity but not part of the trader's
-                 critical path
-
-    Under ANY_RECIPIENT_SUCCESS, a delivery to backup alone would return
-    True even if the primary recipient failed. This is acceptable ONLY
-    while there is exactly one REQUIRED recipient — the backup is not
-    a required destination, so its delivery is best-effort.
-
-    If the deployment ever requires "trader must positively receive
-    each actionable alert" (i.e., primary must succeed), switch to a
-    PRIMARY_RECIPIENT_SUCCESS variant that ignores backup status when
-    computing the truth value. That is a policy change, not a code
-    change — the recipient loop is already labelled.
+                 chat_id_2) — mirror to a designated backup viewer;
+                 best-effort only.
 
     Callers that persist delivery-gated state (the predator notification
     gateway) MUST use this variant. Fire-and-forget callers (weekly
@@ -1246,8 +1247,15 @@ def deliver_plain(text: str) -> tuple[bool, str]:
     if not recipients:
         return False, "no_recipients_configured"
 
-    any_success = False
-    failures: list[str] = []
+    primary_configured = any(lbl == "primary" for _, _, lbl in recipients)
+    if not primary_configured:
+        return False, "no_primary_configured"
+
+    primary_ok = False
+    primary_err: str | None = None
+    secondary_ok: bool | None = None
+    secondary_err: str | None = None
+
     for bot_token, chat_id, label in recipients:
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -1257,19 +1265,48 @@ def deliver_plain(text: str) -> tuple[bool, str]:
                 "disable_web_page_preview": True,
             }, timeout=10.0)
             if resp.is_success:
-                any_success = True
+                if label == "primary":
+                    primary_ok = True
+                else:
+                    secondary_ok = True
             else:
-                failures.append(f"{label}:HTTP{resp.status_code}")
-                log.warning("[strategist_runner] Telegram send failed "
-                            "recipient=%s status=%s", label, resp.status_code)
+                err = f"HTTP{resp.status_code}"
+                if label == "primary":
+                    primary_err = err
+                    log.warning("[strategist_runner] PRIMARY Telegram send "
+                                 "failed status=%s", resp.status_code)
+                else:
+                    secondary_err = err
+                    log.warning("[strategist_runner] secondary Telegram send "
+                                 "failed (best-effort) status=%s",
+                                 resp.status_code)
         except Exception as exc:
-            failures.append(f"{label}:{type(exc).__name__}")
-            log.warning("[strategist_runner] Telegram plain send error "
-                        "recipient=%s: %s", label, exc)
+            err = type(exc).__name__
+            if label == "primary":
+                primary_err = err
+                log.warning("[strategist_runner] PRIMARY Telegram send error: %s",
+                            exc)
+            else:
+                secondary_err = err
+                log.warning("[strategist_runner] secondary Telegram send "
+                            "error (best-effort): %s", exc)
 
-    if any_success:
-        return True, "ok" if not failures else f"partial:{'; '.join(failures)}"
-    return False, "; ".join(failures) or "unknown"
+    # Truth is defined by the PRIMARY only.
+    if primary_ok:
+        if secondary_err is not None:
+            return True, f"primary_ok;secondary_failed:{secondary_err}"
+        return True, "ok"
+
+    # primary failed — never allow secondary success to substitute
+    diag_parts = [f"primary_failed:{primary_err or 'unknown'}"]
+    if secondary_ok is True:
+        diag_parts.append("secondary_ok_but_ignored")
+        log.warning("[strategist_runner] PRIMARY delivery failed while "
+                     "secondary succeeded — actionable alert NOT considered "
+                     "delivered; setup remains retry-eligible")
+    elif secondary_err is not None:
+        diag_parts.append(f"secondary_failed:{secondary_err}")
+    return False, ";".join(diag_parts)
 
 
 def _send_plain(text: str) -> None:
