@@ -1545,6 +1545,75 @@ class PredatorSetup(Base):
     linked_batch_id        = Column(Integer,    nullable=True)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Track A — MT5 broker tick capture (research-only ingestion)
+# NOT true order flow. Broker-provided quote microstructure only.
+# See design brief 2026-09-03. No production strategy may consume this dataset.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class MT5Tick(Base):
+    """
+    One row per genuinely distinct broker tick event.
+
+    Multiple legitimate ticks CAN share a millisecond timestamp (a bid update
+    and an ask update within the same ms), so uniqueness is enforced on a
+    CONTENT HASH covering the observable fields rather than time alone. Two
+    ticks with the same time_msc AND identical bid/ask/last/volume_real/flags
+    are treated as a duplicate; any field difference makes them distinct.
+
+    Fields preserved verbatim from MetaTrader5. No derived metrics stored here.
+    """
+    __tablename__ = "mt5_ticks"
+    __table_args__ = (
+        UniqueConstraint("symbol", "content_hash", name="ux_mt5_ticks_symbol_hash"),
+    )
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    ingest_at      = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+
+    # Authoritative MT5-supplied millisecond timestamp
+    tick_time_msc  = Column(Integer, nullable=False, index=True)  # BIGINT ok in SQLite Integer
+    tick_time_utc  = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    symbol         = Column(String(16), nullable=False, index=True)
+
+    # Raw broker fields — never transformed
+    bid            = Column(Float, nullable=False)
+    ask            = Column(Float, nullable=False)
+    last           = Column(Float, nullable=True)   # NULL when broker did not populate
+    volume_real    = Column(Float, nullable=True)   # NULL when broker did not populate
+    flags          = Column(Integer, nullable=False)  # raw MT5 bitfield
+
+    # Deterministic identity across restarts / retries
+    content_hash   = Column(String(24), nullable=False)  # 12-byte truncated sha1 hex
+
+    # Provenance
+    broker         = Column(String(24), nullable=False, default="exness")
+    account        = Column(String(24), nullable=False, default="unknown")
+    daemon_id      = Column(String(32), nullable=True)
+
+
+class MT5TickGap(Base):
+    """
+    Records any interval where the daemon could not retrieve a complete tick
+    range from MT5 (broker outage, laptop sleep, MT5 restart, unrecoverable
+    POST failure). Never silently interpolated — analysis code must respect
+    these gaps and exclude affected windows.
+    """
+    __tablename__ = "mt5_tick_gaps"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    created_at     = Column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+    symbol         = Column(String(16), nullable=False, index=True)
+    start_msc      = Column(Integer, nullable=False)
+    end_msc        = Column(Integer, nullable=False)
+    start_utc      = Column(DateTime(timezone=True), nullable=False)
+    end_utc        = Column(DateTime(timezone=True), nullable=False)
+    reason         = Column(String(64), nullable=False)
+    daemon_id      = Column(String(32), nullable=True)
+    detail         = Column(Text, nullable=True)
+
+
 class PredatorNotificationEvent(Base):
     """
     Append-only audit log of every gateway decision. Powers the

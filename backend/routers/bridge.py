@@ -723,3 +723,156 @@ def receive_mt5_candles(
         },
         source="mt5_bridge",
     )
+
+
+# ── Track A — MT5 tick capture (research-only ingestion) ─────────────────────
+#
+# Daemon uses mt5.copy_ticks_from() to retrieve every broker tick since the
+# last confirmed cursor and POSTs the batch here. Nothing in production
+# trading depends on this dataset. See design brief 2026-09-03.
+
+class MT5TickRecord(BaseModel):
+    """One broker tick, fields preserved verbatim from MetaTrader5."""
+    time_msc:      int                   = Field(..., description="ms since Unix epoch, UTC")
+    bid:           float
+    ask:           float
+    last:          Optional[float]       = Field(default=None)
+    volume_real:   Optional[float]       = Field(default=None)
+    flags:         int                   = Field(default=0)
+
+
+class MT5TickBatch(BaseModel):
+    """Batch of ticks for a single symbol."""
+    symbol:        str                   = Field(..., description="broker symbol as MT5 returns it, e.g. XAUUSD")
+    broker:        str                   = Field(default="exness")
+    account:       str                   = Field(default="unknown")
+    count:         int
+    ticks:         list[MT5TickRecord]
+
+
+class MT5TickGapReport(BaseModel):
+    """Explicit acknowledgement of an unrecoverable data gap from the daemon."""
+    symbol:        str
+    start_msc:     int
+    end_msc:       int
+    reason:        str                   = Field(..., description="e.g. mt5_disconnect | mt5_returned_empty | daemon_offline")
+    detail:        Optional[str]         = Field(default=None)
+
+
+def _tick_content_hash(rec: MT5TickRecord) -> str:
+    import hashlib
+    payload = (
+        f"{rec.time_msc}|{rec.bid:.6f}|{rec.ask:.6f}"
+        f"|{'' if rec.last is None else f'{rec.last:.6f}'}"
+        f"|{'' if rec.volume_real is None else f'{rec.volume_real:.6f}'}"
+        f"|{rec.flags}"
+    )
+    return hashlib.sha1(payload.encode("ascii")).hexdigest()[:24]
+
+
+@router.post(
+    "/ticks/receive",
+    response_model=APIResponse[dict],
+    summary="[TRACK A — RESEARCH ONLY] Receive raw MT5 broker ticks. No production consumer.",
+)
+@limiter.limit("240/minute")
+def receive_mt5_ticks(
+    request: Request,
+    batch: MT5TickBatch,
+    bridge_daemon_id: str = Header(default="unknown", alias="X-Bridge-Daemon-Id"),
+    _: None = Depends(_require_bridge_secret),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from db_models import MT5Tick
+    from datetime import datetime as _dt, timezone as _tz
+
+    inserted = 0
+    duplicates = 0
+    errors = 0
+    latest_msc: int | None = None
+
+    for t in batch.ticks:
+        try:
+            content_hash = _tick_content_hash(t)
+            row = MT5Tick(
+                tick_time_msc=int(t.time_msc),
+                tick_time_utc=_dt.fromtimestamp(t.time_msc / 1000.0, tz=_tz.utc),
+                symbol=batch.symbol,
+                bid=float(t.bid),
+                ask=float(t.ask),
+                last=(None if t.last is None else float(t.last)),
+                volume_real=(None if t.volume_real is None else float(t.volume_real)),
+                flags=int(t.flags),
+                content_hash=content_hash,
+                broker=batch.broker,
+                account=batch.account,
+                daemon_id=bridge_daemon_id,
+            )
+            db.add(row)
+            db.commit()
+            inserted += 1
+            if latest_msc is None or t.time_msc > latest_msc:
+                latest_msc = t.time_msc
+        except Exception as exc:
+            db.rollback()
+            # Uniqueness violation on (symbol, content_hash) → duplicate
+            if "unique" in str(exc).lower() or "UNIQUE" in str(exc):
+                duplicates += 1
+            else:
+                errors += 1
+                if errors <= 3:
+                    log.warning("[bridge/ticks/receive] insert failed: %s", exc)
+
+    if inserted or duplicates or errors:
+        log.info("[bridge/ticks/receive] %s [%s]: inserted=%d dup=%d err=%d latest_msc=%s",
+                  batch.symbol, bridge_daemon_id, inserted, duplicates, errors, latest_msc)
+
+    return APIResponse(
+        data={
+            "accepted":   inserted,
+            "duplicates": duplicates,
+            "errors":     errors,
+            "latest_msc": latest_msc,
+            "symbol":     batch.symbol,
+        },
+        source="mt5_bridge_ticks",
+    )
+
+
+@router.post(
+    "/ticks/gap",
+    response_model=APIResponse[dict],
+    summary="[TRACK A — RESEARCH ONLY] Record an unrecoverable tick data gap.",
+)
+@limiter.limit("30/minute")
+def report_mt5_tick_gap(
+    request: Request,
+    gap: MT5TickGapReport,
+    bridge_daemon_id: str = Header(default="unknown", alias="X-Bridge-Daemon-Id"),
+    _: None = Depends(_require_bridge_secret),
+    db: Session = Depends(get_db),
+) -> APIResponse[dict]:
+    from db_models import MT5TickGap
+    from datetime import datetime as _dt, timezone as _tz
+
+    try:
+        row = MT5TickGap(
+            symbol=gap.symbol,
+            start_msc=int(gap.start_msc),
+            end_msc=int(gap.end_msc),
+            start_utc=_dt.fromtimestamp(gap.start_msc / 1000.0, tz=_tz.utc),
+            end_utc=_dt.fromtimestamp(gap.end_msc / 1000.0, tz=_tz.utc),
+            reason=gap.reason,
+            detail=gap.detail,
+            daemon_id=bridge_daemon_id,
+        )
+        db.add(row)
+        db.commit()
+        log.warning("[bridge/ticks/gap] %s [%s]: %d → %d reason=%s",
+                    gap.symbol, bridge_daemon_id, gap.start_msc, gap.end_msc, gap.reason)
+        return APIResponse(data={"recorded": True, "id": row.id}, source="mt5_bridge_ticks")
+    except Exception as exc:
+        db.rollback()
+        log.warning("[bridge/ticks/gap] insert failed: %s", exc)
+        return APIResponse(data={"recorded": False, "error": str(exc)[:120]},
+                            source="mt5_bridge_ticks")

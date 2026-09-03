@@ -815,8 +815,22 @@ def main():
     # would otherwise be lost forever.
     reconcile_orphaned_trades()
 
+    # Track A — research-only MT5 tick capture. Optional; falls back cleanly
+    # if the module is missing or errors. NOT read by any trading logic.
+    try:
+        from mt5_ticks_extension import push_ticks as push_ticks_research
+        from mt5_ticks_extension import TICK_PUSH_SEC as _TICK_PUSH_SEC
+        _tick_capture_enabled = True
+        log.info("[track-A] MT5 tick capture ENABLED (every %.1fs)", _TICK_PUSH_SEC)
+    except Exception as _exc:
+        push_ticks_research = None
+        _TICK_PUSH_SEC = 999999
+        _tick_capture_enabled = False
+        log.info("[track-A] MT5 tick capture disabled: %s", _exc)
+
     last_heartbeat = 0
     last_candle_push = 0
+    last_tick_push = 0
     try:
         while _running:
             now = time.time()
@@ -830,6 +844,16 @@ def main():
             if now - last_candle_push >= CANDLE_PUSH_SEC:
                 push_candles()
                 last_candle_push = now
+
+            # Track A tick push — research-only; wrapped so any failure
+            # leaves the rest of the loop untouched.
+            if _tick_capture_enabled and now - last_tick_push >= _TICK_PUSH_SEC:
+                try:
+                    push_ticks_research(mt5, session, api, log,
+                                          account=str(MT5_LOGIN))
+                except Exception as _texc:
+                    log.warning("[track-A] tick push loop error: %s", _texc)
+                last_tick_push = now
 
             # Periodic reconcile sweep (every 15 min) — catches orphans
             # that monitor threads dropped mid-run.
