@@ -1,42 +1,37 @@
 """
 Track A — MT5 tick capture extension for mt5_bridge_daemon.py.
 
-This module is imported by mt5_bridge_daemon.py and adds:
-  - push_ticks() — retrieves all ticks since a persistent cursor and POSTs them
-  - persistent cursor file (survives daemon / laptop / MT5 restarts)
-  - gap detection + reporting when a range cannot be recovered
+Retrieves broker ticks via mt5.copy_ticks_from(symbol, from_time, count,
+COPY_TICKS_ALL) and POSTs them to the droplet for research-only storage.
 
-Research-only. No production strategy consumes this data. Fields are stored
-verbatim; no derived metrics are computed here.
+CURSOR SAFETY (rev-2, 2026-09-03)
+─────────────────────────────────
+There are exactly TWO facts a cursor may reflect:
+  (1) "server has confirmed persistence up to msc=X"     ← authoritative
+  (2) "daemon has inspected up to msc=X"                 ← non-authoritative
 
-DESIGN NOTES
-------------
-1. Complete stream capture — uses `mt5.copy_ticks_from(symbol, from_ms,
-   count=100_000, flags=mt5.COPY_TICKS_ALL)`. This returns EVERY broker tick
-   in the requested range up to the count limit, not a snapshot. Repeatedly
-   called until fewer than count ticks come back — that means we caught up.
+We persist only (1) to disk. The authoritative cursor advances ONLY after
+the server's POST response confirms the batch was committed. On timeout,
+5xx, connection failure or invalid response, the cursor is not touched
+and the same window will be re-fetched next cycle. Server-side dedup
+(unique (symbol, content_hash)) makes replay safe.
 
-2. Cursor persistence — after every successful POST we write the max
-   `time_msc` we pushed to a small JSON file on disk. On restart the daemon
-   reads it and resumes from `cursor + 1 ms`.
+An empty return from copy_ticks_from is NOT proof the interval had no
+ticks. Before advancing across an empty interval we classify the state:
 
-3. Gap reporting — if `copy_ticks_from` returns None (MT5 disconnect) OR
-   returns 0 records for a window that ends more than 30 s in the past
-   (broker gap), we POST an explicit gap notice to the droplet so analysis
-   code knows to exclude that window.
+  VERIFIED_NO_MARKET_TICKS   → advance safely (market open, terminal ok,
+                               symbol ok, non-zero ticks recently)
+  MARKET_CLOSED              → advance in bounded steps (max 1 h at a time)
+  MT5_TEMPORARILY_UNAVAILABLE→ do NOT advance; retry
+  TERMINAL_DISCONNECTED      → do NOT advance; retry
+  SYMBOL_UNAVAILABLE         → do NOT advance; retry
+  API_ERROR                  → do NOT advance; retry
+  UNKNOWN_EMPTY_RESPONSE     → do NOT advance; retry; log
 
-4. Raw only — bid / ask / last / volume_real / flags copied field-for-field
-   from the numpy struct. No aggregator classification, no delta, no CVD,
-   nothing derived inside ingestion.
+Only VERIFIED_NO_MARKET_TICKS and MARKET_CLOSED advance the cursor without
+a POST. Everything else preserves it for later recovery.
 
-5. Quote vs trade — the `flags` field is preserved as-is. Distinguishing a
-   quote update from an actual trade is a QUERY-TIME concern:
-       trades:   (flags & 0x08) != 0     # TICK_FLAG_LAST
-       quotes:   (flags & 0x08) == 0
-
-6. Independence — this module is optional. If the tick capture code errors
-   at import or runtime, the rest of the daemon (candle push, trade
-   execution) continues untouched.
+Research-only. No production strategy consumes this data.
 """
 from __future__ import annotations
 
@@ -49,7 +44,7 @@ from typing import Optional
 
 log = logging.getLogger("mt5_bridge.ticks")
 
-# ── configuration (env-overridable) ──────────────────────────────────────────
+# ── configuration ────────────────────────────────────────────────────────────
 TICK_SYMBOL       = os.getenv("MT5_TICK_SYMBOL", os.getenv("MT5_SYMBOL", "XAUUSD"))
 TICK_PUSH_SEC     = float(os.getenv("MT5_TICK_PUSH_SEC", "3.0"))
 TICK_BATCH_MAX    = int(os.getenv("MT5_TICK_BATCH_MAX", "5000"))
@@ -57,16 +52,41 @@ TICK_PULL_MAX     = int(os.getenv("MT5_TICK_PULL_MAX", "100000"))
 TICK_CURSOR_FILE  = os.getenv("MT5_TICK_CURSOR_FILE",
                                 os.path.join(os.path.dirname(__file__),
                                              ".mt5_tick_cursor.json"))
-TICK_GAP_STALE_S  = int(os.getenv("MT5_TICK_GAP_STALE_S", "60"))
-TICK_ENABLED      = os.getenv("MT5_TICK_ENABLED", "true").lower() in ("1", "true", "yes")
+# Max time we advance the cursor across a market-closed interval in a
+# single step. Keeps us honest about when we "confirmed" a window.
+MAX_EMPTY_ADVANCE_MS = int(os.getenv("MT5_TICK_MAX_EMPTY_ADVANCE_MS", str(60 * 60 * 1000)))
+# Grace after last confirmed tick before we start classifying empty windows
+EMPTY_GRACE_MS       = int(os.getenv("MT5_TICK_EMPTY_GRACE_MS", "30000"))
+TICK_ENABLED         = os.getenv("MT5_TICK_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+# ── health state (in-memory; also surfaced by the daemon later) ──────────────
+_HEALTH = {
+    "last_state":            None,   # last classification of empty return
+    "last_state_at":         None,   # when
+    "consec_empty":          0,      # consecutive empty windows
+    "last_confirmed_msc":    None,   # last msc server confirmed persistence for
+    "last_confirmed_at":     None,
+    "last_ticks_pushed":     0,
+    "posts_ok":              0,
+    "posts_failed":          0,
+    "gaps_reported":         0,
+}
+
+
+def health_snapshot() -> dict:
+    return dict(_HEALTH)
+
 
 # ── cursor persistence ───────────────────────────────────────────────────────
 
 def _load_cursor(symbol: str) -> Optional[int]:
+    """Reads the confirmed-persisted cursor for a symbol; None if unset."""
     try:
         with open(TICK_CURSOR_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return int(data.get(symbol, None)) if data.get(symbol) else None
+        v = data.get(symbol)
+        return int(v) if v is not None else None
     except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
         return None
     except Exception as exc:
@@ -74,7 +94,12 @@ def _load_cursor(symbol: str) -> Optional[int]:
         return None
 
 
-def _save_cursor(symbol: str, time_msc: int) -> None:
+def _save_cursor(symbol: str, time_msc: int, reason: str) -> None:
+    """
+    Persists the CONFIRMED cursor (server acknowledged). Reason is stored
+    so post-hoc audit can tell why the cursor moved (server_ack, market_closed,
+    verified_no_ticks). Never call from unconfirmed code paths.
+    """
     try:
         data = {}
         if os.path.exists(TICK_CURSOR_FILE):
@@ -84,6 +109,7 @@ def _save_cursor(symbol: str, time_msc: int) -> None:
             except Exception:
                 data = {}
         data[symbol] = int(time_msc)
+        data[f"{symbol}_last_advance_reason"] = reason
         data["_updated_at"] = datetime.now(timezone.utc).isoformat()
         tmp = TICK_CURSOR_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -93,82 +119,175 @@ def _save_cursor(symbol: str, time_msc: int) -> None:
         log.warning("tick cursor save failed: %s", exc)
 
 
+# ── empty-response classification ────────────────────────────────────────────
+
+def _classify_empty(mt5, symbol: str, cursor_ms: int) -> str:
+    """
+    Return one of:
+      VERIFIED_NO_MARKET_TICKS
+      MARKET_CLOSED
+      MT5_TEMPORARILY_UNAVAILABLE
+      TERMINAL_DISCONNECTED
+      SYMBOL_UNAVAILABLE
+      API_ERROR
+      UNKNOWN_EMPTY_RESPONSE
+
+    Only VERIFIED_NO_MARKET_TICKS + MARKET_CLOSED are safe cursor-advance states.
+    """
+    try:
+        ti = mt5.terminal_info()
+        if ti is None:
+            return "TERMINAL_DISCONNECTED"
+        if getattr(ti, "connected", False) is False:
+            return "TERMINAL_DISCONNECTED"
+
+        si = mt5.symbol_info(symbol)
+        if si is None:
+            return "SYMBOL_UNAVAILABLE"
+        # visible=False can mean broker disabled the symbol
+        if getattr(si, "visible", True) is False:
+            return "SYMBOL_UNAVAILABLE"
+
+        # Live probe — does symbol_info_tick return something plausible?
+        live = mt5.symbol_info_tick(symbol)
+        if live is None:
+            return "MT5_TEMPORARILY_UNAVAILABLE"
+
+        # If the LIVE tick is older than the cursor + a small grace,
+        # the market is effectively quiet — but we cannot conclude
+        # "no ticks in interval" without more evidence. Only assert
+        # "verified no market ticks" when the live tick's msc is
+        # strictly greater than cursor+grace AND we still got zero
+        # rows from copy_ticks_from — that means the broker sees a
+        # newer tick than the cursor but historical returned empty,
+        # which implies the historical window was genuinely quiet.
+        live_msc = int(getattr(live, "time_msc", 0) or 0)
+        if live_msc > cursor_ms + EMPTY_GRACE_MS:
+            return "VERIFIED_NO_MARKET_TICKS"
+
+        # Weekend / holiday heuristic: use UTC weekday.
+        # CME Globex Gold electronic session: 22:00 UTC Sun → 21:00 UTC Fri
+        # with a daily 60 min break at 21:00-22:00 UTC.
+        now = datetime.now(timezone.utc)
+        wd = now.weekday()  # Mon=0, Sun=6
+        hr = now.hour
+        # weekend closed
+        if wd == 5:  # Saturday
+            return "MARKET_CLOSED"
+        if wd == 6 and hr < 22:  # Sunday before session open
+            return "MARKET_CLOSED"
+        if wd == 4 and hr >= 21:  # Friday after session close
+            return "MARKET_CLOSED"
+        # Daily maintenance window
+        if 21 <= hr < 22:
+            return "MARKET_CLOSED"
+
+        return "UNKNOWN_EMPTY_RESPONSE"
+
+    except Exception as exc:
+        log.warning("_classify_empty error: %s", exc)
+        return "API_ERROR"
+
+
 # ── main tick worker ─────────────────────────────────────────────────────────
 
 def push_ticks(mt5, session, api, log_parent, account: str = "unknown") -> None:
     """
-    Retrieve broker ticks since the persistent cursor and POST them.
+    One iteration. Called every TICK_PUSH_SEC by the daemon's main loop.
 
-    Called every TICK_PUSH_SEC by the daemon's main loop. Fully wrapped in
-    try/except so any failure is logged and does not disturb the parent
-    daemon's other duties (candle push, trade execution, heartbeats).
+    Cursor advances ONLY when:
+      (a) server acknowledges persistence of a non-empty batch, OR
+      (b) empty return is classified VERIFIED_NO_MARKET_TICKS or
+          MARKET_CLOSED (bounded step).
 
-    Parameters
-    ----------
-    mt5      : the MetaTrader5 module (already initialized by the daemon)
-    session : requests.Session with auth headers already set up
-    api      : callable that returns the fully-qualified droplet URL for a path
-    log_parent: parent daemon's logger (used for cross-referenceable log lines)
-    account  : MT5 login id string, for provenance
+    In every other empty case the cursor stays put and we retry.
     """
     if not TICK_ENABLED:
         return
 
     try:
         cursor = _load_cursor(TICK_SYMBOL)
-
-        # First run: seed with "now - 5 minutes" so we don't pull the entire
-        # broker history and DoS ourselves.
-        if cursor is None:
-            seed_dt = datetime.now(timezone.utc)
-            cursor = int(seed_dt.timestamp() * 1000) - 5 * 60 * 1000
+        first_run = cursor is None
+        if first_run:
+            # Seed with "now - 5 minutes" so we don't pull an unbounded history
+            cursor = int(datetime.now(timezone.utc).timestamp() * 1000) - 5 * 60 * 1000
             log.info("tick cursor seeded to %d ms (5 min ago)", cursor)
 
-        from_dt = datetime.fromtimestamp(cursor / 1000.0, tz=timezone.utc)
-        # copy_ticks_from wants a datetime in UTC — MT5 will treat it as UTC
-        # because the terminal is set to UTC. If the terminal is set to a
-        # different timezone the daemon should surface that as a separate
-        # issue — tick_time_msc from MT5 is always UTC epoch ms regardless.
+        # copy_ticks_from wants a datetime; MT5 interprets it as UTC.
+        # We ask for cursor+1 ms so we don't refetch the exact confirmed msc.
+        from_dt = datetime.fromtimestamp((cursor + 1) / 1000.0, tz=timezone.utc)
         raw = mt5.copy_ticks_from(TICK_SYMBOL, from_dt, TICK_PULL_MAX,
                                    mt5.COPY_TICKS_ALL)
 
-        # None ≠ [] ≠ zero-length ndarray — treat all three as distinct
+        # Distinguish None (API error) vs zero-length (empty window)
         if raw is None:
+            _HEALTH["last_state"] = "MT5_TEMPORARILY_UNAVAILABLE"
+            _HEALTH["last_state_at"] = datetime.now(timezone.utc).isoformat()
+            _HEALTH["consec_empty"] += 1
             _report_gap(session, api, TICK_SYMBOL, cursor,
                         int(datetime.now(timezone.utc).timestamp() * 1000),
                         reason="mt5_returned_none",
-                        detail="copy_ticks_from returned None; "
-                                "possible broker disconnect")
+                        detail="copy_ticks_from returned None")
+            _HEALTH["gaps_reported"] += 1
             return
 
         n = len(raw)
         if n == 0:
-            # No ticks in [cursor, now]. If cursor is far in the past we may
-            # have a genuine broker outage — mark a gap once it stays stale.
+            state = _classify_empty(mt5, TICK_SYMBOL, cursor)
+            _HEALTH["last_state"] = state
+            _HEALTH["last_state_at"] = datetime.now(timezone.utc).isoformat()
+            _HEALTH["consec_empty"] += 1
+
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            if now_ms - cursor > TICK_GAP_STALE_S * 1000:
+
+            if state == "VERIFIED_NO_MARKET_TICKS":
+                # Advance ONLY to the live tick's msc (not past it),
+                # bounded — this is the safe form of "the interval
+                # was genuinely empty."
+                live = mt5.symbol_info_tick(TICK_SYMBOL)
+                live_msc = int(getattr(live, "time_msc", cursor) or cursor)
+                new_cursor = min(live_msc - 1, cursor + MAX_EMPTY_ADVANCE_MS)
+                if new_cursor > cursor:
+                    _save_cursor(TICK_SYMBOL, new_cursor,
+                                    "verified_no_market_ticks")
+                return
+
+            if state == "MARKET_CLOSED":
+                # Bounded step; we never leap the cursor across an
+                # arbitrary interval, so a subsequent market re-open
+                # never leaves an under-inspected window.
+                new_cursor = min(now_ms - EMPTY_GRACE_MS,
+                                    cursor + MAX_EMPTY_ADVANCE_MS)
+                if new_cursor > cursor:
+                    _save_cursor(TICK_SYMBOL, new_cursor, "market_closed")
+                return
+
+            # Any other classification: DO NOT advance. Retry next cycle.
+            # Record a gap if we're stale > EMPTY_GRACE_MS so analysis
+            # code can respect it.
+            if now_ms - cursor > EMPTY_GRACE_MS:
                 _report_gap(session, api, TICK_SYMBOL, cursor, now_ms,
-                            reason="mt5_returned_empty",
-                            detail=f"no ticks in {(now_ms-cursor)/1000:.0f}s window")
-                # Advance cursor so we don't re-report the same gap
-                _save_cursor(TICK_SYMBOL, now_ms)
+                            reason=state.lower(),
+                            detail=(f"empty response classified as {state}; "
+                                    f"cursor unchanged for retry"))
+                _HEALTH["gaps_reported"] += 1
             return
 
-        # Build batch payload — verbatim broker fields
-        max_msc = int(raw[-1]["time_msc"])
+        # Non-empty result → build the payload with only ticks strictly newer
+        # than the confirmed cursor, then POST and advance only on server ACK.
+        max_msc_in_batch = int(raw[-1]["time_msc"])
         ticks_payload = []
         for r in raw:
             t_msc = int(r["time_msc"])
             if t_msc <= cursor:
-                continue    # already have this one
+                continue
             flags = int(r["flags"]) if "flags" in r.dtype.names else 0
             rec = {
-                "time_msc":    t_msc,
-                "bid":         float(r["bid"]),
-                "ask":         float(r["ask"]),
-                "flags":       flags,
+                "time_msc": t_msc,
+                "bid":      float(r["bid"]),
+                "ask":      float(r["ask"]),
+                "flags":    flags,
             }
-            # only include last / volume_real when broker actually populated them
             if "last" in r.dtype.names:
                 last_val = float(r["last"])
                 if last_val != 0.0:
@@ -180,11 +299,17 @@ def push_ticks(mt5, session, api, log_parent, account: str = "unknown") -> None:
             ticks_payload.append(rec)
 
         if not ticks_payload:
+            # Ticks came back but all were <= cursor — nothing new
+            _HEALTH["last_state"] = "NO_NEW_TICKS_ABOVE_CURSOR"
             return
 
-        # POST in chunks of TICK_BATCH_MAX
+        # POST in bounded chunks. Cursor advances chunk-by-chunk on ACK.
+        chunks_ok = 0
+        chunks_failed = 0
+        confirmed_msc_this_cycle = cursor
         for i in range(0, len(ticks_payload), TICK_BATCH_MAX):
             chunk = ticks_payload[i:i + TICK_BATCH_MAX]
+            chunk_max_msc = max(t["time_msc"] for t in chunk)
             body = {
                 "symbol":  TICK_SYMBOL,
                 "broker":  os.getenv("MT5_BROKER", "exness"),
@@ -194,16 +319,49 @@ def push_ticks(mt5, session, api, log_parent, account: str = "unknown") -> None:
             }
             try:
                 r = session.post(api("/ticks/receive"), json=body, timeout=15)
-                if not r.ok:
-                    log.warning("tick push HTTP %s %s", r.status_code,
-                                 (r.text or "")[:120])
-                    return  # keep cursor unchanged → will retry next tick
             except Exception as exc:
-                log.warning("tick push failed: %s", exc)
-                return
+                chunks_failed += 1
+                _HEALTH["posts_failed"] += 1
+                log.warning("tick push transport error: %s", exc)
+                # STOP advancing on transport error — later chunks
+                # would be out-of-order commits. Break and retry
+                # everything above the current confirmed msc next cycle.
+                break
+            if not r.ok:
+                chunks_failed += 1
+                _HEALTH["posts_failed"] += 1
+                log.warning("tick push HTTP %s %s", r.status_code,
+                             (r.text or "")[:120])
+                break
+            # Confirm server-side commit before advancing
+            try:
+                body_json = r.json()
+                data = body_json.get("data", {}) if isinstance(body_json, dict) else {}
+                latest_ack = data.get("latest_msc")
+                # If server gives us a latest_msc we trust that. Otherwise
+                # trust the chunk_max_msc since HTTP 2xx means commit.
+                if isinstance(latest_ack, int) and latest_ack >= chunk_max_msc:
+                    confirmed_msc_this_cycle = latest_ack
+                else:
+                    confirmed_msc_this_cycle = chunk_max_msc
+            except Exception:
+                # No parseable body — HTTP 2xx alone is our commit signal
+                confirmed_msc_this_cycle = chunk_max_msc
+            chunks_ok += 1
+            _HEALTH["posts_ok"] += 1
 
-        _save_cursor(TICK_SYMBOL, max_msc)
-        log.debug("tick push: %d ticks up to msc=%d", len(ticks_payload), max_msc)
+        if confirmed_msc_this_cycle > cursor:
+            _save_cursor(TICK_SYMBOL, confirmed_msc_this_cycle, "server_ack")
+            _HEALTH["last_confirmed_msc"] = confirmed_msc_this_cycle
+            _HEALTH["last_confirmed_at"]  = datetime.now(timezone.utc).isoformat()
+            _HEALTH["last_ticks_pushed"]  = len(ticks_payload)
+            _HEALTH["consec_empty"]       = 0
+            log.info("tick push: %d ticks, %d/%d chunks OK, cursor→%d",
+                       len(ticks_payload), chunks_ok, chunks_ok + chunks_failed,
+                       confirmed_msc_this_cycle)
+        else:
+            log.warning("tick push: no chunks confirmed — cursor unchanged at %d",
+                         cursor)
 
     except Exception as exc:
         # Never let this crash the daemon
