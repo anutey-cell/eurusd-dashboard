@@ -12,11 +12,11 @@ Additions on top of v1.1:
 import json
 import math
 import sys
+sys.path.insert(0, "/app")
 from datetime import datetime, timezone, timedelta, date
 from database import SessionLocal
 from sqlalchemy import text
 
-sys.path.insert(0, "/app")
 from closure_20_snapshot_v11 import (
     current_xauusd_from_ticks, previous_trading_day, previous_trading_week,
     asian_session_range, structural_read, refresh_gc_bars, refresh_events,
@@ -147,7 +147,8 @@ def options_intelligence(db):
         "CME_GC_OPTIONS": {"status": "NOT_OBSERVED",
             "reason": "CME endpoints return HTTP 403 from droplet IP; no free authoritative alternative accessible."},
         "GLD_ETF_OPTIONS_PROXY": {
-            "STATUS":   "OBSERVED  (RESEARCH PROXY — GLD is SPDR Gold Shares ETF, NOT COMEX GC)",
+            "STATUS":   "OBSERVED  (SEPARATE RESEARCH HYPOTHESIS: does GLD positioning inform XAUUSD? NOT a GC substitute)",
+            "QUARANTINE_NOTE": "GLD-native metrics only. No XAUUSD-equivalent strike overlay is published from this layer.",
             "SOURCE":   "CBOE delayed quotes (application/json)",
             "OBS_DATE": obs,
             "underlying_ref_S": S_now,
@@ -348,7 +349,18 @@ def compose_v12(db):
     }
 
     # ── confluence map ──
-    snap["options_confluence_map"] = build_confluence_map(db, ms, opts, xau_now)
+    # QUARANTINED (2026-09-07 per Phase-2A directive): the GLD → XAU strike
+    # mapping is not shown in the user-facing snapshot. The GLD dataset is
+    # retained in options_gamma_concentration for a SEPARATE research hypothesis
+    # ("does GLD options positioning contain independent information for XAUUSD?")
+    # and the mapping utility is preserved in code but no longer surfaced.
+    snap["options_confluence_map"] = {
+        "status": "SUPPRESSED_QUARANTINE_v1.2a",
+        "reason": ("GLD→XAU strike mapping is not sufficiently validated. The "
+                    "underlying GLD positioning data remains in "
+                    "options_gamma_concentration for the separate research "
+                    "hypothesis about GLD options informing XAUUSD."),
+    }
 
     # ── intelligence matrix + classification ──
     # Determine derivatives status:
