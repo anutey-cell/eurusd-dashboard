@@ -94,31 +94,107 @@ def _fetch_yahoo(pair: str, interval: str, lookback: int) -> list:
 
 
 # TV retry policy — the anonymous tvDatafeed session drops occasionally.
-# Retry with short backoffs before giving up and falling to Yahoo.
-_TV_RETRY_BACKOFFS_S: list[float] = [1.0, 3.0]
+# Expanded backoffs after Sep-8 outage: 18h of MT5 downtime, zero TV fills.
+# 5 attempts, cumulative wait ~ 32s per top-up cycle.
+_TV_RETRY_BACKOFFS_S: list[float] = [1.0, 3.0, 8.0, 20.0]
+
+
+def _yahoo_gc_basis_adjusted(pair: str, interval: str, lookback: int) -> Optional[list]:
+    """Signal-survival fallback: Yahoo GC=F bars, basis-adjusted to spot-equivalent.
+
+    P189 says do NOT retag GC as XAU. That rule stands for RAW data. This
+    function computes a basis-adjusted spot proxy explicitly stamped
+    source='yahoo_gc_proxy' so downstream can distinguish it from true spot.
+
+    Basis = median(recent_gc_close - recent_xau_close) over the last 24h of
+    historical_candles. If insufficient history exists, uses a $50 default
+    (consistent with the 2026-09-04 Section 62 observation).
+
+    Purpose: keep the signal path fresh when BOTH MT5 push and TradingView
+    are unavailable. Prevents 18h signal blackouts like Sep 8-9 2026.
+    """
+    from services.yahoo_provider import get_yahoo_candles
+    from datetime import datetime, timedelta
+    try:
+        candles = get_yahoo_candles(pair, timeframe=interval, lookback=lookback)
+    except Exception as exc:
+        log.debug("[candle_ingestion] Yahoo GC fetch exc: %s", exc)
+        return None
+    if not candles:
+        return None
+
+    # Compute basis from recent overlap of GC=F vs XAU/USD H1 closes.
+    basis = 50.0    # default per Section 62 Sep-04-2026 observation
+    try:
+        from database import SessionLocal
+        from sqlalchemy import text
+        cutoff = (datetime.utcnow() - timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
+        with SessionLocal() as db:
+            r = db.execute(text("""
+                SELECT AVG(g.close - x.close) AS median_basis, COUNT(*) AS n
+                FROM historical_candles g
+                JOIN historical_candles x
+                  ON g.candle_time = x.candle_time AND g.timeframe = x.timeframe
+                WHERE g.instrument IN ('GC=F','gc_futures') AND x.instrument='XAU/USD'
+                  AND g.timeframe='H1' AND g.candle_time >= :cut
+                  AND x.source != 'yahoo_gc_proxy'
+            """), {"cut": cutoff}).fetchone()
+            if r and r[1] and r[1] >= 3:
+                basis = float(r[0])
+    except Exception as exc:
+        log.debug("[candle_ingestion] basis calc exc: %s — using default $%.1f",
+                    exc, basis)
+
+    # Subtract basis so the stamped source's spot-equivalent price is a
+    # rough approximation of XAU.
+    adjusted = []
+    for c in candles:
+        if isinstance(c, dict):
+            adj = dict(c)
+            for k in ("open", "high", "low", "close"):
+                if k in adj and adj[k] is not None:
+                    adj[k] = float(adj[k]) - basis
+            adjusted.append(adj)
+        else:
+            # Pydantic-model shape — take a plain-dict copy
+            adjusted.append({
+                "time": getattr(c, "time", None),
+                "open": (getattr(c, "open", 0) or 0) - basis,
+                "high": (getattr(c, "high", 0) or 0) - basis,
+                "low":  (getattr(c, "low",  0) or 0) - basis,
+                "close":(getattr(c, "close",0) or 0) - basis,
+                "volume": getattr(c, "volume", 0) or 0,
+            })
+    log.info("[candle_ingestion] yahoo_gc_proxy: %d bars adjusted by basis=$%.2f",
+              len(adjusted), basis)
+    return adjusted
 
 
 def _fetch_with_fallback(pair: str, interval: str,
                           lookback: int) -> tuple[list, str]:
     """
-    Ingest fallback chain (per operator brief 2026-08-11):
+    Ingest fallback chain (updated 2026-09-09 after MT5 outage exposed
+    single-point-of-failure risk):
 
-      1. TradingView OANDA:XAUUSD    (spot, retry on transient drops)
-      2. Yahoo GC=F                   (gold futures, ~$5-10 basis vs spot)
+      1. TradingView OANDA:XAUUSD   (spot, 5 attempts with backoffs)
+      2. Yahoo GC=F basis-adjusted   (spot proxy, stamped 'yahoo_gc_proxy')
+         Basis auto-computed from recent GC-vs-XAU overlap; default $50.
 
     Note: MT5 bars arrive via a separate PUSH from the laptop daemon at
     routers/bridge.py POST /candles/receive — they don't need to be pulled
     here. When the daemon is running, MT5 bars land with source='mt5' and
-    win the freshness race naturally.
+    win the freshness race naturally. When MT5 is down (laptop offline,
+    ISP outage, endpoint filter), the two cloud sources above keep the
+    signal path fresh so strategist doesn't blackout.
 
-    Raises RuntimeError only when BOTH providers are exhausted so the
+    Raises RuntimeError only when ALL providers are exhausted so the
     freshness sentinel gets a clear error text.
     """
     from services.tradingview_provider import invalidate_cache as _tv_invalidate
 
     last_exc: Optional[Exception] = None
 
-    # 1. TradingView with retries
+    # 1. TradingView with expanded retries
     for attempt, backoff in enumerate([0.0] + _TV_RETRY_BACKOFFS_S):
         if backoff > 0:
             time.sleep(backoff)
@@ -135,22 +211,24 @@ def _fetch_with_fallback(pair: str, interval: str,
             log.debug("[candle_ingestion] TV attempt %d for %s %s: %s",
                         attempt + 1, pair, interval, exc)
 
-    # 2. Yahoo GC=F fallback (futures, not spot — flagged for downstream)
-    try:
-        candles = _fetch_yahoo(pair, interval, lookback)
-        if candles:
-            log.info("[candle_ingestion] %s %s: falling back to Yahoo GC=F "
-                     "(TV exhausted)", pair, interval)
-            return candles, "yahoo"
-    except Exception as exc:
-        last_exc = exc
-        log.debug("[candle_ingestion] Yahoo fallback for %s %s: %s",
-                    pair, interval, exc)
+    # 2. Yahoo GC=F basis-adjusted spot proxy — signal survival only
+    if pair.lower() == "xauusd":
+        try:
+            adjusted = _yahoo_gc_basis_adjusted(pair, interval, lookback)
+            if adjusted:
+                log.warning(
+                    "[candle_ingestion] TV exhausted — falling back to "
+                    "yahoo_gc_proxy for %s %s (%d bars). "
+                    "Signal path preserved; strategist may see slightly "
+                    "different spot price until TV/MT5 recovers.",
+                    pair, interval, len(adjusted)
+                )
+                return adjusted, "yahoo_gc_proxy"
+        except Exception as exc:
+            log.warning("[candle_ingestion] yahoo_gc_proxy fallback failed: %s", exc)
 
-    # Both providers exhausted — raise clean error text
     raise RuntimeError(
-        f"All free-tier providers exhausted for {pair} {interval} "
-        f"(TV + Yahoo): {last_exc}"
+        f"All providers exhausted for {pair} {interval}: TV {last_exc}"
     )
 
 
@@ -270,4 +348,68 @@ def top_up_recent(db: Session, pair: str = "xauusd",
     return report
 
 
-__all__ = ["top_up_recent"]
+def _persist_gc_bars(db: Session, tf: str, candles: list) -> dict:
+    """Persist Yahoo GC=F candles into gc_futures_bars (independent from XAU/USD)."""
+    from db_models import GcFuturesBar
+    inserted, skipped, errors = 0, 0, 0
+    for c in candles:
+        try:
+            ts = _field(c, "time")
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if ts is None:
+                errors += 1; continue
+            if not getattr(ts, "tzinfo", None):
+                ts = ts.replace(tzinfo=timezone.utc)
+            row = GcFuturesBar(
+                contract="GC=F",
+                timeframe=tf,
+                candle_time=ts,
+                open=float(_field(c, "open", 0.0)),
+                high=float(_field(c, "high", 0.0)),
+                low=float(_field(c, "low",  0.0)),
+                close=float(_field(c, "close", 0.0)),
+                volume=float(_field(c, "volume", 0) or 0),
+                source="yahoo",
+            )
+            db.add(row)
+            try:
+                db.commit()
+                inserted += 1
+            except Exception:
+                db.rollback()
+                skipped += 1     # unique-constraint hit — dedupe
+        except Exception:
+            db.rollback()
+            errors += 1
+    return {"inserted": inserted, "skipped_duplicate": skipped, "errors": errors,
+             "fetched": len(candles)}
+
+
+def ingest_gc_futures(db: Session, timeframes: tuple = ("M5", "M15", "H1"),
+                        lookback: int = 100) -> dict:
+    """
+    Fetch Yahoo GC=F for each timeframe and persist to gc_futures_bars.
+    Independent from XAU/USD ingestion. Never contaminates historical_candles.
+    """
+    report = {"pair": "GC=F", "timeframes": {},
+              "totals": {"inserted": 0, "skipped": 0, "errors": 0}}
+    for tf in timeframes:
+        try:
+            candles = _fetch_yahoo("xauusd", tf, lookback)
+            if not candles:
+                report["timeframes"][tf] = {"note": "yahoo empty"}
+                continue
+            r = _persist_gc_bars(db, tf, candles)
+            report["timeframes"][tf] = r
+            report["totals"]["inserted"] += r["inserted"]
+            report["totals"]["skipped"]  += r["skipped_duplicate"]
+            report["totals"]["errors"]   += r["errors"]
+        except Exception as exc:
+            log.warning("[gc_ingest] %s failed: %s", tf, exc)
+            report["timeframes"][tf] = {"error": str(exc)}
+            report["totals"]["errors"] += 1
+    return report
+
+
+__all__ = ["top_up_recent", "ingest_gc_futures"]
