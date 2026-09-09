@@ -47,7 +47,7 @@ log = logging.getLogger("mt5_bridge.ticks")
 # ── configuration ────────────────────────────────────────────────────────────
 TICK_SYMBOL       = os.getenv("MT5_TICK_SYMBOL", os.getenv("MT5_SYMBOL", "XAUUSD"))
 TICK_PUSH_SEC     = float(os.getenv("MT5_TICK_PUSH_SEC", "3.0"))
-TICK_BATCH_MAX    = int(os.getenv("MT5_TICK_BATCH_MAX", "5000"))
+TICK_BATCH_MAX    = int(os.getenv("MT5_TICK_BATCH_MAX", "2500"))
 TICK_PULL_MAX     = int(os.getenv("MT5_TICK_PULL_MAX", "100000"))
 TICK_CURSOR_FILE  = os.getenv("MT5_TICK_CURSOR_FILE",
                                 os.path.join(os.path.dirname(__file__),
@@ -318,7 +318,7 @@ def push_ticks(mt5, session, api, log_parent, account: str = "unknown") -> None:
                 "ticks":   chunk,
             }
             try:
-                r = session.post(api("/ticks/receive"), json=body, timeout=15)
+                r = session.post(api("/ticks/receive"), json=body, timeout=45)
             except Exception as exc:
                 chunks_failed += 1
                 _HEALTH["posts_failed"] += 1
@@ -379,7 +379,7 @@ def _report_gap(session, api, symbol: str, start_msc: int, end_msc: int,
         }
         if detail:
             body["detail"] = detail
-        r = session.post(api("/ticks/gap"), json=body, timeout=10)
+        r = session.post(api("/ticks/gap"), json=body, timeout=20)
         if r.ok:
             log.warning("tick gap reported: %s %d→%d (%s)",
                          symbol, start_msc, end_msc, reason)

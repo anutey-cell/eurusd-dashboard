@@ -802,7 +802,7 @@ def push_candles() -> None:
                 "count":      len(payload_candles),
                 "candles":    payload_candles,
             }
-            r = session.post(api("/candles/receive"), json=body, timeout=15)
+            r = session.post(api("/candles/receive"), json=body, timeout=45)
             if not r.ok:
                 log.warning("push_candles %s: HTTP %s %s",
                               tf_str, r.status_code, (r.text or "")[:120])
