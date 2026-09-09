@@ -99,6 +99,14 @@ MT5_LOGIN     = env("MT5_LOGIN", "")
 MT5_PASSWORD  = env("MT5_PASSWORD", "")
 MT5_SERVER    = env("MT5_SERVER", "")
 
+# Hard daemon-side execution gate.
+# Defaults OFF. When disabled, heartbeat/candles/ticks continue,
+# but pending-order polling, execution and trade reconciliation are blocked.
+EXECUTION_POLL_ENABLED = (
+    (env("EXECUTION_POLL_ENABLED", "false") or "false").strip().lower()
+    in ("1", "true", "yes")
+)
+
 if not DASHBOARD_URL or not BRIDGE_SECRET:
     log.error("DASHBOARD_URL and BRIDGE_SECRET are required. "
               "Create deploy/.env.bridge from .env.bridge.example.")
@@ -262,6 +270,12 @@ def _is_mandate_order(order: dict) -> bool:
 
 
 def execute_order(order: dict) -> dict:
+    if not EXECUTION_POLL_ENABLED:
+        log.warning("execute_order blocked: EXECUTION_POLL_ENABLED=false")
+        return {
+            "status": "REJECTED",
+            "error": "Broker execution disabled locally by daemon safety gate",
+        }
     """
     Place a market order on MT5. Mandate orders use lot=0.01 + TP=TP2 (the
     stretch target) with TP1 as a breakeven milestone managed by the monitor
@@ -572,6 +586,8 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
 def fetch_pending() -> list[dict]:
+    if not EXECUTION_POLL_ENABLED:
+        return []
     try:
         r = session.get(api("/pending-orders"), timeout=15)
         r.raise_for_status()
@@ -660,6 +676,9 @@ def heartbeat() -> None:
 
 
 def reconcile_orphaned_trades() -> None:
+    if not EXECUTION_POLL_ENABLED:
+        log.debug("trade reconciliation disabled by local execution gate")
+        return
     """
     On startup, find any prior ACCEPTED orders whose monitor thread died
     with a previous daemon (so result is still PENDING in the backend).
