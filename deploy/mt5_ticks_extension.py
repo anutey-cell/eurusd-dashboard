@@ -202,6 +202,16 @@ def push_ticks(mt5, session, api, log_parent, account: str = "unknown") -> None:
 
     In every other empty case the cursor stays put and we retry.
     """
+
+    # Resolve provenance from the MT5 terminal when credentials are intentionally
+    # omitted from .env.bridge and the daemon attaches to an already logged-in terminal.
+    if not account or account == "unknown":
+        try:
+            acc = mt5.account_info()
+            account = str(getattr(acc, "login", None) or "unknown")
+        except Exception:
+            account = "unknown"
+
     if not TICK_ENABLED:
         return
 
