@@ -786,42 +786,59 @@ def receive_mt5_ticks(
     from db_models import MT5Tick
     from datetime import datetime as _dt, timezone as _tz
 
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    rows = []
+    for t in batch.ticks:
+        rows.append({
+            "tick_time_msc": int(t.time_msc),
+            "tick_time_utc": _dt.fromtimestamp(t.time_msc / 1000.0, tz=_tz.utc),
+            "symbol": batch.symbol,
+            "bid": float(t.bid),
+            "ask": float(t.ask),
+            "last": (None if t.last is None else float(t.last)),
+            "volume_real": (None if t.volume_real is None else float(t.volume_real)),
+            "flags": int(t.flags),
+            "content_hash": _tick_content_hash(t),
+            "broker": batch.broker,
+            "account": batch.account,
+            "daemon_id": bridge_daemon_id,
+        })
+
     inserted = 0
     duplicates = 0
     errors = 0
     latest_msc: int | None = None
 
-    for t in batch.ticks:
+    if rows:
         try:
-            content_hash = _tick_content_hash(t)
-            row = MT5Tick(
-                tick_time_msc=int(t.time_msc),
-                tick_time_utc=_dt.fromtimestamp(t.time_msc / 1000.0, tz=_tz.utc),
-                symbol=batch.symbol,
-                bid=float(t.bid),
-                ask=float(t.ask),
-                last=(None if t.last is None else float(t.last)),
-                volume_real=(None if t.volume_real is None else float(t.volume_real)),
-                flags=int(t.flags),
-                content_hash=content_hash,
-                broker=batch.broker,
-                account=batch.account,
-                daemon_id=bridge_daemon_id,
+            stmt = (
+                sqlite_insert(MT5Tick)
+                .values(rows)
+                .on_conflict_do_nothing(
+                    index_elements=["symbol", "content_hash"]
+                )
             )
-            db.add(row)
+            result = db.execute(stmt)
             db.commit()
-            inserted += 1
-            if latest_msc is None or t.time_msc > latest_msc:
-                latest_msc = t.time_msc
+
+            inserted = max(int(result.rowcount or 0), 0)
+            duplicates = len(rows) - inserted
+
+            # Preserve existing response semantics as closely as possible.
+            # A duplicate-only batch returns latest_msc=None; the daemon already
+            # treats HTTP 2xx as acknowledgement of the complete chunk.
+            if inserted:
+                latest_msc = max(r["tick_time_msc"] for r in rows)
+
         except Exception as exc:
             db.rollback()
-            # Uniqueness violation on (symbol, content_hash) → duplicate
-            if "unique" in str(exc).lower() or "UNIQUE" in str(exc):
-                duplicates += 1
-            else:
-                errors += 1
-                if errors <= 3:
-                    log.warning("[bridge/ticks/receive] insert failed: %s", exc)
+            log.exception("[bridge/ticks/receive] bulk insert failed")
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=500,
+                detail="tick batch persistence failed",
+            ) from exc
 
     if inserted or duplicates or errors:
         log.info("[bridge/ticks/receive] %s [%s]: inserted=%d dup=%d err=%d latest_msc=%s",
