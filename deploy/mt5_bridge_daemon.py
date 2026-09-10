@@ -861,6 +861,7 @@ def main():
     last_heartbeat = 0
     last_candle_push = 0
     last_tick_push = 0
+    last_order_poll = 0
     try:
         while _running:
             now = time.time()
@@ -889,28 +890,31 @@ def main():
             # that monitor threads dropped mid-run.
             maybe_periodic_reconcile()
 
-            # Pull pending orders
-            orders = fetch_pending()
-            if orders:
-                log.info("Found %d pending order(s)", len(orders))
-            for o in orders:
-                oid = o["id"]
-                # Try to claim atomically
-                if not claim(oid):
-                    log.info("Order %d already claimed by another daemon — skipping", oid)
-                    continue
-                # Execute on MT5
-                try:
-                    result = execute_order(o)
-                except Exception as exc:
-                    result = {"status": "FAILED", "error": f"daemon exception: {exc}"}
-                log.info("Order %d result: %s", oid, result)
-                # Report back to VPS
-                report(oid, result)
+            # Poll execution queue independently from the fast market-data loop.
+            # POLL_SEC remains the order-poll cadence; tick capture may run faster.
+            if now - last_order_poll >= POLL_SEC:
+                orders = fetch_pending()
+                if orders:
+                    log.info("Found %d pending order(s)", len(orders))
+                for o in orders:
+                    oid = o["id"]
+                    # Try to claim atomically
+                    if not claim(oid):
+                        log.info("Order %d already claimed by another daemon - skipping", oid)
+                        continue
+                    # Execute on MT5
+                    try:
+                        result = execute_order(o)
+                    except Exception as exc:
+                        result = {"status": "FAILED", "error": f"daemon exception: {exc}"}
+                    log.info("Order %d result: %s", oid, result)
+                    # Report back to VPS
+                    report(oid, result)
 
-            # Sleep until next poll (interrupt-friendly)
-            sleep_until = now + POLL_SEC
-            while _running and time.time() < sleep_until:
+                last_order_poll = now
+
+            # Fast scheduler tick. Individual jobs enforce their own cadence.
+            if _running:
                 time.sleep(1)
     finally:
         mt5_shutdown()
