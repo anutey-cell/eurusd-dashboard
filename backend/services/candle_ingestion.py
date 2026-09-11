@@ -2,16 +2,18 @@
 Candle Ingestion — Recurring Top-Up
 ====================================
 
-Runs periodically to keep `historical_candles` fresh. Uses TwelveData
-(same provider the live scanner already uses successfully) as the
-primary source; falls back to TradingView if configured.
+Runs periodically to keep `historical_candles` fresh. The production cloud
+continuity path prefers true XAU/USD spot candles and fails closed rather
+than silently substituting a stale or materially different instrument.
 
-Why: the TradingView-only backfill (services/realdata_backfill.py)
-depends on tvDatafeed sign-in which has been failing silently since
-2026-05-26. Result: historical_candles went 2 months stale while the
-live scanner (also TwelveData) kept working — creating a split-brain
-where verdicts run on live ticks but any lookback feature reads May
-data.
+Provider order for recurring VPS pulls:
+  1. Twelve Data XAU/USD (primary cloud spot source)
+  2. TradingView OANDA:XAUUSD (independent spot fallback, with retries)
+
+MT5 bars arrive separately via the Windows bridge and naturally win the
+freshness race when the laptop is online. Yahoo GC=F remains useful as a
+futures/context feed, but it is deliberately NOT persisted as XAU/USD spot
+history by this module.
 
 This module is:
   1. Idempotent — inserts are gated on unique (instrument, timeframe,
@@ -19,8 +21,10 @@ This module is:
   2. Bounded — pulls only N most-recent bars per call (default 200),
      enough to fill any gap up to a week without paying to re-fetch
      historical.
-  3. Silent by design — errors log at WARN, never raise; the daily
-     backfill_historical_candles() job still handles bulk history.
+  3. Freshness-gated — a provider payload must contain a sufficiently recent
+     closed bar before it can enter the signal database.
+  4. Silent by design — errors log at WARN, never raise out of the scheduler;
+     the freshness sentinel remains responsible for operator alerting.
 """
 from __future__ import annotations
 
@@ -80,77 +84,128 @@ def _fetch_twelvedata(pair: str, interval: str, lookback: int) -> list:
 
 
 def _fetch_tradingview(pair: str, interval: str, lookback: int) -> list:
-    """Fetch via TradingView (free, unlimited). Returns [] on failure."""
+    """Fetch via TradingView. Returns [] on failure."""
     from services.tradingview_provider import get_tv_candles
     r = get_tv_candles(pair, timeframe=interval, limit=lookback)
     return r or []
 
 
-def _fetch_yahoo(pair: str, interval: str, lookback: int) -> list:
-    """Fetch via Yahoo GC=F gold futures (free, unlimited). Returns [] on failure."""
-    from services.yahoo_provider import get_yahoo_candles
-    r = get_yahoo_candles(pair, timeframe=interval, limit=lookback)
-    return r or []
-
-
-# TV retry policy — the anonymous tvDatafeed session drops occasionally.
-# Retry with short backoffs before giving up and falling to Yahoo.
+# TV retry policy — anonymous/authenticated tvDatafeed sessions can drop.
+# Keep retries short: Twelve Data has already been attempted before we get here.
 _TV_RETRY_BACKOFFS_S: list[float] = [1.0, 3.0]
+
+
+def _candle_time_utc(candle) -> Optional[datetime]:
+    """Extract a candle timestamp from dict/Pydantic shapes and normalise UTC."""
+    raw = candle.get("time") if isinstance(candle, dict) else getattr(candle, "time", None)
+    if isinstance(raw, str):
+        try:
+            raw = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(raw, datetime):
+        return None
+    return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+
+
+def _payload_fresh(candles: list, interval: str,
+                   now: Optional[datetime] = None) -> tuple[bool, str]:
+    """Return whether a provider payload is recent enough for the signal DB.
+
+    The thresholds intentionally reuse the production freshness sentinel's
+    per-timeframe tolerances. During the market's weekend closure we accept
+    the latest completed bars because no newer bar should exist.
+    """
+    if not candles:
+        return False, "empty payload"
+
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    from services.data_freshness import STALENESS_MIN_BY_TF, _is_weekend_closed
+
+    times = [ts for ts in (_candle_time_utc(c) for c in candles) if ts is not None]
+    if not times:
+        return False, "payload has no parseable candle timestamps"
+
+    latest = max(times)
+    if _is_weekend_closed(now):
+        return True, f"market closed; latest={latest.isoformat()}"
+
+    threshold_min = STALENESS_MIN_BY_TF.get(interval.upper(), 60)
+    age_min = max(0.0, (now - latest).total_seconds() / 60.0)
+    if age_min <= threshold_min:
+        return True, f"latest age={age_min:.1f}m <= {threshold_min}m"
+
+    return False, (
+        f"stale latest={latest.isoformat()} age={age_min:.1f}m "
+        f"> threshold={threshold_min}m"
+    )
 
 
 def _fetch_with_fallback(pair: str, interval: str,
                           lookback: int) -> tuple[list, str]:
-    """
-    Ingest fallback chain (per operator brief 2026-08-11):
+    """Fetch a FRESH spot payload using the production cloud fallback chain.
 
-      1. TradingView OANDA:XAUUSD    (spot, retry on transient drops)
-      2. Yahoo GC=F                   (gold futures, ~$5-10 basis vs spot)
+    MT5 bars are pushed separately by the Windows bridge; they are not pulled
+    here. If MT5 is offline, the VPS tries:
 
-    Note: MT5 bars arrive via a separate PUSH from the laptop daemon at
-    routers/bridge.py POST /candles/receive — they don't need to be pulled
-    here. When the daemon is running, MT5 bars land with source='mt5' and
-    win the freshness race naturally.
+      1. Twelve Data XAU/USD
+      2. TradingView OANDA:XAUUSD (with bounded retries)
 
-    Raises RuntimeError only when BOTH providers are exhausted so the
-    freshness sentinel gets a clear error text.
+    Raw Yahoo GC=F is intentionally excluded from this XAU/USD spot history
+    path. A futures proxy may be used by research/context layers, but it must
+    never silently become the price series used for spot entries, stops and
+    targets.
+
+    Raises RuntimeError only when no fresh spot provider is available so the
+    freshness sentinel receives an actionable root-cause string.
     """
     from services.tradingview_provider import invalidate_cache as _tv_invalidate
 
-    last_exc: Optional[Exception] = None
+    failures: list[str] = []
 
-    # 1. TradingView with retries
-    for attempt, backoff in enumerate([0.0] + _TV_RETRY_BACKOFFS_S):
+    # 1. Twelve Data — configured production cloud spot source.
+    try:
+        candles = _fetch_twelvedata(pair, interval, lookback)
+        ok, detail = _payload_fresh(candles, interval)
+        if ok:
+            return candles, "twelvedata"
+        failures.append(f"TwelveData rejected: {detail}")
+        log.warning("[candle_ingestion] %s %s TwelveData rejected: %s",
+                    pair, interval, detail)
+    except Exception as exc:
+        failures.append(f"TwelveData {type(exc).__name__}: {exc}")
+        log.warning("[candle_ingestion] %s %s TwelveData failed: %s: %s",
+                    pair, interval, type(exc).__name__, exc)
+
+    # 2. TradingView OANDA:XAUUSD — independent spot fallback.
+    for attempt, backoff in enumerate([0.0] + _TV_RETRY_BACKOFFS_S, start=1):
         if backoff > 0:
             time.sleep(backoff)
             _tv_invalidate(pair)
         try:
             candles = _fetch_tradingview(pair, interval, lookback)
-            if candles:
+            ok, detail = _payload_fresh(candles, interval)
+            if ok:
+                if attempt > 1 or failures:
+                    log.info("[candle_ingestion] %s %s using TradingView fallback "
+                             "after TwelveData/unhealthy source", pair, interval)
                 return candles, "tradingview"
-            last_exc = RuntimeError(
-                f"TradingView empty for {pair} {interval} (attempt {attempt+1})"
-            )
+            failures.append(f"TradingView attempt {attempt} rejected: {detail}")
+            log.warning("[candle_ingestion] %s %s TradingView attempt %d rejected: %s",
+                        pair, interval, attempt, detail)
         except Exception as exc:
-            last_exc = exc
-            log.debug("[candle_ingestion] TV attempt %d for %s %s: %s",
-                        attempt + 1, pair, interval, exc)
+            failures.append(
+                f"TradingView attempt {attempt} {type(exc).__name__}: {exc}"
+            )
+            log.warning("[candle_ingestion] %s %s TradingView attempt %d failed: %s: %s",
+                        pair, interval, attempt, type(exc).__name__, exc)
 
-    # 2. Yahoo GC=F fallback (futures, not spot — flagged for downstream)
-    try:
-        candles = _fetch_yahoo(pair, interval, lookback)
-        if candles:
-            log.info("[candle_ingestion] %s %s: falling back to Yahoo GC=F "
-                     "(TV exhausted)", pair, interval)
-            return candles, "yahoo"
-    except Exception as exc:
-        last_exc = exc
-        log.debug("[candle_ingestion] Yahoo fallback for %s %s: %s",
-                    pair, interval, exc)
-
-    # Both providers exhausted — raise clean error text
+    summary = " | ".join(failures[-6:])
     raise RuntimeError(
-        f"All free-tier providers exhausted for {pair} {interval} "
-        f"(TV + Yahoo): {last_exc}"
+        f"No fresh XAU/USD spot provider for {pair} {interval}. {summary}"
     )
 
 
