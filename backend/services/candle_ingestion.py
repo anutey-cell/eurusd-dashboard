@@ -90,6 +90,13 @@ def _fetch_tradingview(pair: str, interval: str, lookback: int) -> list:
     return r or []
 
 
+def _fetch_yahoo(pair: str, interval: str, lookback: int) -> list:
+    """Fetch Yahoo GC=F for the independent futures-context table only."""
+    from services.yahoo_provider import get_yahoo_candles
+    r = get_yahoo_candles(pair, timeframe=interval, limit=lookback)
+    return r or []
+
+
 # TV retry policy — anonymous/authenticated tvDatafeed sessions can drop.
 # Keep retries short: Twelve Data has already been attempted before we get here.
 _TV_RETRY_BACKOFFS_S: list[float] = [1.0, 3.0]
@@ -325,4 +332,78 @@ def top_up_recent(db: Session, pair: str = "xauusd",
     return report
 
 
-__all__ = ["top_up_recent"]
+def _persist_gc_bars(db: Session, tf: str, candles: list) -> dict:
+    """Persist Yahoo GC=F into its independent futures table, never XAU/USD."""
+    from db_models import GcFuturesBar
+    inserted, skipped, errors = 0, 0, 0
+    for c in candles:
+        try:
+            ts = _field(c, "time")
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if ts is None:
+                errors += 1
+                continue
+            if not getattr(ts, "tzinfo", None):
+                ts = ts.replace(tzinfo=timezone.utc)
+            row = GcFuturesBar(
+                contract="GC=F",
+                timeframe=tf,
+                candle_time=ts,
+                open=float(_field(c, "open", 0.0)),
+                high=float(_field(c, "high", 0.0)),
+                low=float(_field(c, "low", 0.0)),
+                close=float(_field(c, "close", 0.0)),
+                volume=float(_field(c, "volume", 0) or 0),
+                source="yahoo",
+            )
+            db.add(row)
+            try:
+                db.commit()
+                inserted += 1
+            except Exception:
+                db.rollback()
+                skipped += 1
+        except Exception:
+            db.rollback()
+            errors += 1
+    return {
+        "inserted": inserted,
+        "skipped_duplicate": skipped,
+        "errors": errors,
+        "fetched": len(candles),
+    }
+
+
+def ingest_gc_futures(db: Session, timeframes: tuple = ("M5", "M15", "H1"),
+                      lookback: int = 100) -> dict:
+    """Refresh the independent GC=F context series expected by the scheduler.
+
+    This compatibility function is deliberately separate from `top_up_recent`: GC
+    futures may support basis/context research, but can never satisfy XAU/USD spot
+    freshness or be persisted into `historical_candles`.
+    """
+    report = {
+        "pair": "GC=F",
+        "timeframes": {},
+        "totals": {"inserted": 0, "skipped": 0, "errors": 0},
+    }
+    for tf in timeframes:
+        try:
+            candles = _fetch_yahoo("xauusd", tf, lookback)
+            if not candles:
+                report["timeframes"][tf] = {"note": "yahoo empty"}
+                continue
+            r = _persist_gc_bars(db, tf, candles)
+            report["timeframes"][tf] = r
+            report["totals"]["inserted"] += r["inserted"]
+            report["totals"]["skipped"] += r["skipped_duplicate"]
+            report["totals"]["errors"] += r["errors"]
+        except Exception as exc:
+            log.warning("[gc_ingest] %s failed: %s", tf, exc)
+            report["timeframes"][tf] = {"error": str(exc)}
+            report["totals"]["errors"] += 1
+    return report
+
+
+__all__ = ["top_up_recent", "ingest_gc_futures"]
