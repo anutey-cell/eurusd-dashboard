@@ -20,7 +20,7 @@ Ownership audit branch: `chatgpt/takeover-safety-audit`
 3. PREDATOR is an independent specialist engine with its own execution manager; repository default keeps its execution disabled/shadow-only.
 4. Generic broker REST execution provider is an inert skeleton and cannot place broker orders.
 5. The historical direct/local MT5 `place_demo_market_order()` path is explicitly disabled by takeover policy.
-6. The intended executable order flow is therefore `PendingExecution -> hardened Windows MT5 bridge -> MetaTrader5`.
+6. The intended executable order flow is therefore `PendingExecution -> atomic claim-v2 -> hardened Windows MT5 bridge -> MetaTrader5`.
 
 ## Confirmed safety controls
 
@@ -80,11 +80,22 @@ Branch mitigation: takeover bootstrap replaces `place_demo_market_order()` with 
 
 Status: **MITIGATED IN BRANCH; CI COVERED; RUNTIME DEPLOYMENT PENDING.**
 
+### S6 — historical bridge claim was SELECT-then-UPDATE, not truly atomic
+
+Finding: `/bridge/claim/{id}` first read `PENDING`, then updated the row. Two daemons racing before either commit could both observe PENDING and both proceed to execution.
+
+Branch mitigation:
+- `routers/bridge_claim_safety.py` registers `/bridge/claim-v2/{id}` on the existing bridge router.
+- Claim-v2 uses one conditional database UPDATE with `id`, `status='PENDING'`, and unexpired TTL in the WHERE clause. Exactly one claimant can transition the row to `EXECUTING`; all others receive HTTP 409.
+- The hardened Windows launcher replaces the legacy daemon's claim function so executable orders use claim-v2 only.
+
+Status: **MITIGATED IN BRANCH; ROUTE REGISTRATION TESTED; RUNTIME CUTOVER PENDING.**
+
 ## Verification assets added
 
 - `backend/tests/test_takeover_execution_safety.py` — fail-closed governor, package bootstrap, reservation cleanup, legacy-executor block, and direct/local MT5 block tests.
-- `backend/tests/test_bridge_safety.py` — login/server/demo/terminal guard tests.
-- `backend/scripts/takeover_safety_check.py` — read-only post-deploy assertion that all takeover safety patches are installed and dangerous live/generic switches remain off.
+- `backend/tests/test_bridge_safety.py` — login/server/demo/terminal guard tests plus atomic claim-v2 route registration.
+- `backend/scripts/takeover_safety_check.py` — read-only post-deploy assertion that all takeover safety patches and atomic claim route are installed and dangerous live/generic switches remain off.
 - `.github/workflows/safety-tests.yml` — non-deploying CI for takeover safety tests, syntax checks and PowerShell parser validation.
 - `deploy/takeover_readonly_audit.py` — redacted read-only runtime collector.
 - `docs/TAKEOVER_DEPLOYMENT_RUNBOOK.md` — deployment, demo smoke-test and rollback procedure.
@@ -129,7 +140,7 @@ Operational ownership requires:
 1. VPS runtime HEAD/config/services reconciled with this repository.
 2. Windows bridge runtime/account state independently verified and hardened launcher cut over on DEMO.
 3. Safety PR CI green at final head and reviewed before merge.
-4. Signal -> grading -> notification -> queue -> bridge result lifecycle proven end-to-end in demo/shadow mode.
+4. Signal -> grading -> notification -> queue -> atomic claim -> bridge result lifecycle proven end-to-end in demo/shadow mode.
 5. Current data-source freshness and fallback paths audited.
 6. Post-deploy safety check, health and rollback checks completed.
 
