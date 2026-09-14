@@ -1,0 +1,60 @@
+name: Predator Off-Host Revalidation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/scripts/export_predator_history.py'
+      - 'backend/scripts/predator_offline_revalidation.py'
+      - '.github/workflows/predator-offhost-revalidation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  revalidate:
+    name: Export history then replay on CI runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Export candle snapshot from VPS and copy to runner
+        env:
+          DO_HOST: ${{ secrets.DO_HOST }}
+          DO_USER: ${{ secrets.DO_USER }}
+          DO_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DO_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          SSH="ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          SCP="scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+          $SSH "$DO_USER@$DO_HOST" 'set -eu
+            cd /opt/xauusd
+            git fetch origin main
+            git reset --hard origin/main
+            docker inspect --format="backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" xauusd-backend
+            docker cp backend/scripts/export_predator_history.py xauusd-backend:/tmp/export_predator_history.py
+            docker exec -e PYTHONPATH=/app -w /app xauusd-backend python /tmp/export_predator_history.py /tmp/predator_history.csv.gz
+            docker cp xauusd-backend:/tmp/predator_history.csv.gz /tmp/predator_history.csv.gz
+          '
+          $SCP "$DO_USER@$DO_HOST:/tmp/predator_history.csv.gz" ./predator_history.csv.gz
+          $SSH "$DO_USER@$DO_HOST" 'rm -f /tmp/predator_history.csv.gz; docker exec xauusd-backend rm -f /tmp/predator_history.csv.gz /tmp/export_predator_history.py || true'
+          ls -lh predator_history.csv.gz
+
+      - name: Run corrected full-history replay off-host
+        working-directory: backend
+        run: python scripts/predator_offline_revalidation.py ../predator_history.csv.gz
