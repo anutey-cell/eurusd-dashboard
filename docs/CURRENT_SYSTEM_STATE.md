@@ -16,10 +16,11 @@ Ownership audit branch: `chatgpt/takeover-safety-audit`
 ## Authoritative execution architecture
 
 1. Mandate Strategist is the configured authoritative strategist path when `USE_MANDATE_STRATEGIST=true`.
-2. Legacy `auto_executor.py` is a back-compat/development path. The takeover branch now blocks its executable entry point while preserving dry-run/research use.
+2. Legacy `auto_executor.py` is a back-compat/development path. The takeover branch blocks its executable entry point while preserving dry-run/research use.
 3. PREDATOR is an independent specialist engine with its own execution manager; repository default keeps its execution disabled/shadow-only.
 4. Generic broker REST execution provider is an inert skeleton and cannot place broker orders.
-5. Actual executable order flow is `PendingExecution -> Windows MT5 bridge -> MetaTrader5`.
+5. The historical direct/local MT5 `place_demo_market_order()` path is explicitly disabled by takeover policy.
+6. The intended executable order flow is therefore `PendingExecution -> hardened Windows MT5 bridge -> MetaTrader5`.
 
 ## Confirmed safety controls
 
@@ -32,7 +33,7 @@ Ownership audit branch: `chatgpt/takeover-safety-audit`
 
 ## Manipulation / accumulation capability
 
-The repository already implements an ICT-style `Accumulation -> Manipulation -> Distribution` framework in `services/ict_advanced.py`, including Judas-swing/session liquidity-sweep and reversal detection. Validation—not greenfield implementation—is the next research task: measure false positives/negatives and determine whether Track-A quote-level microstructure improves timing and confirmation.
+The repository already implements an ICT-style `Accumulation -> Manipulation -> Distribution` framework in `services/ict_advanced.py`, including Judas-swing/session liquidity-sweep and reversal detection. The repository also contains `services/four_hour_manipulation.py`; its predictive value still requires separate validation. Validation—not greenfield implementation—is the next research task: measure false positives/negatives and determine whether Track-A quote-level microstructure improves timing and confirmation.
 
 ## Takeover safety findings and mitigations
 
@@ -40,7 +41,7 @@ The repository already implements an ICT-style `Accumulation -> Manipulation -> 
 
 Finding: Strategist and PREDATOR caller exception handlers could log a governor exception and continue.
 
-Branch mitigation: `services/execution_safety_bootstrap.py` wraps `reserve_capacity()` and `check_new_order()` at the shared governor boundary. Unexpected errors now return explicit denials with `within_limit=false`, `state_unknown=true`, and zero remaining capacity. This means existing caller exception handlers no longer receive ordinary governor failures as exceptions.
+Branch mitigation: `services/execution_safety_bootstrap.py` wraps `reserve_capacity()` and `check_new_order()` at the shared governor boundary. Unexpected errors now return explicit denials with `within_limit=false`, `state_unknown=true`, and zero remaining capacity. Existing caller fail-open exception handlers therefore no longer receive ordinary governor failures as exceptions.
 
 Status: **MITIGATED IN BRANCH; CI COVERED; RUNTIME DEPLOYMENT PENDING.**
 
@@ -71,15 +72,24 @@ Branch mitigation: the takeover bootstrap wraps `_maybe_enqueue_demo_order()`, i
 
 Status: **MITIGATED IN BRANCH; CI COVERED; RUNTIME DEPLOYMENT PENDING.**
 
+### S5 — alternate direct/local MT5 execution path bypassed the hardened bridge
+
+Finding: `/api/v1/mt5/demo-order` calls `services.mt5_provider.place_demo_market_order()` directly. Despite its historical “demo” naming, the provider's account-mode gate can admit a live account when `LIVE_TRADING_AUTHORIZED=true`, and the function ultimately calls `mt5.order_send()` locally. This is an alternate execution authority outside the hardened bridge path.
+
+Branch mitigation: takeover bootstrap replaces `place_demo_market_order()` with a fail-closed wrapper raising `DIRECT_LOCAL_MT5_EXECUTION_DISABLED`. This also prevents the legacy local auto-executor path from bypassing the queue/bridge architecture. No signal-generation or research logic is affected.
+
+Status: **MITIGATED IN BRANCH; CI COVERED; RUNTIME DEPLOYMENT PENDING.**
+
 ## Verification assets added
 
-- `backend/tests/test_takeover_execution_safety.py` — fail-closed governor, package bootstrap, reservation cleanup and legacy-executor block tests.
+- `backend/tests/test_takeover_execution_safety.py` — fail-closed governor, package bootstrap, reservation cleanup, legacy-executor block, and direct/local MT5 block tests.
 - `backend/tests/test_bridge_safety.py` — login/server/demo/terminal guard tests.
-- `.github/workflows/safety-tests.yml` — non-deploying CI for takeover safety tests, Python compilation and PowerShell parser validation.
+- `backend/scripts/takeover_safety_check.py` — read-only post-deploy assertion that all takeover safety patches are installed and dangerous live/generic switches remain off.
+- `.github/workflows/safety-tests.yml` — non-deploying CI for takeover safety tests, syntax checks and PowerShell parser validation.
 - `deploy/takeover_readonly_audit.py` — redacted read-only runtime collector.
 - `docs/TAKEOVER_DEPLOYMENT_RUNBOOK.md` — deployment, demo smoke-test and rollback procedure.
 
-Latest completed safety CI on the takeover branch was green before this status update; every subsequent branch commit is required to pass the same workflow before merge.
+Every branch commit must pass the safety workflow before merge.
 
 ## Data / research state
 
@@ -98,6 +108,12 @@ python deploy/takeover_readonly_audit.py > takeover_runtime_audit.txt
 
 The collector reports git/runtime/config switch state while redacting secrets. It does not restart services, alter databases, or place orders.
 
+After backend deployment, run inside the backend environment/container:
+
+```bash
+python scripts/takeover_safety_check.py
+```
+
 For the Windows bridge, first validate the proposed Scheduled Task change without mutation:
 
 ```powershell
@@ -115,6 +131,6 @@ Operational ownership requires:
 3. Safety PR CI green at final head and reviewed before merge.
 4. Signal -> grading -> notification -> queue -> bridge result lifecycle proven end-to-end in demo/shadow mode.
 5. Current data-source freshness and fallback paths audited.
-6. Post-deploy health and rollback checks completed.
+6. Post-deploy safety check, health and rollback checks completed.
 
 Until those gates pass, no new live-capital authority should be enabled.
