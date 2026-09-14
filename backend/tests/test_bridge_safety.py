@@ -61,16 +61,20 @@ def test_terminal_guard_blocks_disconnected_or_trade_disabled():
     assert verify_terminal(SimpleNamespace(connected=True, trade_allowed=True)).ok is True
 
 
-def test_atomic_bridge_claim_route_is_registered():
+def test_atomic_bridge_claim_routes_replace_legacy_and_register_v2():
     import routers
     from routers import bridge
 
     assert routers.BRIDGE_ATOMIC_CLAIM_INSTALLED is True
-    # bridge.router already carries APIRouter(prefix="/bridge"), so the route
-    # object stores the prefixed path. main.py later adds /api/v1.
-    matching = [
-        route for route in bridge.router.routes
-        if getattr(route, "path", None) == "/bridge/claim-v2/{order_id}"
+    paths = [
+        (getattr(route, "path", None), set(getattr(route, "methods", set()) or set()))
+        for route in bridge.router.routes
     ]
-    assert len(matching) == 1
-    assert "POST" in matching[0].methods
+    legacy = [methods for path, methods in paths if path == "/bridge/claim/{order_id}"]
+    v2 = [methods for path, methods in paths if path == "/bridge/claim-v2/{order_id}"]
+
+    # Exactly one POST handler remains for the legacy path: the atomic replacement.
+    assert len(legacy) == 1
+    assert "POST" in legacy[0]
+    assert len(v2) == 1
+    assert "POST" in v2[0]
