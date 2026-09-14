@@ -2,8 +2,9 @@
 """Read-only post-deploy verification for takeover execution hardening.
 
 Safe to run inside the backend container. Exits non-zero if the takeover
-safety bootstrap/atomic bridge route is not installed or if obviously dangerous
-generic/live execution switches are enabled unexpectedly.
+safety bootstrap/atomic bridge route is not installed, control-plane secrets
+are placeholders, or obviously dangerous live/generic execution switches are
+enabled unexpectedly.
 
 This script does not query or mutate trading tables and never places orders.
 """
@@ -23,6 +24,7 @@ if str(BACKEND_ROOT) not in sys.path:
 import services
 import routers
 from config import settings
+from middleware import _strong_operator_key
 
 
 def main() -> int:
@@ -44,6 +46,8 @@ def main() -> int:
     }
 
     bridge_atomic_claim = bool(getattr(routers, "BRIDGE_ATOMIC_CLAIM_INSTALLED", False))
+    operator_key_secure = _strong_operator_key(settings) is not None
+    bridge_secret_set = bool(str(getattr(settings, "mt5_bridge_shared_secret", "") or "").strip())
 
     failures: list[str] = []
     for key, expected in expected_patches.items():
@@ -51,6 +55,10 @@ def main() -> int:
             failures.append(f"takeover patch {key} expected {expected}, got {patch_state.get(key)!r}")
     if not bridge_atomic_claim:
         failures.append("atomic bridge claim-v2 route is not installed")
+    if not operator_key_secure:
+        failures.append("operator API key is missing or still a placeholder")
+    if switches["mt5_bridge_enabled"] and not bridge_secret_set:
+        failures.append("MT5 bridge is enabled but MT5_BRIDGE_SHARED_SECRET is empty")
 
     # Takeover policy: generic/live account execution must stay off. Demo bridge
     # may legitimately be enabled, so it is reported but not treated as failure.
@@ -65,6 +73,8 @@ def main() -> int:
         "ok": not failures,
         "takeover_safety_state": patch_state,
         "atomic_bridge_claim_installed": bridge_atomic_claim,
+        "operator_api_key_secure": operator_key_secure,
+        "bridge_secret_set": bridge_secret_set,
         "execution_switches": switches,
         "failures": failures,
     }
