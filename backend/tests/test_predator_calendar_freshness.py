@@ -18,9 +18,9 @@ def _friday_reference_bars():
     return bars
 
 
-def _fire(bar_time="2026-09-14T13:35:00"):
+def _fire(bar_time="2026-09-14T13:35:00", archetype="PDL_BREAK"):
     return pe.PredatorSignal(
-        archetype="PDL_BREAK",
+        archetype=archetype,
         direction="SELL",
         state="FIRE",
         entry=95.0,
@@ -112,7 +112,7 @@ def test_alert_suppresses_pre_fix_performance_claims():
         regime={"direction": "range", "volatility": "expanded", "session": "NY_OPEN"},
     )
 
-    assert "POST-FIX VALIDATION PENDING" in msg
+    assert "QUARANTINED" in msg
     assert "Historical Win Rate: —" in msg
     assert "Historical Expectancy: —" in msg
     assert "Profit Factor: —" in msg
@@ -172,3 +172,45 @@ def test_evaluate_boundary_drops_stale_fire_before_scheduler(monkeypatch):
     )
 
     assert pe.evaluate(None) == []
+
+
+def test_quarantined_pdl_fire_is_shadow_recorded_then_withheld(monkeypatch):
+    sig = _fire(archetype="PDL_BREAK")
+    latest = datetime(2026, 9, 14, 13, 35)
+    bars = [_bar(latest - timedelta(minutes=5), 96.0), _bar(latest, 95.0)]
+    recorded = []
+
+    monkeypatch.setattr(pe, "_legacy_evaluate", lambda db: [sig])
+    monkeypatch.setattr(pe, "_legacy_load_recent", lambda db, tf, n: bars)
+    monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5: (True, "ok"))
+    monkeypatch.setattr(pe, "_record_quarantined_shadow", lambda db, signal: recorded.append(signal.archetype))
+
+    assert pe.evaluate(object()) == []
+    assert recorded == ["PDL_BREAK"]
+
+
+def test_quarantined_asian_fire_is_shadow_recorded_then_withheld(monkeypatch):
+    sig = _fire(archetype="ASIAN_BREAKDOWN")
+    latest = datetime(2026, 9, 14, 13, 35)
+    bars = [_bar(latest - timedelta(minutes=5), 96.0), _bar(latest, 95.0)]
+    recorded = []
+
+    monkeypatch.setattr(pe, "_legacy_evaluate", lambda db: [sig])
+    monkeypatch.setattr(pe, "_legacy_load_recent", lambda db, tf, n: bars)
+    monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5: (True, "ok"))
+    monkeypatch.setattr(pe, "_record_quarantined_shadow", lambda db, signal: recorded.append(signal.archetype))
+
+    assert pe.evaluate(object()) == []
+    assert recorded == ["ASIAN_BREAKDOWN"]
+
+
+def test_nonquarantined_fire_continues_downstream(monkeypatch):
+    sig = _fire(archetype="VOL_CONTINUATION")
+    latest = datetime(2026, 9, 14, 13, 35)
+    bars = [_bar(latest - timedelta(minutes=5), 96.0), _bar(latest, 95.0)]
+
+    monkeypatch.setattr(pe, "_legacy_evaluate", lambda db: [sig])
+    monkeypatch.setattr(pe, "_legacy_load_recent", lambda db, tf, n: bars)
+    monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5: (True, "ok"))
+
+    assert pe.evaluate(object()) == [sig]
