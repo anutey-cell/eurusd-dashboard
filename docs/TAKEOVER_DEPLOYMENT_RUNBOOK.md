@@ -12,16 +12,17 @@ This runbook deploys the takeover hardening without changing strategy thresholds
 
 ## 2. What this hardening changes
 
-Backend service import installs four defence-in-depth controls:
+Backend hardening installs four defence-in-depth execution controls:
 
 1. Portfolio-governor exceptions return explicit execution rejections rather than escaping into caller fail-open handlers.
 2. Strategist reservations created before a later refusal are released immediately if still `RESERVED`.
 3. The historical legacy autonomous executor is blocked from executable use; its dry-run/research paths remain available.
-4. Direct/local `services.mt5_provider.place_demo_market_order()` execution is blocked, including `/api/v1/mt5/demo-order`, so execution authority is funnelled through `PendingExecution -> hardened Windows bridge`.
+4. Direct/local `services.mt5_provider.place_demo_market_order()` execution is blocked, including `/api/v1/mt5/demo-order`, so execution authority is funnelled through the bridge.
 
-Windows bridge hardening is a separate cutover:
+Bridge hardening adds two further controls:
 
-- `deploy/mt5_bridge_daemon_hardened.py` re-verifies active MT5 login, exact server, DEMO trade mode, terminal connectivity/trading permission, and XAU/USD symbol immediately before each execution attempt.
+5. `/api/v1/bridge/claim-v2/{id}` claims an order with one conditional database UPDATE. Racing daemons cannot both transition the same row from `PENDING` to `EXECUTING`.
+6. `deploy/mt5_bridge_daemon_hardened.py` uses claim-v2 and re-verifies active MT5 login, exact server, DEMO trade mode, terminal connectivity/trading permission, and XAU/USD symbol immediately before each execution attempt.
 
 ## 3. VPS pre-deploy audit
 
@@ -49,7 +50,7 @@ Then run the takeover assertions inside the backend runtime/container:
 python scripts/takeover_safety_check.py
 ```
 
-Required result: `"ok": true`, with all four takeover patches true and `BROKER_EXECUTION_ENABLED=false`, `LIVE_TRADING_AUTHORIZED=false`, `USE_MANDATE_STRATEGIST=true`.
+Required result: `"ok": true`, all four takeover patches true, `atomic_bridge_claim_installed=true`, and `BROKER_EXECUTION_ENABLED=false`, `LIVE_TRADING_AUTHORIZED=false`, `USE_MANDATE_STRATEGIST=true`.
 
 Check backend health and logs for `[takeover-safety]`. Confirm there are no patch-install exceptions.
 
@@ -84,7 +85,8 @@ Required observations:
 - direct `/api/v1/mt5/demo-order` execution returns the takeover safety rejection rather than reaching `order_send`;
 - a simulated governor exception produces an execution denial in tests/logs;
 - a deliberately mismatched MT5 account is rejected locally by the hardened bridge before `order_send`;
-- normal demo queue lifecycle remains `PENDING -> EXECUTING -> ACCEPTED/REJECTED -> CLOSED`;
+- a second/concurrent claim of the same order receives HTTP 409 and cannot execute;
+- normal demo queue lifecycle remains `PENDING -> atomic claim-v2 -> EXECUTING -> ACCEPTED/REJECTED -> CLOSED`;
 - Strategist/PREDATOR signal generation and Telegram/shadow analytics continue independently of the disabled alternate execution paths.
 
 ## 7. Rollback
