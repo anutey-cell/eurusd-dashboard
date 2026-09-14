@@ -1,0 +1,47 @@
+name: Predator Governance Audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/scripts/predator_regime_revalidation.py'
+      - 'backend/scripts/predator_notification_parity_audit.py'
+      - '.github/workflows/predator-governance-audit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  governance-audit:
+    name: Full-history regime + notification parity audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Run read-only Predator governance audits on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+          command_timeout: 25m
+          script: |
+            set -eu
+            cd /opt/xauusd
+            git fetch origin main
+            git reset --hard origin/main
+            echo '=== PREDATOR GOVERNANCE AUDIT ==='
+            printf 'git_head='; git rev-parse HEAD
+            docker inspect --format='backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' xauusd-backend
+
+            docker cp backend/scripts/predator_regime_revalidation.py xauusd-backend:/tmp/predator_regime_revalidation.py
+            echo '=== FULL-HISTORY REGIME REVALIDATION ==='
+            docker exec -e PYTHONPATH=/app -w /app xauusd-backend \
+              python /tmp/predator_regime_revalidation.py
+
+            docker cp backend/scripts/predator_notification_parity_audit.py xauusd-backend:/tmp/predator_notification_parity_audit.py
+            echo '=== NOTIFICATION PARITY AUDIT ==='
+            docker exec -e PYTHONPATH=/app -w /app xauusd-backend \
+              python /tmp/predator_notification_parity_audit.py
+
+            echo '=== GOVERNANCE AUDIT COMPLETE (READ ONLY) ==='
