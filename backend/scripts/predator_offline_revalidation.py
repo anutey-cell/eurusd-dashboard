@@ -3,6 +3,9 @@
 Consumes the gzip CSV produced by export_predator_history.py and replays the
 CURRENT corrected detector functions on a CI runner with ample memory. This
 keeps heavy research computation off the live VPS.
+
+The report also isolates the notification gateway's current RR>=1.2 rule so we
+can determine whether that filter improves or degrades realised expectancy.
 """
 from __future__ import annotations
 
@@ -12,7 +15,6 @@ import json
 import sys
 from bisect import bisect_right
 from collections import defaultdict
-from datetime import datetime
 
 from services import predator_engine as pe
 from services.regime_detector import (
@@ -22,6 +24,7 @@ from services.regime_detector import (
 )
 
 MAX_FORWARD_M5 = 96
+GATE_RR = 1.2
 
 
 def _ts(v):
@@ -154,6 +157,16 @@ def _groups(rows, key):
     return {k: _stats(v) for k, v in sorted(g.items())}
 
 
+def _rr_gate(rows):
+    passed = [r for r in rows if float(r.get("rr", 0.0) or 0.0) >= GATE_RR]
+    rejected = [r for r in rows if float(r.get("rr", 0.0) or 0.0) < GATE_RR]
+    return {
+        f"rr_gte_{GATE_RR}": _stats(passed),
+        f"rr_lt_{GATE_RR}": _stats(rejected),
+        "pass_rate": round(len(passed) / len(rows), 4) if rows else 0.0,
+    }
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: predator_offline_revalidation.py predator_history.csv.gz")
@@ -208,6 +221,7 @@ def main():
         "history_start": m5[0][0].isoformat(),
         "history_end": m5[-1][0].isoformat(),
         "regime_rule": "production favorable iff multiplier >= 0.5",
+        "gateway_rr_rule": f"RR >= {GATE_RR}",
         "same_bar_rule": "SL_FIRST_CONSERVATIVE",
         "replay_horizon_m5_bars": MAX_FORWARD_M5,
         "dedupe": "first unique archetype+XAU_trading_date+key_level",
@@ -221,11 +235,13 @@ def main():
             "overall": _stats(rows),
             "by_regime": _groups(rows, "regime_cell"),
             "by_session": _groups(rows, "session"),
+            "rr_gate_impact": _rr_gate(rows),
         }
         report["production_regime_matched"][arch] = {
             "overall": _stats(mrows),
             "by_regime": _groups(mrows, "regime_cell"),
             "by_session": _groups(mrows, "session"),
+            "rr_gate_impact": _rr_gate(mrows),
         }
     print(json.dumps(report, indent=2, sort_keys=True))
 
