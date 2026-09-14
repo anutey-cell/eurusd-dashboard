@@ -1,11 +1,14 @@
 """Off-host full-history post-fix Predator revalidation.
 
 Consumes the gzip CSV produced by export_predator_history.py and replays the
-CURRENT corrected detector functions on a CI runner with ample memory. This
-keeps heavy research computation off the live VPS.
+CURRENT corrected detector functions on a CI runner with ample memory. Heavy
+research computation stays off the live VPS.
 
-The report also isolates the notification gateway's current RR>=1.2 rule so we
-can determine whether that filter improves or degrades realised expectancy.
+Besides aggregate/regime/RR diagnostics, this report performs a deliberately
+simple chronological 70/30 holdout. It tests only ONE-DIMENSION filters
+(session or regime cell) with minimum samples; no combinatorial threshold
+search is allowed. A candidate is labelled robust only when expectancy is
+positive and PF > 1.0 in BOTH train and holdout.
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ import json
 import sys
 from bisect import bisect_right
 from collections import defaultdict
+from datetime import datetime
 
 from services import predator_engine as pe
 from services.regime_detector import (
@@ -25,6 +29,9 @@ from services.regime_detector import (
 
 MAX_FORWARD_M5 = 96
 GATE_RR = 1.2
+TRAIN_FRACTION = 0.70
+MIN_TRAIN_N = 15
+MIN_HOLDOUT_N = 8
 
 
 def _ts(v):
@@ -167,6 +174,51 @@ def _rr_gate(rows):
     }
 
 
+def _is_positive(stats):
+    pf = stats.get("profit_factor")
+    return (
+        stats.get("n", 0) > 0
+        and stats.get("expectancy_pts", 0.0) > 0.0
+        and (pf is None or pf > 1.0)
+    )
+
+
+def _chronological_holdout(rows, split_time):
+    """Single-dimension candidate validation, deliberately anti-overfit."""
+    train = [r for r in rows if _ts(r["time"]) < split_time]
+    holdout = [r for r in rows if _ts(r["time"]) >= split_time]
+    report = {
+        "split_time": split_time.isoformat(),
+        "train_overall": _stats(train),
+        "holdout_overall": _stats(holdout),
+        "minimum_samples": {"train": MIN_TRAIN_N, "holdout": MIN_HOLDOUT_N},
+        "candidate_filters": [],
+        "robust_candidates": [],
+    }
+
+    for dimension in ("session", "regime_cell"):
+        values = sorted({str(r[dimension]) for r in rows})
+        for value in values:
+            tr = [r for r in train if str(r[dimension]) == value]
+            ho = [r for r in holdout if str(r[dimension]) == value]
+            if len(tr) < MIN_TRAIN_N or len(ho) < MIN_HOLDOUT_N:
+                continue
+            tr_stats = _stats(tr)
+            ho_stats = _stats(ho)
+            robust = _is_positive(tr_stats) and _is_positive(ho_stats)
+            candidate = {
+                "dimension": dimension,
+                "value": value,
+                "train": tr_stats,
+                "holdout": ho_stats,
+                "robust_positive_both": robust,
+            }
+            report["candidate_filters"].append(candidate)
+            if robust:
+                report["robust_candidates"].append(candidate)
+    return report
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: predator_offline_revalidation.py predator_history.csv.gz")
@@ -175,6 +227,8 @@ def main():
     if len(m5) < 800:
         raise SystemExit(f"insufficient M5 history: {len(m5)}")
 
+    split_idx = max(1, min(len(m5)-1, int(len(m5) * TRAIN_FRACTION)))
+    split_time = m5[split_idx][0]
     rsi_times, rsi_vals = _h1_rsi_series(h1)
     regime_times, regime_vals = _precompute_regimes(m15)
 
@@ -225,6 +279,11 @@ def main():
         "same_bar_rule": "SL_FIRST_CONSERVATIVE",
         "replay_horizon_m5_bars": MAX_FORWARD_M5,
         "dedupe": "first unique archetype+XAU_trading_date+key_level",
+        "chronological_holdout": {
+            "train_fraction": TRAIN_FRACTION,
+            "split_time": split_time.isoformat(),
+            "search_space": "single-dimension only: session OR regime_cell",
+        },
         "all_corrected_triggers": {},
         "production_regime_matched": {},
     }
@@ -236,12 +295,14 @@ def main():
             "by_regime": _groups(rows, "regime_cell"),
             "by_session": _groups(rows, "session"),
             "rr_gate_impact": _rr_gate(rows),
+            "holdout": _chronological_holdout(rows, split_time),
         }
         report["production_regime_matched"][arch] = {
             "overall": _stats(mrows),
             "by_regime": _groups(mrows, "regime_cell"),
             "by_session": _groups(mrows, "session"),
             "rr_gate_impact": _rr_gate(mrows),
+            "holdout": _chronological_holdout(mrows, split_time),
         }
     print(json.dumps(report, indent=2, sort_keys=True))
 
