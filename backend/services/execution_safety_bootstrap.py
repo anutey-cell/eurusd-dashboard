@@ -7,7 +7,9 @@ capital-protection and execution-authorisation failures must fail CLOSED.
 The patches are intentionally narrow and reversible:
 - portfolio governor exceptions become explicit rejections;
 - strategist reservations are cleaned up if enqueue refuses/fails after reserve;
-- the legacy autonomous executor is disabled during the takeover period.
+- the legacy autonomous executor is disabled during the takeover period;
+- direct/local MT5 order placement is disabled so executable authority stays on
+  the audited PendingExecution -> hardened bridge path.
 
 The authoritative Mandate Strategist and PREDATOR signal/research logic are not
 changed here. Only unsafe failure behaviour is constrained.
@@ -139,9 +141,33 @@ def disabled_legacy_executor_wrapper(original: Callable, attempt_cls: type) -> C
     return wrapped
 
 
+def disabled_local_mt5_wrapper(original: Callable, safety_error_cls: type[Exception]) -> Callable:
+    """Block the historical direct/local MT5 `order_send` path.
+
+    During takeover all executable authority is intentionally funnelled through
+    `PendingExecution -> hardened Windows bridge`, where the active demo account
+    is re-verified immediately before execution. The direct `/mt5/demo-order`
+    path and legacy local caller therefore remain disabled.
+    """
+    def wrapped(*args, **kwargs):
+        raise safety_error_cls(
+            "DIRECT_LOCAL_MT5_EXECUTION_DISABLED — takeover policy requires "
+            "PendingExecution -> hardened MT5 bridge execution."
+        )
+    wrapped.__name__ = getattr(original, "__name__", "place_demo_market_order")
+    wrapped.__doc__ = getattr(original, "__doc__", None)
+    setattr(wrapped, "_takeover_disabled", True)
+    return wrapped
+
+
 def install_safety_patches() -> dict[str, bool]:
     """Install idempotent runtime safety patches and return applied-state flags."""
-    state = {"governor": False, "strategist_cleanup": False, "legacy_executor": False}
+    state = {
+        "governor": False,
+        "strategist_cleanup": False,
+        "legacy_executor": False,
+        "direct_local_mt5": False,
+    }
     gov = None
 
     try:
@@ -181,5 +207,17 @@ def install_safety_patches() -> dict[str, bool]:
         state["legacy_executor"] = True
     except Exception as exc:
         log.exception("[takeover-safety] legacy executor patch install failed: %s", exc)
+
+    try:
+        from services import mt5_provider as mt5_provider
+
+        if not getattr(mt5_provider.place_demo_market_order, "_takeover_disabled", False):
+            mt5_provider.place_demo_market_order = disabled_local_mt5_wrapper(
+                mt5_provider.place_demo_market_order,
+                mt5_provider.MT5SafetyError,
+            )
+        state["direct_local_mt5"] = True
+    except Exception as exc:
+        log.exception("[takeover-safety] direct/local MT5 patch install failed: %s", exc)
 
     return state
