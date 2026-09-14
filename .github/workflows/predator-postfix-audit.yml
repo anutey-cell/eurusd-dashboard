@@ -31,5 +31,5 @@ jobs:
             echo '=== PREDATOR POSTFIX AUDIT ==='
             printf 'git_head='; git rev-parse HEAD
             docker inspect --format='backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' xauusd-backend
-            docker exec -w /app xauusd-backend python scripts/predator_postfix_audit.py
+            docker exec -e PYTHONPATH=/app -w /app xauusd-backend python scripts/predator_postfix_audit.py
             echo '=== AUDIT COMPLETE (READ ONLY) ==='
