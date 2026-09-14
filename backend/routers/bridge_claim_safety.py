@@ -1,13 +1,21 @@
-"""Atomic bridge-claim endpoint used by the hardened Windows daemon.
+"""Atomic bridge-claim hardening.
 
 The historical `/bridge/claim/{id}` endpoint performs SELECT-then-UPDATE and
-can double-claim if two daemons race before either transaction commits. This
-module adds `/bridge/claim-v2/{id}` using a single conditional UPDATE:
+can double-claim if two daemons race before either transaction commits.
 
-    WHERE id=:id AND status='PENDING' AND expires_at>=now
+At router import time this module:
+1. removes the legacy non-atomic POST claim route;
+2. re-registers `/bridge/claim/{id}` with an atomic compare-and-set UPDATE so
+   existing daemons are protected immediately after backend deployment; and
+3. adds `/bridge/claim-v2/{id}` for hardened daemons to make the protocol
+   version explicit.
 
-Only one transaction can change the row from PENDING to EXECUTING, so every
-other claimant receives HTTP 409 and must not execute the order.
+Both paths have identical safety semantics:
+
+    UPDATE ... WHERE id=:id AND status='PENDING' AND expires_at>=now
+
+Only one transaction can move an order to EXECUTING. Racing claimants receive
+HTTP 409 and must never execute the order.
 """
 from __future__ import annotations
 
@@ -27,7 +35,7 @@ _INSTALLED = False
 
 
 def install_atomic_claim_route(bridge_module) -> bool:
-    """Register the v2 route exactly once on the existing bridge router."""
+    """Replace legacy claim with atomic semantics and add versioned alias."""
     global _INSTALLED
     if _INSTALLED:
         return True
@@ -36,23 +44,32 @@ def install_atomic_claim_route(bridge_module) -> bool:
     require_secret = bridge_module._require_bridge_secret
     serialise = bridge_module._serialise
 
-    @router.post(
-        "/claim-v2/{order_id}",
-        response_model=APIResponse[dict],
-        summary="Atomically claim a pending order (hardened bridge)",
-    )
-    @limiter.limit("60/minute")
-    def claim_order_v2(
+    # Remove ONLY the legacy POST claim route. Other bridge routes are untouched.
+    legacy_path = "/bridge/claim/{order_id}"
+    retained = []
+    removed = 0
+    for route in router.routes:
+        methods = set(getattr(route, "methods", set()) or set())
+        if getattr(route, "path", None) == legacy_path and "POST" in methods:
+            removed += 1
+            continue
+        retained.append(route)
+    router.routes[:] = retained
+    if removed != 1:
+        raise RuntimeError(
+            f"expected exactly one legacy bridge claim route, removed={removed}"
+        )
+
+    def _claim_atomic_impl(
         request: Request,
         order_id: int,
-        bridge_daemon_id: str = Header(default="unknown", alias="X-Bridge-Daemon-Id"),
-        _: None = Depends(require_secret),
-        db: Session = Depends(get_db),
+        bridge_daemon_id: str,
+        db: Session,
     ) -> APIResponse[dict]:
         now = datetime.now(timezone.utc)
 
-        # Single compare-and-set statement. This is the safety property: even
-        # concurrent daemons cannot both transition the same PENDING row.
+        # Single compare-and-set statement. Even concurrent daemons cannot both
+        # transition the same PENDING row.
         updated = (
             db.query(PendingExecution)
             .filter(PendingExecution.id == order_id)
@@ -71,16 +88,15 @@ def install_atomic_claim_route(bridge_module) -> bool:
         if updated == 1:
             db.commit()
             row = db.query(PendingExecution).filter(PendingExecution.id == order_id).first()
-            log.info("[bridge/v2] order %d atomically claimed by %s", order_id, bridge_daemon_id)
+            log.info("[bridge/atomic] order %d claimed by %s", order_id, bridge_daemon_id)
             return APIResponse(data=serialise(row), source="mt5_bridge")
 
-        # Nothing changed. Roll back the no-op transaction before diagnosing.
         db.rollback()
         row = db.query(PendingExecution).filter(PendingExecution.id == order_id).first()
         if row is None:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        # Expired but still PENDING: close it rather than leaving a zombie row.
+        # Close a stale PENDING row instead of leaving a zombie in the queue.
         if row.status == "PENDING" and row.expires_at and row.expires_at < now:
             expired = (
                 db.query(PendingExecution)
@@ -101,11 +117,47 @@ def install_atomic_claim_route(bridge_module) -> bool:
                 db.rollback()
             raise HTTPException(status_code=409, detail="Order expired before claim")
 
-        # Most commonly another daemon won the race and status is EXECUTING.
         raise HTTPException(
             status_code=409,
             detail=f"Order is {row.status}, not atomically claimable",
         )
+
+    @router.post(
+        "/claim/{order_id}",
+        response_model=APIResponse[dict],
+        summary="Atomically claim a pending order",
+    )
+    @limiter.limit("60/minute")
+    def claim_order_atomic(
+        request: Request,
+        order_id: int,
+        bridge_daemon_id: str = Header(default="unknown", alias="X-Bridge-Daemon-Id"),
+        _: None = Depends(require_secret),
+        db: Session = Depends(get_db),
+    ) -> APIResponse[dict]:
+        return _claim_atomic_impl(request, order_id, bridge_daemon_id, db)
+
+    @router.post(
+        "/claim-v2/{order_id}",
+        response_model=APIResponse[dict],
+        summary="Atomically claim a pending order (hardened bridge v2)",
+    )
+    @limiter.limit("60/minute")
+    def claim_order_v2(
+        request: Request,
+        order_id: int,
+        bridge_daemon_id: str = Header(default="unknown", alias="X-Bridge-Daemon-Id"),
+        _: None = Depends(require_secret),
+        db: Session = Depends(get_db),
+    ) -> APIResponse[dict]:
+        return _claim_atomic_impl(request, order_id, bridge_daemon_id, db)
+
+    # Verify actual prefixed routes exist before claiming installation.
+    paths = [getattr(r, "path", None) for r in router.routes]
+    if paths.count("/bridge/claim/{order_id}") != 1:
+        raise RuntimeError("atomic replacement for /bridge/claim/{order_id} not registered")
+    if paths.count("/bridge/claim-v2/{order_id}") != 1:
+        raise RuntimeError("/bridge/claim-v2/{order_id} not registered")
 
     _INSTALLED = True
     return True
