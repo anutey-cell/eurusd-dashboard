@@ -30,7 +30,14 @@ jobs:
         run: |
           python -m py_compile services/execution_safety_bootstrap.py
           python -m py_compile ../deploy/bridge_safety.py
-          python -m py_compile ../deploy/mt5_bridge_daemon_hardened.py
+      - name: Parse hardened bridge launcher
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          ast.parse(Path('../deploy/mt5_bridge_daemon_hardened.py').read_text(encoding='utf-8'))
+          print('hardened bridge syntax OK')
+          PY
       - name: Parse PowerShell cutover script
         shell: pwsh
         run: |
