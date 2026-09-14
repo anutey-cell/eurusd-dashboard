@@ -1,16 +1,21 @@
 """Read-only full-history post-fix Predator regime revalidation.
 
 Replays the CURRENT corrected Asian Breakdown and PDL Break detectors across the
-largest reliable historical_candles window available on the VPS. Processing is
-chunked and M15 regimes are precomputed once per M15 bar to stay within the
-production host's memory ceiling.
+largest reliable historical_candles window available on the VPS.
+
+Each historical chunk runs in a fresh subprocess. This deliberately resets
+Python/DB-driver memory after every chunk so the audit can traverse long history
+without accumulating memory inside the production backend container.
 
 No database writes, no Telegram sends, no execution calls.
 """
 from __future__ import annotations
 
-import gc
 import json
+import os
+import subprocess
+import sys
+import tempfile
 from bisect import bisect_right
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -33,6 +38,13 @@ MAX_FORWARD_M5 = 96
 
 def _ts(v):
     t = pe._legacy._parse_ts(v)
+    if getattr(t, "tzinfo", None) is not None:
+        t = t.replace(tzinfo=None)
+    return t
+
+
+def _parse_iso(v):
+    t = datetime.fromisoformat(v)
     if getattr(t, "tzinfo", None) is not None:
         t = t.replace(tzinfo=None)
     return t
@@ -92,11 +104,8 @@ def _rsi_at(t, times, vals):
 
 
 def _precompute_m15_regimes(m15):
-    """Compute regime only on M15 closes, then M5 bars look up the latest one."""
     times, vals = [], []
     for i in range(len(m15)):
-        # Production classifiers need at most ~214 bars. Keeping 300 is ample
-        # and prevents historical prefix growth from increasing memory/CPU.
         start = max(0, i - 299)
         hist = m15[start:i+1]
         closes = [b[4] for b in hist]
@@ -173,117 +182,162 @@ def _group_stats(rows, key):
     return {k: _stats(v) for k, v in sorted(groups.items())}
 
 
-def main():
-    all_rows = defaultdict(list)
-    matched_rows = defaultdict(list)
-    seen = set()
+def _worker(core_start, core_end, output_path):
+    q_start = core_start - timedelta(days=LOOKBACK_DAYS)
+    q_end = core_end + timedelta(hours=FORWARD_HOURS)
+    local_seen = set()
+    rows_out = []
 
     with SessionLocal() as db:
+        m5 = _load_range(db, "M5", q_start, q_end)
+        m15 = _load_range(db, "M15", q_start, q_end)
+        h1 = _load_range(db, "H1", q_start, q_end)
+
+    rsi_times, rsi_vals = _rsi_series(h1)
+    regime_times, regime_vals = _precompute_m15_regimes(m15)
+
+    if m5:
+        for i, bar in enumerate(m5):
+            t = bar[0]
+            if not (core_start <= t < core_end):
+                continue
+            if i < 700 or i + MAX_FORWARD_M5 >= len(m5):
+                continue
+
+            window = m5[i-699:i+1]
+            vol = _vol_ratio(m5, i)
+            rsi = _rsi_at(t, rsi_times, rsi_vals)
+            d, v, mult = _regime_at(t, regime_times, regime_vals)
+
+            candidates = []
+            a = pe.detect_asian_breakdown(window, rsi_h1=rsi, vol_r=vol)
+            if a:
+                candidates.append(a)
+            p = pe.detect_pdl_break(window, vol_r=vol)
+            if p:
+                candidates.append(p)
+
+            for sig in candidates:
+                key_level = round(sig.stop_loss - 5.0, 2)
+                dedupe = (sig.archetype, pe._trading_date(t).isoformat(), key_level)
+                if dedupe in local_seen:
+                    continue
+                local_seen.add(dedupe)
+                row = _replay(m5, i, sig)
+                row.update({
+                    "time": t.isoformat(),
+                    "archetype": sig.archetype,
+                    "entry": sig.entry,
+                    "stop": sig.stop_loss,
+                    "rr": sig.rr,
+                    "session": sig.session,
+                    "confidence": sig.confidence,
+                    "regime_direction": d,
+                    "regime_volatility": v,
+                    "regime_cell": f"{d}×{v}",
+                    "regime_multiplier": mult,
+                    "dedupe_key": [sig.archetype, pe._trading_date(t).isoformat(), key_level],
+                })
+                rows_out.append(row)
+
+    with open(output_path, "a", encoding="utf-8") as f:
+        for row in rows_out:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    print(json.dumps({
+        "worker": True,
+        "core_start": core_start.isoformat(),
+        "core_end": core_end.isoformat(),
+        "rows": len(rows_out),
+        "asian": sum(1 for r in rows_out if r["archetype"] == "ASIAN_BREAKDOWN"),
+        "pdl": sum(1 for r in rows_out if r["archetype"] == "PDL_BREAK"),
+    }), flush=True)
+
+
+def _parent():
+    with SessionLocal() as db:
         start, end, raw_count = _bounds(db)
+
+    fd, output_path = tempfile.mkstemp(prefix="predator_regime_", suffix=".jsonl", dir="/tmp")
+    os.close(fd)
+    try:
         cursor = start
         chunk_count = 0
         while cursor <= end:
             core_start = cursor
             core_end = min(end + timedelta(minutes=5), core_start + timedelta(days=CHUNK_DAYS))
-            q_start = core_start - timedelta(days=LOOKBACK_DAYS)
-            q_end = core_end + timedelta(hours=FORWARD_HOURS)
-
-            m5 = _load_range(db, "M5", q_start, q_end)
-            m15 = _load_range(db, "M15", q_start, q_end)
-            h1 = _load_range(db, "H1", q_start, q_end)
-            rsi_times, rsi_vals = _rsi_series(h1)
-            regime_times, regime_vals = _precompute_m15_regimes(m15)
-
-            if m5:
-                for i, bar in enumerate(m5):
-                    t = bar[0]
-                    if not (core_start <= t < core_end):
-                        continue
-                    if i < 700 or i + MAX_FORWARD_M5 >= len(m5):
-                        continue
-
-                    window = m5[i-699:i+1]
-                    vol = _vol_ratio(m5, i)
-                    rsi = _rsi_at(t, rsi_times, rsi_vals)
-                    d, v, mult = _regime_at(t, regime_times, regime_vals)
-
-                    candidates = []
-                    a = pe.detect_asian_breakdown(window, rsi_h1=rsi, vol_r=vol)
-                    if a:
-                        candidates.append(a)
-                    p = pe.detect_pdl_break(window, vol_r=vol)
-                    if p:
-                        candidates.append(p)
-
-                    for sig in candidates:
-                        key_level = round(sig.stop_loss - 5.0, 2)
-                        dedupe = (sig.archetype, pe._trading_date(t).isoformat(), key_level)
-                        if dedupe in seen:
-                            continue
-                        seen.add(dedupe)
-                        row = _replay(m5, i, sig)
-                        row.update({
-                            "time": t.isoformat(),
-                            "archetype": sig.archetype,
-                            "entry": sig.entry,
-                            "stop": sig.stop_loss,
-                            "rr": sig.rr,
-                            "session": sig.session,
-                            "confidence": sig.confidence,
-                            "regime_direction": d,
-                            "regime_volatility": v,
-                            "regime_cell": f"{d}×{v}",
-                            "regime_multiplier": mult,
-                        })
-                        all_rows[sig.archetype].append(row)
-                        if mult >= 0.5:
-                            matched_rows[sig.archetype].append(row)
-
+            cmd = [
+                sys.executable, os.path.abspath(__file__), "--worker",
+                core_start.isoformat(), core_end.isoformat(), output_path,
+            ]
+            proc = subprocess.run(cmd, text=True, capture_output=True)
+            if proc.stdout:
+                print(proc.stdout.strip(), flush=True)
+            if proc.returncode != 0:
+                if proc.stderr:
+                    print(proc.stderr, file=sys.stderr, flush=True)
+                raise SystemExit(f"chunk worker failed rc={proc.returncode} start={core_start.isoformat()}")
             chunk_count += 1
-            print(json.dumps({
-                "progress": True,
-                "chunk": chunk_count,
-                "core_start": core_start.isoformat(),
-                "core_end": core_end.isoformat(),
-                "asian_all": len(all_rows["ASIAN_BREAKDOWN"]),
-                "pdl_all": len(all_rows["PDL_BREAK"]),
-                "asian_matched": len(matched_rows["ASIAN_BREAKDOWN"]),
-                "pdl_matched": len(matched_rows["PDL_BREAK"]),
-            }), flush=True)
             cursor = core_end
 
-            # Explicit release matters on the small production droplet.
-            del m5, m15, h1, rsi_times, rsi_vals, regime_times, regime_vals
-            gc.collect()
+        all_rows = defaultdict(list)
+        matched_rows = defaultdict(list)
+        global_seen = set()
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                key = tuple(row.pop("dedupe_key"))
+                if key in global_seen:
+                    continue
+                global_seen.add(key)
+                all_rows[row["archetype"]].append(row)
+                if float(row.get("regime_multiplier", 0.0) or 0.0) >= 0.5:
+                    matched_rows[row["archetype"]].append(row)
 
-    report = {
-        "mode": "READ_ONLY_FULL_HISTORY_POSTFIX_REGIME_REVALIDATION",
-        "raw_m5_rows": raw_count,
-        "history_start": start.isoformat(),
-        "history_end": end.isoformat(),
-        "chunk_days": CHUNK_DAYS,
-        "regime_rule": "production favorable iff multiplier >= 0.5",
-        "same_bar_rule": "SL_FIRST_CONSERVATIVE",
-        "replay_horizon_m5_bars": MAX_FORWARD_M5,
-        "dedupe": "first unique archetype+XAU_trading_date+key_level",
-        "all_corrected_triggers": {},
-        "production_regime_matched": {},
-    }
-    for arch in ("ASIAN_BREAKDOWN", "PDL_BREAK"):
-        rows = all_rows[arch]
-        mrows = matched_rows[arch]
-        report["all_corrected_triggers"][arch] = {
-            "overall": _stats(rows),
-            "by_regime": _group_stats(rows, "regime_cell"),
-            "by_session": _group_stats(rows, "session"),
+        report = {
+            "mode": "READ_ONLY_FULL_HISTORY_POSTFIX_REGIME_REVALIDATION",
+            "raw_m5_rows": raw_count,
+            "history_start": start.isoformat(),
+            "history_end": end.isoformat(),
+            "chunk_days": CHUNK_DAYS,
+            "chunks_completed": chunk_count,
+            "execution_architecture": "fresh_subprocess_per_chunk",
+            "regime_rule": "production favorable iff multiplier >= 0.5",
+            "same_bar_rule": "SL_FIRST_CONSERVATIVE",
+            "replay_horizon_m5_bars": MAX_FORWARD_M5,
+            "dedupe": "first unique archetype+XAU_trading_date+key_level",
+            "all_corrected_triggers": {},
+            "production_regime_matched": {},
         }
-        report["production_regime_matched"][arch] = {
-            "overall": _stats(mrows),
-            "by_regime": _group_stats(mrows, "regime_cell"),
-            "by_session": _group_stats(mrows, "session"),
-        }
-    print("=== FINAL REPORT ===")
-    print(json.dumps(report, indent=2, sort_keys=True))
+        for arch in ("ASIAN_BREAKDOWN", "PDL_BREAK"):
+            rows = all_rows[arch]
+            mrows = matched_rows[arch]
+            report["all_corrected_triggers"][arch] = {
+                "overall": _stats(rows),
+                "by_regime": _group_stats(rows, "regime_cell"),
+                "by_session": _group_stats(rows, "session"),
+            }
+            report["production_regime_matched"][arch] = {
+                "overall": _stats(mrows),
+                "by_regime": _group_stats(mrows, "regime_cell"),
+                "by_session": _group_stats(mrows, "session"),
+            }
+        print("=== FINAL REPORT ===")
+        print(json.dumps(report, indent=2, sort_keys=True))
+    finally:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+
+
+def main():
+    if len(sys.argv) >= 5 and sys.argv[1] == "--worker":
+        _worker(_parse_iso(sys.argv[2]), _parse_iso(sys.argv[3]), sys.argv[4])
+        return
+    _parent()
 
 
 if __name__ == "__main__":
