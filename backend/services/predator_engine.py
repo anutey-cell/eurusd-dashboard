@@ -9,9 +9,11 @@ This module patches operational defects and production governance controls:
 5) legacy pre-fix performance claims are suppressed,
 6) a fail-closed FIRE freshness guard validates signal-bar and M5-feed recency,
 7) ASIAN_BREAKDOWN and PDL_BREAK FIREs are quarantined to shadow research after
-   full-history post-fix validation showed no robust production edge.
+   full-history post-fix validation showed no robust production edge,
+8) VOL_CONTINUATION is quarantined too because the frozen engine creates it only
+   as a derivative of one of those primary FIREs and copies its trade plan.
 
-Sizing, SL/TP geometry, VOL_CONTINUATION logic and SELL mandate are unchanged.
+Sizing, SL/TP geometry and SELL mandate are unchanged.
 """
 from __future__ import annotations
 
@@ -39,7 +41,11 @@ detect_vol_continuation = _legacy.detect_vol_continuation
 # Evidence basis (2025-03-21 -> 2026-09-14, conservative SL-first replay):
 #   ASIAN_BREAKDOWN production-regime-matched: n=92, E=-0.55, PF=0.91
 #   PDL_BREAK       production-regime-matched: n=105, E=-3.97, PF=0.65
-_QUARANTINED_FIRE_ARCHETYPES = frozenset({"ASIAN_BREAKDOWN", "PDL_BREAK"})
+# VOL_CONTINUATION has no independent thesis in the frozen engine: it is created
+# only when one of those primaries fires, then copies the parent's entry/SL/TP.
+_QUARANTINED_FIRE_ARCHETYPES = frozenset({
+    "ASIAN_BREAKDOWN", "PDL_BREAK", "VOL_CONTINUATION",
+})
 
 # The old figures were measured against pre-fix trigger semantics and must not
 # be advertised as performance of the corrected production trigger.
@@ -53,9 +59,8 @@ _ARCHETYPE_STATS = {
         "wr": "—", "expectancy": "—", "pf": "—",
     },
     "VOL_CONTINUATION": {
-        "sample": "inherits primary",
-        "wr": "inherits primary", "expectancy": "inherits primary",
-        "pf": "inherits primary",
+        "sample": "QUARANTINED · DERIVATIVE OF PRIMARY",
+        "wr": "—", "expectancy": "—", "pf": "—",
     },
 }
 # Frozen formatter resolves this global in the legacy module.
