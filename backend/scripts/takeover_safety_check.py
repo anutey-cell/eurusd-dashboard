@@ -10,6 +10,15 @@ This script does not query or mutate trading tables and never places orders.
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
+
+# Running a file from backend/scripts makes Python put only that scripts/
+# directory on sys.path. Add the backend root explicitly so this behaves the
+# same in CI, a Docker exec shell, and a normal backend working directory.
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 import services
 from config import settings
