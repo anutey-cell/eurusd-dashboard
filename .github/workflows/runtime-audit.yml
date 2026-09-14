@@ -1,0 +1,101 @@
+name: Takeover Runtime Audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'chatgpt/takeover-safety-audit'
+    paths:
+      - '.github/workflows/runtime-audit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  vps-runtime-audit:
+    name: Read-only VPS runtime audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Audit VPS over existing deploy SSH channel
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+          script: |
+            set -eu
+            cd /opt/xauusd
+
+            echo '=== VPS REPOSITORY ==='
+            printf 'git_head='; git rev-parse HEAD
+            printf 'git_branch='; git branch --show-current || true
+            printf 'working_tree_changes='; git status --porcelain | wc -l
+
+            echo '=== CONTAINERS ==='
+            docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.prod ps
+            docker inspect --format='backend_status={{.State.Status}} backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} backend_started={{.State.StartedAt}}' xauusd-backend
+
+            echo '=== SAFE RUNTIME SWITCHES ==='
+            docker exec xauusd-backend python - <<'PY'
+            import json
+            from config import settings
+
+            bool_names = [
+                'broker_execution_enabled',
+                'live_trading_authorized',
+                'use_mandate_strategist',
+                'predator_execution_enabled',
+                'mt5_bridge_enabled',
+                'allow_demo_trading',
+                'mt5_execution_enabled',
+                'mt5_enabled',
+            ]
+            report = {name: bool(getattr(settings, name, False)) for name in bool_names}
+            report['mt5_login_configured'] = bool(str(getattr(settings, 'mt5_login', '') or '').strip())
+            report['mt5_server_configured'] = bool(str(getattr(settings, 'mt5_server', '') or '').strip())
+            report['bridge_secret_configured'] = bool(str(getattr(settings, 'mt5_bridge_shared_secret', '') or '').strip())
+            print(json.dumps(report, sort_keys=True))
+            PY
+
+            echo '=== BACKEND + BRIDGE STATUS ==='
+            docker exec xauusd-backend python - <<'PY'
+            import json
+            import urllib.request
+
+            def get(path):
+                with urllib.request.urlopen('http://127.0.0.1:8000' + path, timeout=5) as r:
+                    return json.load(r)
+
+            health = get('/api/v1/health')
+            print('backend_health_ok=', bool(health))
+
+            status = get('/api/v1/bridge/status')
+            data = status.get('data') or {}
+            daemons = data.get('daemons') or {}
+            print(json.dumps({
+                'bridge_enabled': (data.get('config') or {}).get('enabled'),
+                'bridge_secret_set': (data.get('config') or {}).get('secretSet'),
+                'queue': data.get('queue') or {},
+                'daemon_count': len(daemons),
+                'any_daemon_fresh': data.get('anyDaemonFresh'),
+                'any_autotrading_enabled': data.get('anyAutoTradingEnabled'),
+                'all_daemons_demo': all(((h.get('mt5') or {}).get('accountDemo') is True) for h in daemons.values()) if daemons else None,
+                'all_daemons_connected': all(((h.get('mt5') or {}).get('connected') is True) for h in daemons.values()) if daemons else None,
+            }, sort_keys=True))
+            PY
+
+            echo '=== READ-ONLY DB COUNTS ==='
+            docker exec xauusd-backend python - <<'PY'
+            import json
+            from database import db_session
+            from db_models import PendingExecution, StrategistVerdict
+
+            statuses = ['PENDING','EXECUTING','ACCEPTED','REJECTED','FAILED','EXPIRED']
+            with db_session() as db:
+                counts = {s: db.query(PendingExecution).filter(PendingExecution.status == s).count() for s in statuses}
+                verdicts = db.query(StrategistVerdict).count()
+            print(json.dumps({'pending_execution_counts': counts, 'strategist_verdict_count': verdicts}, sort_keys=True))
+            PY
+
+            echo '=== AUDIT COMPLETE (READ ONLY) ==='
