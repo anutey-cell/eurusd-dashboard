@@ -29,6 +29,7 @@ jobs:
       - name: Compile safety modules
         run: |
           python -m py_compile services/execution_safety_bootstrap.py
+          python -m py_compile scripts/takeover_safety_check.py
           python -m py_compile ../deploy/bridge_safety.py
       - name: Parse hardened bridge launcher
         run: |
@@ -53,3 +54,5 @@ jobs:
           }
       - name: Run takeover safety tests
         run: pytest -q tests/test_takeover_execution_safety.py tests/test_bridge_safety.py
+      - name: Run read-only post-deploy safety check against defaults
+        run: python scripts/takeover_safety_check.py
