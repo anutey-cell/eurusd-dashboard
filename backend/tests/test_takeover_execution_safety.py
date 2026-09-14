@@ -4,9 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import threading
 
+import pytest
 import services
 from services.execution_safety_bootstrap import (
     disabled_legacy_executor_wrapper,
+    disabled_local_mt5_wrapper,
     fail_closed_check_wrapper,
     fail_closed_reserve_wrapper,
     strategist_enqueue_cleanup_wrapper,
@@ -18,15 +20,18 @@ def test_service_package_installs_takeover_safety_policy():
     assert state["governor"] is True
     assert state["strategist_cleanup"] is True
     assert state["legacy_executor"] is True
+    assert state["direct_local_mt5"] is True
 
     from services import portfolio_governor as gov
     from services import strategist_runner as strategist
     from services import auto_executor as legacy
+    from services import mt5_provider
 
     assert getattr(gov.reserve_capacity, "_takeover_fail_closed", False) is True
     assert getattr(gov.check_new_order, "_takeover_fail_closed", False) is True
     assert getattr(strategist._maybe_enqueue_demo_order, "_takeover_reservation_cleanup", False) is True
     assert getattr(legacy.evaluate_and_execute, "_takeover_disabled", False) is True
+    assert getattr(mt5_provider.place_demo_market_order, "_takeover_disabled", False) is True
 
 
 def test_reserve_exception_fails_closed():
@@ -115,3 +120,18 @@ def test_legacy_executor_is_blocked_before_original_can_run():
     assert result.fired is False
     assert result.blocking_layer == "takeover_safety"
     assert "LEGACY_AUTO_EXECUTOR_DISABLED" in result.blocking_reason
+
+
+def test_direct_local_mt5_execution_is_blocked_before_original_can_run():
+    from services.mt5_provider import MT5SafetyError
+
+    called = {"value": False}
+
+    def original(signal):
+        called["value"] = True
+        raise AssertionError("direct local MT5 path must not run")
+
+    wrapped = disabled_local_mt5_wrapper(original, MT5SafetyError)
+    with pytest.raises(MT5SafetyError, match="DIRECT_LOCAL_MT5_EXECUTION_DISABLED"):
+        wrapped({"pair": "xauusd", "signal": "BUY"})
+    assert called["value"] is False
