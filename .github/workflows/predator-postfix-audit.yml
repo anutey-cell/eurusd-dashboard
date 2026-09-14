@@ -1,0 +1,35 @@
+name: Predator Postfix Audit
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/scripts/predator_postfix_audit.py'
+      - '.github/workflows/predator-postfix-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postfix-audit:
+    name: Read-only Predator post-fix replay on VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Run corrected Predator replay against live historical store
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+          command_timeout: 12m
+          script: |
+            set -eu
+            cd /opt/xauusd
+            echo '=== PREDATOR POSTFIX AUDIT ==='
+            printf 'git_head='; git rev-parse HEAD
+            docker inspect --format='backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' xauusd-backend
+            docker exec xauusd-backend python /app/scripts/predator_postfix_audit.py
+            echo '=== AUDIT COMPLETE (READ ONLY) ==='
