@@ -2,8 +2,8 @@
 """Read-only post-deploy verification for takeover execution hardening.
 
 Safe to run inside the backend container. Exits non-zero if the takeover
-safety bootstrap is not installed or if obviously dangerous generic/live
-execution switches are enabled unexpectedly.
+safety bootstrap/atomic bridge route is not installed or if obviously dangerous
+generic/live execution switches are enabled unexpectedly.
 
 This script does not query or mutate trading tables and never places orders.
 """
@@ -21,6 +21,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 import services
+import routers
 from config import settings
 
 
@@ -42,10 +43,14 @@ def main() -> int:
         "allow_demo_trading": bool(getattr(settings, "allow_demo_trading", False)),
     }
 
+    bridge_atomic_claim = bool(getattr(routers, "BRIDGE_ATOMIC_CLAIM_INSTALLED", False))
+
     failures: list[str] = []
     for key, expected in expected_patches.items():
         if patch_state.get(key) is not expected:
             failures.append(f"takeover patch {key} expected {expected}, got {patch_state.get(key)!r}")
+    if not bridge_atomic_claim:
+        failures.append("atomic bridge claim-v2 route is not installed")
 
     # Takeover policy: generic/live account execution must stay off. Demo bridge
     # may legitimately be enabled, so it is reported but not treated as failure.
@@ -59,6 +64,7 @@ def main() -> int:
     report = {
         "ok": not failures,
         "takeover_safety_state": patch_state,
+        "atomic_bridge_claim_installed": bridge_atomic_claim,
         "execution_switches": switches,
         "failures": failures,
     }
