@@ -28,8 +28,12 @@ jobs:
           script: |
             set -eu
             cd /opt/xauusd
+            git fetch origin main
+            git reset --hard origin/main
             echo '=== PREDATOR POSTFIX AUDIT ==='
             printf 'git_head='; git rev-parse HEAD
             docker inspect --format='backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' xauusd-backend
-            docker exec -e PYTHONPATH=/app -w /app xauusd-backend python scripts/predator_postfix_audit.py
+            docker cp backend/scripts/predator_postfix_audit.py xauusd-backend:/tmp/predator_postfix_audit.py
+            docker exec -e PYTHONPATH=/app -w /app xauusd-backend python /tmp/predator_postfix_audit.py
+            rm -f /tmp/predator_postfix_audit.py || true
             echo '=== AUDIT COMPLETE (READ ONLY) ==='
