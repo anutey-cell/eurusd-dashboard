@@ -1,58 +1,85 @@
 # XAUUSD Engine — Current System State
 
-Status date: 2026-09-13
+Status date: 2026-09-14
 Baseline repository commit: `0c17987e777d274b2354f3dd4f48e717b69e1b55`
 Ownership audit branch: `chatgpt/takeover-safety-audit`
 
 ## Ownership state
 
-- GitHub repository access: CONFIRMED (read/write/admin through connected GitHub integration)
-- Architecture mapping: IN PROGRESS, substantially complete
-- Production mutation: FROZEN during takeover audit
+- GitHub repository access: CONFIRMED (read/write through connected GitHub integration)
+- Architecture mapping: SUBSTANTIALLY COMPLETE for repository-visible execution/data paths
+- Safety hardening branch: IMPLEMENTED and under CI
+- Production mutation: FROZEN pending runtime reconciliation
 - VPS/runtime access: NOT YET DIRECTLY CONNECTED
 - Windows MT5 bridge runtime: NOT YET DIRECTLY CONNECTED
 
 ## Authoritative execution architecture
 
 1. Mandate Strategist is the configured authoritative strategist path when `USE_MANDATE_STRATEGIST=true`.
-2. Legacy `auto_executor.py` remains a back-compat/development path and should remain dormant in mandate mode.
+2. Legacy `auto_executor.py` is a back-compat/development path. The takeover branch now blocks its executable entry point while preserving dry-run/research use.
 3. PREDATOR is an independent specialist engine with its own execution manager; repository default keeps its execution disabled/shadow-only.
-4. Generic broker REST execution provider is currently an inert skeleton and cannot place broker orders.
-5. Actual executable order flow is through `PendingExecution` -> MT5 bridge daemon -> MetaTrader5.
+4. Generic broker REST execution provider is an inert skeleton and cannot place broker orders.
+5. Actual executable order flow is `PendingExecution -> Windows MT5 bridge -> MetaTrader5`.
 
 ## Confirmed safety controls
 
 - Repository defaults disable generic broker execution, MT5 execution, auto execution, live-trading authorization, and MT5 bridge execution.
-- Mandate strategist refuses SELL execution; SELLs are shadowed and PREDATOR owns SELL execution policy.
+- Mandate Strategist refuses SELL execution; SELLs are shadowed and PREDATOR owns SELL execution policy.
 - Mandate enqueue includes Monday observation, position cap, fixed-lot/aggregate cap, bridge heartbeat, sanctioned demo login/server/symbol, `live_execution_allowed=false`, `ALLOW_DEMO_TRADING`, and bridge-enabled checks.
-- PREDATOR execution manager has local exposure control, sanctioned-demo verification and global portfolio-governor checks.
+- The portfolio governor enforces a global 0.15 gross-lot ceiling, startup reconciliation, MT5-authoritative freshness/mismatch checks, and atomic capacity reservations.
+- PREDATOR has local exposure control, sanctioned-demo verification and global portfolio-governor checks.
 - PREDATOR expansion is hard-disabled in the scheduler path currently audited.
 
 ## Manipulation / accumulation capability
 
-The repository already implements an ICT-style `Accumulation -> Manipulation -> Distribution` framework in `services/ict_advanced.py`, including Judas-swing/session liquidity-sweep and reversal detection. This is already consumed as a confirmation layer by the legacy auto-executor. The next research task is validation, not greenfield implementation: test false-positive/false-negative rates and determine whether Track-A quote-level microstructure improves timing and confirmation.
+The repository already implements an ICT-style `Accumulation -> Manipulation -> Distribution` framework in `services/ict_advanced.py`, including Judas-swing/session liquidity-sweep and reversal detection. Validation—not greenfield implementation—is the next research task: measure false positives/negatives and determine whether Track-A quote-level microstructure improves timing and confirmation.
 
-## Safety defects found during takeover
+## Takeover safety findings and mitigations
 
-### S1 — global portfolio governor can fail open
+### S1 — global portfolio governor caller paths could fail open
 
-Both the legacy/strategist execution paths contain exception handlers around governor checks that log an error but can continue. Capital/risk governors must fail CLOSED: if the governor cannot evaluate, no new order should proceed.
+Finding: Strategist and PREDATOR caller exception handlers could log a governor exception and continue.
 
-Affected areas observed:
-- `services/strategist_runner.py` global governor reservation exception path
-- `services/predator_execution_manager.py` global governor check exception path
+Branch mitigation: `services/execution_safety_bootstrap.py` wraps `reserve_capacity()` and `check_new_order()` at the shared governor boundary. Unexpected errors now return explicit denials with `within_limit=false`, `state_unknown=true`, and zero remaining capacity. This means existing caller exception handlers no longer receive ordinary governor failures as exceptions.
 
-### S2 — legacy auto-executor confirmation gates can fail open
+Status: **MITIGATED IN BRANCH; CI COVERED; RUNTIME DEPLOYMENT PENDING.**
 
-`services/auto_executor.py` currently allows execution to continue if the killzone-policy or ICT-framework module raises. Research/diagnostic enrichments may fail open; execution-authorisation gates should not.
+### S2 — legacy auto-executor confirmation failures could fail open
 
-### S3 — bridge daemon lacks an independent local sanctioned-account guard before `order_send`
+Finding: killzone-policy and ICT-framework exceptions in the historical legacy executor could continue toward execution.
 
-The backend mandate and PREDATOR enqueue paths verify a sanctioned demo heartbeat, but the Windows bridge daemon itself should independently verify the active MT5 login/server immediately before every order. This protects against account switching after heartbeat/enqueue and provides defence in depth.
+Branch mitigation: executable `evaluate_and_execute()` is blocked by takeover policy. Dry-run/research paths remain available. This removes the unsafe execution authority without changing strategy logic.
 
-### S4 — reservation cleanup path requires review
+Status: **MITIGATED IN BRANCH; CI COVERED; RUNTIME DEPLOYMENT PENDING.**
 
-Strategist reserves portfolio capacity before several later demo-account/config checks. Some early returns after reservation do not visibly release the reservation in the audited code window. TTL may eventually recover capacity, but all post-reservation refusal paths should explicitly release.
+### S3 — bridge daemon lacked independent local sanctioned-account guard
+
+Finding: upstream backend checks used the last bridge heartbeat, but the original Windows daemon did not independently re-check the currently connected account immediately before order execution.
+
+Branch mitigation:
+- `deploy/bridge_safety.py` validates login, exact server, DEMO trade mode, terminal connectivity/trading permission.
+- `deploy/mt5_bridge_daemon_hardened.py` performs those checks plus an XAU/USD symbol sanity check immediately before handing off to the existing executor.
+- `deploy/switch_bridge_to_hardened.ps1` provides a dry-run-first Scheduled Task cutover with XML backup and rollback instructions.
+
+Status: **IMPLEMENTED AND TESTED IN BRANCH; WINDOWS RUNTIME CUTOVER PENDING.**
+
+### S4 — Strategist reservations could remain RESERVED after later refusal
+
+Finding: capacity is reserved before several subsequent demo/config checks; refusal after reservation could leave capacity occupied until TTL cleanup.
+
+Branch mitigation: the takeover bootstrap wraps `_maybe_enqueue_demo_order()`, identifies new Strategist `RESERVED` entries and releases them immediately whenever enqueue returns/refuses without producing an order. `SENT` reservations are explicitly preserved.
+
+Status: **MITIGATED IN BRANCH; CI COVERED; RUNTIME DEPLOYMENT PENDING.**
+
+## Verification assets added
+
+- `backend/tests/test_takeover_execution_safety.py` — fail-closed governor, package bootstrap, reservation cleanup and legacy-executor block tests.
+- `backend/tests/test_bridge_safety.py` — login/server/demo/terminal guard tests.
+- `.github/workflows/safety-tests.yml` — non-deploying CI for takeover safety tests, Python compilation and PowerShell parser validation.
+- `deploy/takeover_readonly_audit.py` — redacted read-only runtime collector.
+- `docs/TAKEOVER_DEPLOYMENT_RUNBOOK.md` — deployment, demo smoke-test and rollback procedure.
+
+Latest completed safety CI on the takeover branch was green before this status update; every subsequent branch commit is required to pass the same workflow before merge.
 
 ## Data / research state
 
@@ -69,17 +96,25 @@ Run the read-only collector from repo root on each relevant host:
 python deploy/takeover_readonly_audit.py > takeover_runtime_audit.txt
 ```
 
-The collector reports git/runtime/config switch state while redacting secrets. It does not restart services, query trading rows, alter databases, or place orders.
+The collector reports git/runtime/config switch state while redacting secrets. It does not restart services, alter databases, or place orders.
+
+For the Windows bridge, first validate the proposed Scheduled Task change without mutation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\switch_bridge_to_hardened.ps1
+```
+
+Only after review should `-Apply` be used.
 
 ## Takeover completion gates
 
-Ownership is considered operationally complete only after:
+Operational ownership requires:
 
-1. VPS runtime HEAD/config/services are reconciled with this repository.
-2. Windows bridge runtime/account state is independently verified.
-3. S1-S4 are fixed and tested on a branch/PR.
-4. Signal -> grading -> notification -> queue -> bridge result lifecycle is proven end-to-end in demo/shadow mode.
-5. Current data-source freshness and fallback paths are audited.
-6. A single production deployment/runbook and rollback procedure is documented.
+1. VPS runtime HEAD/config/services reconciled with this repository.
+2. Windows bridge runtime/account state independently verified and hardened launcher cut over on DEMO.
+3. Safety PR CI green at final head and reviewed before merge.
+4. Signal -> grading -> notification -> queue -> bridge result lifecycle proven end-to-end in demo/shadow mode.
+5. Current data-source freshness and fallback paths audited.
+6. Post-deploy health and rollback checks completed.
 
 Until those gates pass, no new live-capital authority should be enabled.
