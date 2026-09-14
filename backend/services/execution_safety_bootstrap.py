@@ -6,6 +6,7 @@ capital-protection and execution-authorisation failures must fail CLOSED.
 
 The patches are intentionally narrow and reversible:
 - portfolio governor exceptions become explicit rejections;
+- strategist reservations are cleaned up if enqueue refuses/fails after reserve;
 - the legacy autonomous executor is disabled during the takeover period.
 
 The authoritative Mandate Strategist and PREDATOR signal/research logic are not
@@ -71,6 +72,49 @@ def fail_closed_check_wrapper(original: Callable) -> Callable:
     return wrapped
 
 
+def strategist_enqueue_cleanup_wrapper(original: Callable, gov: Any) -> Callable:
+    """Release new Strategist RESERVED capacity whenever enqueue does not succeed.
+
+    `strategist_runner._maybe_enqueue_demo_order()` reserves global capacity
+    before several later safety/config checks. If one of those checks refuses
+    the order, this wrapper ensures a newly-created RESERVED entry is released
+    immediately rather than waiting for the governor TTL/prune cycle.
+
+    SENT reservations are never touched here.
+    """
+    def _reserved_ids() -> set[str]:
+        try:
+            with gov._GOVERNOR_LOCK:
+                return {
+                    rid for rid, row in gov._RESERVATIONS.items()
+                    if len(row) >= 4 and row[0] == "STRATEGIST" and row[3] == "RESERVED"
+                }
+        except Exception:
+            return set()
+
+    def wrapped(db, verdict):
+        before = _reserved_ids()
+        try:
+            result = original(db, verdict)
+        except Exception as exc:
+            log.exception("[takeover-safety] strategist enqueue raised; failing closed: %s", exc)
+            result = None
+        if result is None:
+            leaked = _reserved_ids() - before
+            for rid in leaked:
+                try:
+                    gov.release_reservation(rid, "post_reservation_refusal")
+                    log.warning("[takeover-safety] released stranded Strategist reservation %s", rid[:8])
+                except Exception as exc:
+                    log.exception("[takeover-safety] reservation cleanup failed rid=%s: %s", rid[:8], exc)
+        return result
+
+    wrapped.__name__ = getattr(original, "__name__", "_maybe_enqueue_demo_order")
+    wrapped.__doc__ = getattr(original, "__doc__", None)
+    setattr(wrapped, "_takeover_reservation_cleanup", True)
+    return wrapped
+
+
 def disabled_legacy_executor_wrapper(original: Callable, attempt_cls: type) -> Callable:
     """Disable the legacy live executor while the Mandate Strategist is canonical.
 
@@ -97,7 +141,8 @@ def disabled_legacy_executor_wrapper(original: Callable, attempt_cls: type) -> C
 
 def install_safety_patches() -> dict[str, bool]:
     """Install idempotent runtime safety patches and return applied-state flags."""
-    state = {"governor": False, "legacy_executor": False}
+    state = {"governor": False, "strategist_cleanup": False, "legacy_executor": False}
+    gov = None
 
     try:
         from services import portfolio_governor as gov
@@ -111,6 +156,19 @@ def install_safety_patches() -> dict[str, bool]:
         # Package startup must remain observable, but failure to install this
         # patch is serious and should be loud in logs.
         log.exception("[takeover-safety] governor patch install failed: %s", exc)
+
+    if gov is not None:
+        try:
+            from services import strategist_runner as strategist
+
+            if not getattr(strategist._maybe_enqueue_demo_order, "_takeover_reservation_cleanup", False):
+                strategist._maybe_enqueue_demo_order = strategist_enqueue_cleanup_wrapper(
+                    strategist._maybe_enqueue_demo_order,
+                    gov,
+                )
+            state["strategist_cleanup"] = True
+        except Exception as exc:
+            log.exception("[takeover-safety] strategist reservation cleanup patch failed: %s", exc)
 
     try:
         from services import auto_executor as legacy
