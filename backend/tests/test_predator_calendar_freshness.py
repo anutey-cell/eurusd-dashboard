@@ -40,8 +40,6 @@ def _fire(bar_time="2026-09-14T13:35:00", archetype="PDL_BREAK"):
 
 def test_monday_previous_session_skips_sunday_reopen_fragment():
     friday = _friday_reference_bars()
-    # Sunday 22:00 UTC is the OPEN of Monday's XAU trading date, not a
-    # standalone "previous day" session.
     sunday_reopen = [
         _bar(datetime(2026, 9, 13, 22, 0), 96.0, high=99.0, low=95.0),
         _bar(datetime(2026, 9, 13, 22, 5), 97.0, high=100.0, low=94.0),
@@ -59,7 +57,6 @@ def test_pdl_break_requires_fresh_two_close_acceptance():
     monday_start = datetime(2026, 9, 14, 12, 0)
     for i in range(17):
         bars.append(_bar(monday_start + timedelta(minutes=5 * i), 101.0))
-    # PDL=100 => trigger level=97. Fresh sequence is >=97 -> <97 -> <97.
     bars.extend([
         _bar(datetime(2026, 9, 14, 13, 25), 98.0),
         _bar(datetime(2026, 9, 14, 13, 30), 96.0),
@@ -82,8 +79,6 @@ def test_pdl_break_does_not_recycle_an_old_break():
     monday_start = datetime(2026, 9, 14, 12, 0)
     for i in range(14):
         bars.append(_bar(monday_start + timedelta(minutes=5 * i), 101.0))
-    # An old valid-looking break exists, but price remains below the trigger.
-    # The latest three bars do not form a fresh >= -> below -> below event.
     closes = [98.0, 96.0, 95.0, 94.5, 94.0, 93.5]
     for j, close in enumerate(closes):
         bars.append(_bar(datetime(2026, 9, 14, 13, 10) + timedelta(minutes=5 * j), close))
@@ -204,13 +199,16 @@ def test_quarantined_asian_fire_is_shadow_recorded_then_withheld(monkeypatch):
     assert recorded == ["ASIAN_BREAKDOWN"]
 
 
-def test_nonquarantined_fire_continues_downstream(monkeypatch):
+def test_vol_continuation_cannot_bypass_quarantined_primary(monkeypatch):
     sig = _fire(archetype="VOL_CONTINUATION")
     latest = datetime(2026, 9, 14, 13, 35)
     bars = [_bar(latest - timedelta(minutes=5), 96.0), _bar(latest, 95.0)]
+    recorded = []
 
     monkeypatch.setattr(pe, "_legacy_evaluate", lambda db: [sig])
     monkeypatch.setattr(pe, "_legacy_load_recent", lambda db, tf, n: bars)
     monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5: (True, "ok"))
+    monkeypatch.setattr(pe, "_record_quarantined_shadow", lambda db, signal: recorded.append(signal.archetype))
 
-    assert pe.evaluate(object()) == [sig]
+    assert pe.evaluate(object()) == []
+    assert recorded == ["VOL_CONTINUATION"]
