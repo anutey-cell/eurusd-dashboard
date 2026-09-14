@@ -38,6 +38,123 @@ jobs:
             docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.prod ps
             docker inspect --format='backend_status={{.State.Status}} backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} backend_started={{.State.StartedAt}}' xauusd-backend
 
+            echo '=== MISSED-MOVE FORENSICS: M15 TUNED VS LEGACY-STRICT ==='
+            docker exec -i xauusd-backend python - <<'PY'
+            import json
+            from datetime import timezone
+            from database import db_session
+            from services.historical_data_provider import get_historical_candles
+            from services.intraday_strategies import analyze_momentum_breakout
+
+            def iso(t):
+                if t is None:
+                    return None
+                if getattr(t, 'tzinfo', None) is None:
+                    t = t.replace(tzinfo=timezone.utc)
+                return t.isoformat()
+
+            with db_session() as db:
+                candles, source = get_historical_candles(
+                    db=db,
+                    timeframe='M15',
+                    lookback=400,
+                    allow_synthetic_fallback=False,
+                )
+
+            rows = []
+            start = max(30, len(candles) - 32)
+            for i in range(start, len(candles)):
+                window = candles[:i + 1]
+                bar = window[-1]
+                at = bar.time if getattr(bar.time, 'tzinfo', None) else bar.time.replace(tzinfo=timezone.utc)
+                tuned = analyze_momentum_breakout(
+                    candles=window,
+                    at=at,
+                    macro_events=[],
+                    pip_size=1.0,
+                    enable_killzone=True,
+                    enable_news_filter=False,
+                )
+                strict = analyze_momentum_breakout(
+                    candles=window,
+                    at=at,
+                    macro_events=[],
+                    pip_size=1.0,
+                    min_body_atr_mult=2.0,
+                    min_volume_mult=1.5,
+                    min_close_pct=0.80,
+                    max_sl_pts=25.0,
+                    enable_killzone=True,
+                    enable_news_filter=False,
+                )
+                rows.append({
+                    'bar_time': iso(bar.time),
+                    'o': round(float(bar.open), 2),
+                    'h': round(float(bar.high), 2),
+                    'l': round(float(bar.low), 2),
+                    'c': round(float(bar.close), 2),
+                    'body': round(abs(float(bar.close) - float(bar.open)), 2),
+                    'direction': 'UP' if bar.close > bar.open else 'DOWN' if bar.close < bar.open else 'FLAT',
+                    'volume': int(bar.volume or 0),
+                    'tuned_signal': tuned.signal,
+                    'tuned_reason': tuned.reason,
+                    'strict_signal': strict.signal,
+                    'strict_reason': strict.reason,
+                })
+
+            print(json.dumps({
+                'data_source': source,
+                'candle_count': len(candles),
+                'sample_count': len(rows),
+                'rows': rows,
+            }, default=str, sort_keys=True))
+            PY
+
+            echo '=== RECENT STRATEGIST STATE CHANGES (8H) ==='
+            docker exec -i xauusd-backend python - <<'PY'
+            import json
+            from datetime import datetime, timedelta, timezone
+            from database import db_session
+            from db_models import StrategistVerdict
+
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=8)
+            with db_session() as db:
+                rows = (
+                    db.query(StrategistVerdict)
+                    .filter(StrategistVerdict.created_at >= cutoff)
+                    .order_by(StrategistVerdict.created_at.asc())
+                    .all()
+                )
+
+            out = []
+            prior = None
+            for r in rows:
+                sig = (
+                    r.decision,
+                    r.conditions_passed,
+                    r.market_state,
+                    r.tf_alignment_label,
+                    r.session_classification,
+                    r.execution_status,
+                    r.setup_score,
+                )
+                if sig == prior:
+                    continue
+                prior = sig
+                out.append({
+                    'at': r.created_at.isoformat() if r.created_at else None,
+                    'decision': r.decision,
+                    'conditions': r.conditions_passed,
+                    'setup_score': r.setup_score,
+                    'market_state': r.market_state,
+                    'tf_alignment': r.tf_alignment_label,
+                    'session': r.session_classification,
+                    'execution_status': r.execution_status,
+                    'reason': (r.execution_status_reason or '')[:240],
+                })
+            print(json.dumps({'verdict_rows': len(rows), 'state_changes': out[-80:]}, default=str, sort_keys=True))
+            PY
+
             echo '=== SAFE RUNTIME SWITCHES ==='
             docker exec -i xauusd-backend python - <<'PY'
             import json
@@ -64,15 +181,18 @@ jobs:
             docker exec -i xauusd-backend python - <<'PY'
             import json
             import urllib.request
+            from config import settings
 
-            def get(path):
-                with urllib.request.urlopen('http://127.0.0.1:8000' + path, timeout=5) as r:
+            def get(path, headers=None):
+                req = urllib.request.Request('http://127.0.0.1:8000' + path, headers=headers or {})
+                with urllib.request.urlopen(req, timeout=5) as r:
                     return json.load(r)
 
             health = get('/api/v1/health')
             print('backend_health_ok=', bool(health))
 
-            status = get('/api/v1/bridge/status')
+            secret = str(getattr(settings, 'mt5_bridge_shared_secret', '') or '').strip()
+            status = get('/api/v1/bridge/status', {'X-Bridge-Secret': secret})
             data = status.get('data') or {}
             daemons = data.get('daemons') or {}
             print(json.dumps({
@@ -99,5 +219,8 @@ jobs:
                 verdicts = db.query(StrategistVerdict).count()
             print(json.dumps({'pending_execution_counts': counts, 'strategist_verdict_count': verdicts}, sort_keys=True))
             PY
+
+            echo '=== POST-DEPLOY TAKEOVER ASSERTIONS (NON-BLOCKING IN AUDIT BRANCH) ==='
+            docker exec -i xauusd-backend python scripts/takeover_safety_check.py || true
 
             echo '=== AUDIT COMPLETE (READ ONLY) ==='
