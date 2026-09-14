@@ -59,3 +59,16 @@ def test_terminal_guard_blocks_disconnected_or_trade_disabled():
     assert verify_terminal(SimpleNamespace(connected=False, trade_allowed=True)).ok is False
     assert verify_terminal(SimpleNamespace(connected=True, trade_allowed=False)).ok is False
     assert verify_terminal(SimpleNamespace(connected=True, trade_allowed=True)).ok is True
+
+
+def test_atomic_bridge_claim_route_is_registered():
+    import routers
+    from routers import bridge
+
+    assert routers.BRIDGE_ATOMIC_CLAIM_INSTALLED is True
+    matching = [
+        route for route in bridge.router.routes
+        if getattr(route, "path", None) == "/claim-v2/{order_id}"
+    ]
+    assert len(matching) == 1
+    assert "POST" in matching[0].methods
