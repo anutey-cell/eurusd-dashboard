@@ -10,7 +10,6 @@ This script does not query or mutate trading tables and never places orders.
 from __future__ import annotations
 
 import json
-import sys
 
 import services
 from config import settings
@@ -22,6 +21,7 @@ def main() -> int:
         "governor": True,
         "strategist_cleanup": True,
         "legacy_executor": True,
+        "direct_local_mt5": True,
     }
 
     switches = {
