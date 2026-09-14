@@ -154,6 +154,10 @@ def run_dual_engines(db: Session) -> dict:
     # ── Engine 3: Momentum Breakout M15 ──────────────────────────────────
     # Catches the strong NY-open / news-spike moves that ICT misses because
     # they don't go through the sweep -> MSS -> FVG choreography.
+    # IMPORTANT: use analyze_momentum_breakout's canonical defaults here.
+    # The live Telegram momentum hook calls the same function with defaults;
+    # hard-coding older stricter values here previously made the observation
+    # layer say WAIT while the live hook correctly emitted a signal.
     try:
         from services.intraday_strategies import analyze_momentum_breakout
         from data.candles import get_candles
@@ -182,11 +186,12 @@ def run_dual_engines(db: Session) -> dict:
                 m_events = []
 
             mb_result = analyze_momentum_breakout(
-                candles=m15_resp.candles, at=now, macro_events=m_events,
-                pip_size=1.0, target_rr=2.5,
-                min_body_atr_mult=2.0, min_volume_mult=1.5,
-                min_close_pct=0.80, max_sl_pts=25.0,
-                enable_killzone=True, enable_news_filter=True,
+                candles=m15_resp.candles,
+                at=now,
+                macro_events=m_events,
+                pip_size=1.0,
+                enable_killzone=True,
+                enable_news_filter=True,
             )
             results["momentum_breakout"]["signal"] = mb_result.signal
             results["momentum_breakout"]["reason"] = mb_result.reason[:120]

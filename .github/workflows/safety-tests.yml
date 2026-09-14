@@ -54,12 +54,13 @@ jobs:
             $errors | ForEach-Object { Write-Error $_.Message }
             exit 1
           }
-      - name: Run takeover safety tests
+      - name: Run takeover safety and momentum consistency tests
         run: >-
           pytest -q
           tests/test_takeover_execution_safety.py
           tests/test_bridge_safety.py
           tests/test_control_plane_security.py
+          tests/test_momentum_consistency.py
       - name: Run read-only post-deploy safety check against safe CI config
         env:
           API_KEY: ci-operator-key-not-a-production-secret

@@ -1,16 +1,34 @@
 """
-Diagnose WHY analyze_momentum_breakout fires zero times on a historical window.
+Diagnose WHY analyze_momentum_breakout fires or rejects bars on a historical window.
 
-Replicates the function's gate sequence but instead of early-returning on the
-first failure, it records WHICH gate failed for every candle. Returns a per-gate
-filtering breakdown so we can see which thresholds are too aggressive.
+Replicates the strategy's core gate sequence but, instead of early-returning on
+the first failure, records how many bars pass each gate. Canonical production
+thresholds are read from analyze_momentum_breakout's function signature so the
+audit cannot silently drift from the live momentum alert path again.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import inspect
+from datetime import timezone
 from typing import Iterable
 
-from services.intraday_strategies import _atr, _ema, _in_killzone
+from services.intraday_strategies import (
+    _atr,
+    _ema,
+    _in_killzone,
+    analyze_momentum_breakout,
+)
+
+
+def _canonical_defaults() -> dict[str, float]:
+    """Read the live strategy defaults directly from its public signature."""
+    sig = inspect.signature(analyze_momentum_breakout)
+    return {
+        "min_body_atr_mult": float(sig.parameters["min_body_atr_mult"].default),
+        "min_volume_mult": float(sig.parameters["min_volume_mult"].default),
+        "min_close_pct": float(sig.parameters["min_close_pct"].default),
+        "max_sl_pts": float(sig.parameters["max_sl_pts"].default),
+    }
 
 
 def audit_momentum_gates(
@@ -26,11 +44,20 @@ def audit_momentum_gates(
     Returns a structured dict showing:
       - total candles audited
       - per-gate pass count at each threshold
-      - combined gate sequence pass count for current production defaults
-      - recommended thresholds based on what would produce a target number of trades
+      - combined pass count using the SAME canonical thresholds as the live path
+      - candidate tuning combinations for research only
+
+    This audit intentionally does not label looser grid combinations as
+    production settings. Production truth comes only from
+    analyze_momentum_breakout's defaults.
     """
     if not candles or len(candles) < 22:
         return {"error": "Need >= 22 candles"}
+
+    defaults = _canonical_defaults()
+    prod_body = defaults["min_body_atr_mult"]
+    prod_volume = defaults["min_volume_mult"]
+    prod_close = defaults["min_close_pct"]
 
     # Skip warmup
     audit_start = 22
@@ -44,10 +71,9 @@ def audit_momentum_gates(
     gate_close_pass  = {p: 0 for p in close_pcts}
     gate_ema_pass = 0
 
-    # Combined (current production) sequence: kz AND body>=2 AND vol>=1.5 AND close>=0.80 AND ema-agree
     combined_pass = 0
-    # Recommended tuning grid
-    grid: dict[tuple, int] = {}    # (body, vol, close) -> count when all combined
+    # Research grid only — not production truth.
+    grid: dict[tuple, int] = {}
 
     closes_all = [c.close for c in candles]
 
@@ -64,11 +90,18 @@ def audit_momentum_gates(
             continue
         body_mult = body / atr
 
-        # Volume relative to 20-bar avg ending at i-1
+        # Volume relative to 20-bar avg ending at i-1. The live strategy skips
+        # the volume gate if no usable volume baseline exists, so preserve that
+        # behavior in the combined pass calculation.
         prev_vols = [c.volume for c in candles[max(0, i-20):i] if c.volume]
+        volume_gate_available = bool(prev_vols)
         if prev_vols:
             avg_vol = sum(prev_vols) / len(prev_vols)
-            vol_mult = bar.volume / avg_vol if avg_vol > 0 else 0.0
+            if avg_vol > 0:
+                vol_mult = bar.volume / avg_vol
+            else:
+                vol_mult = 0.0
+                volume_gate_available = False
         else:
             vol_mult = 0.0
 
@@ -79,56 +112,77 @@ def audit_momentum_gates(
         # Killzone
         ct = bar.time if bar.time.tzinfo else bar.time.replace(tzinfo=timezone.utc)
         in_kz = _in_killzone(ct)
-        if in_kz: gate_killzone_pass += 1
+        if in_kz:
+            gate_killzone_pass += 1
 
         # EMA21 slope
         ema21 = _ema(closes_all[:i+1], 21)
         ema_ok = (bull and ema21[-1] > ema21[-3]) or ((not bull) and ema21[-1] < ema21[-3])
-        if ema_ok: gate_ema_pass += 1
+        if ema_ok:
+            gate_ema_pass += 1
 
         # Per-threshold body
         for m in body_atr_mults:
-            if body_mult >= m: gate_body_pass[m] += 1
-        # Per-threshold volume
+            if body_mult >= m:
+                gate_body_pass[m] += 1
+        # Per-threshold volume (descriptive only when volume exists)
         for m in volume_mults:
-            if vol_mult >= m: gate_volume_pass[m] += 1
+            if volume_gate_available and vol_mult >= m:
+                gate_volume_pass[m] += 1
         # Per-threshold close_pct
         for p in close_pcts:
-            if close_pct >= p: gate_close_pass[p] += 1
+            if close_pct >= p:
+                gate_close_pass[p] += 1
 
-        # Combined production defaults: body>=2, vol>=1.5, close>=0.80, ema agree, killzone
-        gates = enable_killzone == False or in_kz
-        gates = gates and (body_mult >= 2.0) and (vol_mult >= 1.5) and (close_pct >= 0.80) and ema_ok
-        if gates: combined_pass += 1
+        # Combined canonical defaults. No-volume data follows live behavior:
+        # volume does not veto a bar when a usable baseline is absent.
+        volume_ok = (not volume_gate_available) or (vol_mult >= prod_volume)
+        gates = (not enable_killzone) or in_kz
+        gates = (
+            gates
+            and body_mult >= prod_body
+            and volume_ok
+            and close_pct >= prod_close
+            and ema_ok
+        )
+        if gates:
+            combined_pass += 1
 
-        # Grid scan for tuning recommendations
+        # Grid scan for research diagnostics. If volume is unavailable, mirror
+        # the live strategy and treat the volume gate as non-vetoing.
         for bm in body_atr_mults:
             for vm in volume_mults:
                 for cp in close_pcts:
-                    if (vm <= vol_mult and bm <= body_mult and cp <= close_pct and
-                        ema_ok and (not enable_killzone or in_kz)):
+                    grid_volume_ok = (not volume_gate_available) or (vol_mult >= vm)
+                    if (
+                        bm <= body_mult
+                        and grid_volume_ok
+                        and cp <= close_pct
+                        and ema_ok
+                        and (not enable_killzone or in_kz)
+                    ):
                         grid[(bm, vm, cp)] = grid.get((bm, vm, cp), 0) + 1
 
-    # Sort grid: pick the LOOSEST that still produces 50+ trades, or the loosest overall
     grid_sorted = sorted(grid.items(), key=lambda kv: (-kv[1], kv[0]))
-    recommend = []
+    research_configs = []
     for (bm, vm, cp), count in grid_sorted[:8]:
-        recommend.append({
-            "min_body_atr_mult": bm, "min_volume_mult": vm, "min_close_pct": cp,
+        research_configs.append({
+            "min_body_atr_mult": bm,
+            "min_volume_mult": vm,
+            "min_close_pct": cp,
             "trades_would_fire": count,
         })
 
     return {
-        "auditedCandles":   audited,
-        "killzonePass":     gate_killzone_pass,
-        "emaSlopePass":     gate_ema_pass,
-        "bodyAtrPass":      gate_body_pass,
-        "volumeMultPass":   gate_volume_pass,
-        "closePctPass":     gate_close_pass,
+        "auditedCandles": audited,
+        "killzonePass": gate_killzone_pass,
+        "emaSlopePass": gate_ema_pass,
+        "bodyAtrPass": gate_body_pass,
+        "volumeMultPass": gate_volume_pass,
+        "closePctPass": gate_close_pass,
         "combinedProductionPass": combined_pass,
-        "productionDefaults": {
-            "min_body_atr_mult": 2.0, "min_volume_mult": 1.5,
-            "min_close_pct": 0.80,
-        },
-        "recommendedConfigs": recommend,
+        "productionDefaults": defaults,
+        # New, clearer name plus the legacy alias for API compatibility.
+        "researchConfigs": research_configs,
+        "recommendedConfigs": research_configs,
     }
