@@ -4,6 +4,11 @@ name: Deploy XAUUSD Dashboard
 # Total run time ≈ 3-4 min from `git push` to live (first run is longer;
 # subsequent runs reuse the BuildKit registry cache).
 #
+# Research-only Predator audit/replay files are intentionally excluded from the
+# automatic deployment trigger. They run in their own workflows and do not
+# change the production image/runtime. Manual workflow_dispatch remains
+# available for an explicit deployment.
+#
 # Required GitHub repository secrets:
 #   DO_HOST                  Droplet public IP or DuckDNS hostname
 #   DO_USER                  Usually "root"
@@ -16,6 +21,13 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'backend/scripts/predator_*audit.py'
+      - 'backend/scripts/predator_offline_revalidation.py'
+      - 'backend/scripts/export_predator_history.py'
+      - 'backend/tests/**'
+      - '.github/workflows/predator-*.yml'
+      - '**/*.md'
   workflow_dispatch:
 
 concurrency:
