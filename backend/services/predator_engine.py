@@ -1,29 +1,51 @@
 """Compatibility wrapper for Predator Engine calendar/freshness bugfix (2026-09-14).
 
 The frozen engine implementation is preserved verbatim in predator_engine_legacy.py.
-This module patches only four operational defects:
+This module patches only operational safety/correctness defects:
 1) previous-day levels use the previous XAU trading session (22:00 UTC boundary),
 2) Asian and PDL FIRE events must be fresh, not recycled from a 4h lookback,
 3) PDL narrative says previous-session instead of yesterday,
-4) alert regime/session display uses the signal event session.
+4) alert regime/session display uses the signal event session,
+5) legacy pre-fix performance claims are suppressed pending post-fix validation,
+6) a reusable FIRE freshness guard validates signal-bar and M5-feed recency.
 
 Sizing, SL/TP geometry, regime direction/volatility gates and SELL mandate are unchanged.
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from services import predator_engine_legacy as _legacy
 
 # Re-export the frozen public API first; selected functions are replaced below.
 PredatorSignal = _legacy.PredatorSignal
-_ARCHETYPE_STATS = _legacy._ARCHETYPE_STATS
 _EXPECTED_TOTAL_MOVE_PTS = _legacy._EXPECTED_TOTAL_MOVE_PTS
 _EXTENSION_LIMIT = _legacy._EXTENSION_LIMIT
 format_telegram_invalidated = _legacy.format_telegram_invalidated
 format_predator_execution_summary = _legacy.format_predator_execution_summary
 detect_vol_continuation = _legacy.detect_vol_continuation
+
+# The old figures were measured against pre-fix trigger semantics and must not
+# be advertised as performance of the corrected production trigger. Preserve
+# the fields/message shape while making their validation status explicit.
+_ARCHETYPE_STATS = {
+    "ASIAN_BREAKDOWN": {
+        "sample": "POST-FIX VALIDATION PENDING",
+        "wr": "—", "expectancy": "—", "pf": "—",
+    },
+    "PDL_BREAK": {
+        "sample": "POST-FIX VALIDATION PENDING",
+        "wr": "—", "expectancy": "—", "pf": "—",
+    },
+    "VOL_CONTINUATION": {
+        "sample": "inherits primary",
+        "wr": "inherits primary", "expectancy": "inherits primary",
+        "pf": "inherits primary",
+    },
+}
+# Frozen formatter resolves this global in the legacy module.
+_legacy._ARCHETYPE_STATS = _ARCHETYPE_STATS
 
 # Preserve references to frozen helpers before monkey-patching the legacy module.
 _legacy_load_recent = _legacy._load_recent
@@ -78,6 +100,51 @@ def _fresh_m5_acceptance_below(m5_bars: list[tuple], level: float):
             "low": confirm[3], "idx_in_slice": len(m5_bars) - 1,
         }
     return None
+
+
+def _as_utc(value):
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def validate_fire_freshness(signal, m5_bars: list[tuple], *,
+                            now_utc=None, max_lag_bars: int = 1,
+                            max_data_age_min: int = 15) -> tuple[bool, str]:
+    """Fail-closed FIRE guard shared by notification/execution orchestration.
+
+    A FIRE must reference the latest M5 event (one-bar tolerance) and the
+    latest M5 feed itself must be recent. This prevents a future detector
+    regression from turning a historical breach into a current alert/order.
+    """
+    if getattr(signal, "state", None) != "FIRE":
+        return True, "not_fire"
+    if not m5_bars:
+        return False, "no_m5_reference"
+    try:
+        signal_t = _as_utc(getattr(signal, "bar_time", None))
+        latest_t = _as_utc(m5_bars[-1][0])
+        now_t = _as_utc(now_utc or datetime.now(timezone.utc))
+    except Exception:
+        return False, "invalid_fire_timestamp"
+
+    # Signal cannot be materially ahead of the canonical M5 store.
+    if signal_t - latest_t > timedelta(minutes=1):
+        return False, "future_signal_bar"
+
+    max_lag = timedelta(minutes=5 * max(0, int(max_lag_bars)))
+    if latest_t - signal_t > max_lag:
+        return False, "stale_signal_bar"
+
+    # Canonical data itself must also be current. Allow a small future skew only.
+    if latest_t - now_t > timedelta(minutes=1):
+        return False, "future_m5_feed"
+    if now_t - latest_t > timedelta(minutes=max(1, int(max_data_age_min))):
+        return False, "stale_m5_feed"
+
+    return True, "ok"
 
 
 def _load_recent(db, tf: str, n: int):
@@ -177,5 +244,6 @@ __all__ = [
     "PredatorSignal", "evaluate", "format_telegram_alert",
     "format_telegram_invalidated", "format_predator_execution_summary",
     "detect_asian_breakdown", "detect_pdl_break", "detect_vol_continuation",
+    "validate_fire_freshness",
     "_ARCHETYPE_STATS", "_EXPECTED_TOTAL_MOVE_PTS", "_EXTENSION_LIMIT",
 ]
