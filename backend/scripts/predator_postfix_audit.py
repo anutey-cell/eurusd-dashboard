@@ -32,8 +32,6 @@ def _load(db, tf, raw_limit):
         t = pe._legacy._parse_ts(r[0])
         if getattr(t, "tzinfo", None) is not None:
             t = t.replace(tzinfo=None)
-        # Duplicate ingestion rows are irrelevant to a bar-close replay. Keep one
-        # canonical observation per timestamp; the query is already newest-first.
         if t not in by_time:
             by_time[t] = (t, float(r[1]), float(r[2]), float(r[3]),
                           float(r[4]), float(r[5] or 0))
@@ -79,7 +77,6 @@ def _replay(m5, start_idx, sig, max_bars=96):
         hit_sl = high >= stop
         hit_tp1 = low <= tp1
         hit_tp2 = low <= tp2
-        # Conservative same-bar ordering: adverse exit wins ambiguity.
         if hit_sl:
             return {"outcome": "SL", "pnl": -(stop-entry), "mfe": mfe, "mae": mae,
                     "tp1": hit_tp1, "tp2": hit_tp2}
@@ -123,12 +120,13 @@ def _stats(rows):
 
 
 def main():
-    # Bounded reads protect the production container. 45k M5 rows is ~156
-    # calendar days at 24h trading and covers the prior research horizon while
-    # leaving room for duplicate ingestion rows before timestamp de-duplication.
+    # Deliberately small footprint on the live container. 12k M5 rows is
+    # roughly six calendar weeks at continuous 5-minute sampling before
+    # weekend gaps and duplicate-row removal. This is a governance sample,
+    # not a replacement for an offline full-history research run.
     with SessionLocal() as db:
-        m5 = _load(db, "M5", 45000)
-        h1 = _load(db, "H1", 5000)
+        m5 = _load(db, "M5", 12000)
+        h1 = _load(db, "H1", 1200)
 
     if len(m5) < 800:
         raise SystemExit(f"insufficient unique M5 history: {len(m5)}")
@@ -137,7 +135,6 @@ def main():
     results = defaultdict(list)
     seen = set()
 
-    # 700 bars matches the production patched M5 history depth.
     for i in range(700, len(m5) - 96):
         window = m5[i-699:i+1]
         vol = _vol_ratio(m5, i)
@@ -163,7 +160,7 @@ def main():
             results[sig.archetype].append(row)
 
     report = {
-        "mode": "READ_ONLY_POSTFIX_REPLAY",
+        "mode": "READ_ONLY_POSTFIX_GOVERNANCE_SAMPLE",
         "m5_bars_unique": len(m5),
         "h1_bars_unique": len(h1),
         "m5_start": m5[0][0].isoformat(),
