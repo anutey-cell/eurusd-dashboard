@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Audit VPS over existing deploy SSH channel
+      - name: Inspect momentum notification path
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
@@ -26,160 +26,22 @@ jobs:
           script: |
             set -eu
             cd /opt/xauusd
-
-            echo '=== VPS REPOSITORY ==='
-            printf 'git_head='; git rev-parse HEAD
-            printf 'git_branch='; git branch --show-current || true
-            docker inspect --format='backend_status={{.State.Status}} backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' xauusd-backend
-
-            echo '=== LIVE CANDLE FRESHNESS + PROVIDERS ==='
+            echo '=== BACKEND ==='
+            docker inspect --format='status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' xauusd-backend
+            echo '=== MOMENTUM / TELEGRAM / STRATEGIST LOGS LAST 3H ==='
+            docker logs --since 3h xauusd-backend 2>&1 | grep -Ei 'momentum|telegram|strategist_loop|watchlist alert' | tail -n 800 || true
+            echo '=== CURRENT CALENDAR ==='
             docker exec -i xauusd-backend python - <<'PY'
             import json
-            from datetime import datetime, timezone
-            from sqlalchemy import text
-            from database import db_session
-            from data.candles import get_candles
-
-            def utc(v):
-                if isinstance(v, str):
-                    v = datetime.fromisoformat(v.replace('Z', '+00:00'))
-                if v.tzinfo is None:
-                    v = v.replace(tzinfo=timezone.utc)
-                return v.astimezone(timezone.utc)
-
-            now = datetime.now(timezone.utc)
-            db_latest = {}
-            with db_session() as db:
-                for tf in ('M5','M15','H1','H4','D1'):
-                    r = db.execute(text("""
-                        SELECT candle_time, source, close
-                        FROM historical_candles
-                        WHERE instrument='XAU/USD' AND timeframe=:tf
-                        ORDER BY candle_time DESC LIMIT 1
-                    """), {'tf': tf}).fetchone()
-                    if r:
-                        ts = utc(r[0])
-                        db_latest[tf] = {
-                            'latest': ts.isoformat(),
-                            'age_min': round((now-ts).total_seconds()/60, 1),
-                            'source': r[1],
-                            'close': float(r[2]),
-                        }
-                    else:
-                        db_latest[tf] = None
-
-            live = {}
-            for tf in ('M5','M15','H1','H4'):
-                try:
-                    resp = get_candles(interval=tf, limit=200, pair='xauusd')
-                    cs = resp.candles or []
-                    last = cs[-1] if cs else None
-                    live[tf] = {
-                        'source': getattr(resp, 'source', 'unknown'),
-                        'count': len(cs),
-                        'latest': utc(last.time).isoformat() if last else None,
-                        'close': float(last.close) if last else None,
-                    }
-                except Exception as exc:
-                    live[tf] = {'error': f'{type(exc).__name__}: {exc}'}
-            print(json.dumps({'now': now.isoformat(), 'database_latest': db_latest, 'get_candles': live}, default=str, sort_keys=True))
+            from data.calendar import get_calendar
+            try:
+                cal = get_calendar()
+                events=[]
+                for e in (cal.events or []):
+                    d=e.model_dump() if hasattr(e,'model_dump') else dict(e)
+                    events.append(d)
+                print(json.dumps(events[:100], default=str, sort_keys=True))
+            except Exception as exc:
+                print(json.dumps({'calendar_error':f'{type(exc).__name__}: {exc}'}))
             PY
-
-            echo '=== MISSED-MOVE FORENSICS: LATEST M15 TUNED VS LEGACY-STRICT ==='
-            docker exec -i xauusd-backend python - <<'PY'
-            import json
-            from datetime import datetime, timezone
-            from sqlalchemy import text
-            from database import db_session
-            from models.candle import Candle
-            from services.intraday_strategies import analyze_momentum_breakout
-
-            def utc(v):
-                if isinstance(v, str):
-                    v = datetime.fromisoformat(v.replace('Z', '+00:00'))
-                if v.tzinfo is None:
-                    v = v.replace(tzinfo=timezone.utc)
-                return v.astimezone(timezone.utc)
-
-            with db_session() as db:
-                raw = db.execute(text("""
-                    SELECT candle_time, open, high, low, close, volume, source
-                    FROM historical_candles
-                    WHERE instrument='XAU/USD' AND timeframe='M15'
-                      AND source IN ('csv','tradingview','mt5','provider','sync','broker','twelvedata')
-                    ORDER BY candle_time DESC LIMIT 400
-                """)).fetchall()
-            raw = list(reversed(raw))
-            candles = [Candle(
-                time=utc(r[0]),
-                open=float(r[1]), high=float(r[2]), low=float(r[3]), close=float(r[4]),
-                volume=int(r[5] or 0),
-            ) for r in raw]
-
-            rows = []
-            start = max(30, len(candles) - 32)
-            for i in range(start, len(candles)):
-                window = candles[:i + 1]
-                bar = window[-1]
-                at = utc(bar.time)
-                tuned = analyze_momentum_breakout(
-                    candles=window, at=at, macro_events=[], pip_size=1.0,
-                    enable_killzone=True, enable_news_filter=False,
-                )
-                strict = analyze_momentum_breakout(
-                    candles=window, at=at, macro_events=[], pip_size=1.0,
-                    min_body_atr_mult=2.0, min_volume_mult=1.5,
-                    min_close_pct=0.80, max_sl_pts=25.0,
-                    enable_killzone=True, enable_news_filter=False,
-                )
-                rows.append({
-                    'bar_time': at.isoformat(),
-                    'o': round(float(bar.open), 2), 'h': round(float(bar.high), 2),
-                    'l': round(float(bar.low), 2), 'c': round(float(bar.close), 2),
-                    'body': round(abs(float(bar.close)-float(bar.open)), 2),
-                    'direction': 'UP' if bar.close > bar.open else 'DOWN' if bar.close < bar.open else 'FLAT',
-                    'volume': int(bar.volume or 0),
-                    'tuned_signal': tuned.signal, 'tuned_reason': tuned.reason,
-                    'strict_signal': strict.signal, 'strict_reason': strict.reason,
-                })
-            print(json.dumps({
-                'candle_count': len(candles),
-                'first': candles[0].time.isoformat() if candles else None,
-                'last': candles[-1].time.isoformat() if candles else None,
-                'latest_source': raw[-1][6] if raw else None,
-                'rows': rows,
-            }, default=str, sort_keys=True))
-            PY
-
-            echo '=== RECENT STRATEGIST STATE CHANGES (8H) ==='
-            docker exec -i xauusd-backend python - <<'PY'
-            import json
-            from datetime import datetime, timedelta, timezone
-            from sqlalchemy import text
-            from database import db_session
-
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=8)
-            with db_session() as db:
-                rows = db.execute(text("""
-                    SELECT created_at, decision, conditions_passed, setup_score,
-                           market_state, tf_alignment_label, session_classification,
-                           execution_status, execution_status_reason
-                    FROM strategist_verdicts
-                    WHERE created_at >= :cutoff
-                    ORDER BY created_at ASC
-                """), {'cutoff': cutoff}).fetchall()
-                serial = [{
-                    'at': r[0].isoformat() if hasattr(r[0], 'isoformat') else str(r[0]),
-                    'decision': r[1], 'conditions': r[2], 'setup_score': r[3],
-                    'market_state': r[4], 'tf_alignment': r[5], 'session': r[6],
-                    'execution_status': r[7], 'reason': (r[8] or '')[:240],
-                } for r in rows]
-            out=[]; prior=None
-            for x in serial:
-                sig=(x['decision'],x['conditions'],x['setup_score'],x['market_state'],x['tf_alignment'],x['session'],x['execution_status'],x['reason'])
-                if sig != prior:
-                    out.append(x); prior=sig
-            print(json.dumps({'verdict_rows': len(serial), 'state_changes': out[-100:]}, default=str, sort_keys=True))
-            PY
-
-            echo '=== AUDIT COMPLETE (READ ONLY) ==='
+            echo '=== DONE ==='
