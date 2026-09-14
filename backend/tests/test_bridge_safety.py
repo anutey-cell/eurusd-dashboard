@@ -66,9 +66,11 @@ def test_atomic_bridge_claim_route_is_registered():
     from routers import bridge
 
     assert routers.BRIDGE_ATOMIC_CLAIM_INSTALLED is True
+    # bridge.router already carries APIRouter(prefix="/bridge"), so the route
+    # object stores the prefixed path. main.py later adds /api/v1.
     matching = [
         route for route in bridge.router.routes
-        if getattr(route, "path", None) == "/claim-v2/{order_id}"
+        if getattr(route, "path", None) == "/bridge/claim-v2/{order_id}"
     ]
     assert len(matching) == 1
     assert "POST" in matching[0].methods
