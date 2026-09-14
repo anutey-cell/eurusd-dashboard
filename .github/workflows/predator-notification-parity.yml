@@ -1,0 +1,36 @@
+name: Predator Notification Parity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/scripts/predator_notification_parity_audit.py'
+      - '.github/workflows/predator-notification-parity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    name: Read-only shadow-vs-legacy notification parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Run parity audit on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+          command_timeout: 5m
+          script: |
+            set -eu
+            cd /opt/xauusd
+            git fetch origin main
+            git reset --hard origin/main
+            printf 'git_head='; git rev-parse HEAD
+            docker inspect --format='backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' xauusd-backend
+            docker cp backend/scripts/predator_notification_parity_audit.py xauusd-backend:/tmp/predator_notification_parity_audit.py
+            docker exec -e PYTHONPATH=/app -w /app xauusd-backend \
+              python /tmp/predator_notification_parity_audit.py
