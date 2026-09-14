@@ -1,11 +1,12 @@
 """Read-only post-fix Predator edge revalidation.
 
-Replays the CURRENT production detectors over stored historical M5/H1 bars and
-reports unique-opportunity sample size, win rate, expectancy, profit factor and
-risk diagnostics. No database writes and no execution calls.
+Replays the CURRENT production detectors over a bounded, deduplicated window of
+stored historical M5/H1 bars and reports unique-opportunity sample size, win
+rate, expectancy, profit factor and risk diagnostics. No database writes and
+no execution calls.
 
 Usage (inside backend container):
-    python /app/scripts/predator_postfix_audit.py
+    PYTHONPATH=/app python /app/scripts/predator_postfix_audit.py
 """
 from __future__ import annotations
 
@@ -19,26 +20,30 @@ from database import SessionLocal
 from services import predator_engine as pe
 
 
-def _load(db, tf):
+def _load(db, tf, raw_limit):
+    """Load only the latest bounded rows, then dedupe by candle timestamp."""
     rows = db.execute(text(
         "SELECT candle_time, open, high, low, close, volume "
         "FROM historical_candles WHERE instrument='XAU/USD' AND timeframe=:tf "
-        "ORDER BY candle_time"
-    ), {"tf": tf}).fetchall()
-    out = []
+        "ORDER BY candle_time DESC LIMIT :lim"
+    ), {"tf": tf, "lim": raw_limit}).fetchall()
+    by_time = {}
     for r in rows:
         t = pe._legacy._parse_ts(r[0])
         if getattr(t, "tzinfo", None) is not None:
             t = t.replace(tzinfo=None)
-        out.append((t, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5] or 0)))
-    return out
+        # Duplicate ingestion rows are irrelevant to a bar-close replay. Keep one
+        # canonical observation per timestamp; the query is already newest-first.
+        if t not in by_time:
+            by_time[t] = (t, float(r[1]), float(r[2]), float(r[3]),
+                          float(r[4]), float(r[5] or 0))
+    return [by_time[t] for t in sorted(by_time)]
 
 
 def _vol_ratio(bars, i, window=50):
     if i < window:
         return None
-    hist = [b[5] for b in bars[i-window:i]]
-    avg = sum(hist) / window
+    avg = sum(b[5] for b in bars[i-window:i]) / window
     return round(bars[i][5] / avg, 4) if avg > 0 else None
 
 
@@ -118,12 +123,15 @@ def _stats(rows):
 
 
 def main():
+    # Bounded reads protect the production container. 45k M5 rows is ~156
+    # calendar days at 24h trading and covers the prior research horizon while
+    # leaving room for duplicate ingestion rows before timestamp de-duplication.
     with SessionLocal() as db:
-        m5 = _load(db, "M5")
-        h1 = _load(db, "H1")
+        m5 = _load(db, "M5", 45000)
+        h1 = _load(db, "H1", 5000)
 
     if len(m5) < 800:
-        raise SystemExit(f"insufficient M5 history: {len(m5)}")
+        raise SystemExit(f"insufficient unique M5 history: {len(m5)}")
 
     rsi_times, rsi_values = _rsi_series(h1)
     results = defaultdict(list)
@@ -156,7 +164,8 @@ def main():
 
     report = {
         "mode": "READ_ONLY_POSTFIX_REPLAY",
-        "m5_bars": len(m5),
+        "m5_bars_unique": len(m5),
+        "h1_bars_unique": len(h1),
         "m5_start": m5[0][0].isoformat(),
         "m5_end": m5[-1][0].isoformat(),
         "replay_horizon_m5_bars": 96,
