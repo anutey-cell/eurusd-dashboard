@@ -36,6 +36,8 @@ MIN_HOLDOUT_N = 8
 
 def _ts(v):
     t = pe._legacy._parse_ts(v)
+    if isinstance(t, str):
+        t = datetime.fromisoformat(t.replace("Z", "+00:00"))
     if getattr(t, "tzinfo", None) is not None:
         t = t.replace(tzinfo=None)
     return t
