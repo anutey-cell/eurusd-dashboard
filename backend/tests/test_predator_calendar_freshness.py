@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from services import predator_engine as pe
 
@@ -16,6 +16,26 @@ def _friday_reference_bars():
         ts = start + timedelta(minutes=5 * i)
         bars.append(_bar(ts, 105.0, high=110.0, low=100.0))
     return bars
+
+
+def _fire(bar_time="2026-09-14T13:35:00"):
+    return pe.PredatorSignal(
+        archetype="PDL_BREAK",
+        direction="SELL",
+        state="FIRE",
+        entry=95.0,
+        stop_loss=105.0,
+        tp1=55.0,
+        tp2=35.0,
+        rr=4.0,
+        thesis="Fresh M5 acceptance below previous-session low 100.00.",
+        trigger="fresh two-close M5 acceptance below PDL-3pt",
+        confidence="MED",
+        counterparty="Previous-session dip-buyers",
+        session="NY_OPEN",
+        bar_time=bar_time,
+        fingerprint="test",
+    )
 
 
 def test_monday_previous_session_skips_sunday_reopen_fragment():
@@ -74,23 +94,7 @@ def test_pdl_break_does_not_recycle_an_old_break():
 
 
 def test_alert_cannot_mix_regime_and_signal_session():
-    sig = pe.PredatorSignal(
-        archetype="PDL_BREAK",
-        direction="SELL",
-        state="FIRE",
-        entry=95.0,
-        stop_loss=105.0,
-        tp1=55.0,
-        tp2=35.0,
-        rr=4.0,
-        thesis="Fresh M5 acceptance below previous-session low 100.00.",
-        trigger="fresh two-close M5 acceptance below PDL-3pt",
-        confidence="MED",
-        counterparty="Previous-session dip-buyers",
-        session="NY_OPEN",
-        bar_time="2026-09-14T13:35:00",
-        fingerprint="test",
-    )
+    sig = _fire()
 
     msg = pe.format_telegram_alert(
         sig,
@@ -100,3 +104,71 @@ def test_alert_cannot_mix_regime_and_signal_session():
     assert "Regime: range × expanded × NY_OPEN" in msg
     assert "Session: NY_OPEN" in msg
     assert "range × expanded × NY_LATE" not in msg
+
+
+def test_alert_suppresses_pre_fix_performance_claims():
+    msg = pe.format_telegram_alert(
+        _fire(),
+        regime={"direction": "range", "volatility": "expanded", "session": "NY_OPEN"},
+    )
+
+    assert "POST-FIX VALIDATION PENDING" in msg
+    assert "Historical Win Rate: —" in msg
+    assert "Historical Expectancy: —" in msg
+    assert "Profit Factor: —" in msg
+    assert "73%" not in msg
+    assert "+26.4 pts/trade" not in msg
+
+
+def test_fire_freshness_guard_accepts_current_signal_and_feed():
+    latest = datetime(2026, 9, 14, 13, 35)
+    bars = [_bar(latest - timedelta(minutes=5), 96.0), _bar(latest, 95.0)]
+
+    ok, reason = pe.validate_fire_freshness(
+        _fire("2026-09-14T13:35:00"), bars,
+        now_utc=datetime(2026, 9, 14, 13, 41, tzinfo=timezone.utc),
+    )
+
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_fire_freshness_guard_rejects_old_signal_bar():
+    latest = datetime(2026, 9, 14, 13, 35)
+    bars = [_bar(latest - timedelta(minutes=5), 96.0), _bar(latest, 95.0)]
+
+    ok, reason = pe.validate_fire_freshness(
+        _fire("2026-09-14T13:25:00"), bars,
+        now_utc=datetime(2026, 9, 14, 13, 41, tzinfo=timezone.utc),
+    )
+
+    assert ok is False
+    assert reason == "stale_signal_bar"
+
+
+def test_fire_freshness_guard_rejects_stale_market_feed():
+    latest = datetime(2026, 9, 14, 13, 35)
+    bars = [_bar(latest - timedelta(minutes=5), 96.0), _bar(latest, 95.0)]
+
+    ok, reason = pe.validate_fire_freshness(
+        _fire("2026-09-14T13:35:00"), bars,
+        now_utc=datetime(2026, 9, 14, 14, 0, tzinfo=timezone.utc),
+    )
+
+    assert ok is False
+    assert reason == "stale_m5_feed"
+
+
+def test_evaluate_boundary_drops_stale_fire_before_scheduler(monkeypatch):
+    stale = _fire("2026-09-14T13:25:00")
+    latest = datetime(2026, 9, 14, 13, 35)
+    bars = [_bar(latest - timedelta(minutes=5), 96.0), _bar(latest, 95.0)]
+
+    monkeypatch.setattr(pe, "_legacy_evaluate", lambda db: [stale])
+    monkeypatch.setattr(pe, "_legacy_load_recent", lambda db, tf, n: bars)
+    monkeypatch.setattr(
+        pe, "validate_fire_freshness",
+        lambda signal, m5: (False, "stale_signal_bar"),
+    )
+
+    assert pe.evaluate(None) == []
