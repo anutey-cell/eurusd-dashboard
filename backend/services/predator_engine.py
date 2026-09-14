@@ -7,16 +7,19 @@ This module patches only operational safety/correctness defects:
 3) PDL narrative says previous-session instead of yesterday,
 4) alert regime/session display uses the signal event session,
 5) legacy pre-fix performance claims are suppressed pending post-fix validation,
-6) a reusable FIRE freshness guard validates signal-bar and M5-feed recency.
+6) a fail-closed FIRE freshness guard validates signal-bar and M5-feed recency.
 
 Sizing, SL/TP geometry, regime direction/volatility gates and SELL mandate are unchanged.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from services import predator_engine_legacy as _legacy
+
+log = logging.getLogger(__name__)
 
 # Re-export the frozen public API first; selected functions are replaced below.
 PredatorSignal = _legacy.PredatorSignal
@@ -50,6 +53,7 @@ _legacy._ARCHETYPE_STATS = _ARCHETYPE_STATS
 # Preserve references to frozen helpers before monkey-patching the legacy module.
 _legacy_load_recent = _legacy._load_recent
 _legacy_first_m5_close_below = _legacy._first_m5_close_below
+_legacy_evaluate = _legacy.evaluate
 
 
 def _trading_date(t):
@@ -113,7 +117,7 @@ def _as_utc(value):
 def validate_fire_freshness(signal, m5_bars: list[tuple], *,
                             now_utc=None, max_lag_bars: int = 1,
                             max_data_age_min: int = 15) -> tuple[bool, str]:
-    """Fail-closed FIRE guard shared by notification/execution orchestration.
+    """Fail-closed FIRE guard at the engine boundary.
 
     A FIRE must reference the latest M5 event (one-bar tolerance) and the
     latest M5 feed itself must be recent. This prevents a future detector
@@ -130,7 +134,6 @@ def validate_fire_freshness(signal, m5_bars: list[tuple], *,
     except Exception:
         return False, "invalid_fire_timestamp"
 
-    # Signal cannot be materially ahead of the canonical M5 store.
     if signal_t - latest_t > timedelta(minutes=1):
         return False, "future_signal_bar"
 
@@ -138,7 +141,6 @@ def validate_fire_freshness(signal, m5_bars: list[tuple], *,
     if latest_t - signal_t > max_lag:
         return False, "stale_signal_bar"
 
-    # Canonical data itself must also be current. Allow a small future skew only.
     if latest_t - now_t > timedelta(minutes=1):
         return False, "future_m5_feed"
     if now_t - latest_t > timedelta(minutes=max(1, int(max_data_age_min))):
@@ -225,15 +227,42 @@ def format_telegram_alert(sig, regime=None, key_level=None, current_price=None,
 
 
 # Patch the frozen module because its evaluate() resolves helpers/functions in
-# its own module globals. This keeps every untouched production path identical.
+# its own module globals. This keeps every untouched detector path identical.
 _legacy._prev_day_hl = _prev_day_hl
 _legacy._load_recent = _load_recent
 _legacy._first_m5_close_below = _fresh_m5_cross_below  # Asian detector: latest cross only
 _legacy.detect_pdl_break = detect_pdl_break
 
-# evaluate() remains the frozen implementation, now resolving only the patched
-# level/freshness functions above.
-evaluate = _legacy.evaluate
+
+def evaluate(db):
+    """Frozen evaluation plus a final fail-closed FIRE freshness boundary."""
+    signals = _legacy_evaluate(db)
+    if not signals:
+        return signals
+
+    # Use only the latest few canonical M5 bars here; do not trigger the 700-bar
+    # session-history expansion because this is a freshness check, not detection.
+    try:
+        latest_m5 = _legacy_load_recent(db, "M5", 3)
+    except Exception as exc:
+        log.warning("[predator] FIRE freshness reference unavailable: %s", exc)
+        latest_m5 = []
+
+    out = []
+    for sig in signals:
+        if getattr(sig, "state", None) == "FIRE":
+            ok, reason = validate_fire_freshness(sig, latest_m5)
+            if not ok:
+                log.warning(
+                    "[predator] FIRE blocked by engine freshness guard: %s %s reason=%s bar=%s",
+                    getattr(sig, "archetype", "?"), getattr(sig, "direction", "?"),
+                    reason, getattr(sig, "bar_time", None),
+                )
+                continue
+        out.append(sig)
+    return out
+
+
 detect_asian_breakdown = _legacy.detect_asian_breakdown
 
 # Keep the old research helper available to explicit callers; production does
