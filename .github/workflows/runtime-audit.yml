@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect momentum notification path
+      - name: Inspect full-session alert decisions
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
@@ -26,22 +26,6 @@ jobs:
           script: |
             set -eu
             cd /opt/xauusd
-            echo '=== BACKEND ==='
-            docker inspect --format='status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' xauusd-backend
-            echo '=== MOMENTUM / TELEGRAM / STRATEGIST LOGS LAST 3H ==='
-            docker logs --since 3h xauusd-backend 2>&1 | grep -Ei 'momentum|telegram|strategist_loop|watchlist alert' | tail -n 800 || true
-            echo '=== CURRENT CALENDAR ==='
-            docker exec -i xauusd-backend python - <<'PY'
-            import json
-            from data.calendar import get_calendar
-            try:
-                cal = get_calendar()
-                events=[]
-                for e in (cal.events or []):
-                    d=e.model_dump() if hasattr(e,'model_dump') else dict(e)
-                    events.append(d)
-                print(json.dumps(events[:100], default=str, sort_keys=True))
-            except Exception as exc:
-                print(json.dumps({'calendar_error':f'{type(exc).__name__}: {exc}'}))
-            PY
+            echo '=== ALERT DECISIONS LAST 12H ==='
+            docker logs --since 12h xauusd-backend 2>&1 | grep -Ei 'alert fired|alert suppressed|alert SUPPRESSED|watchlist alert|momentum alert|PRIMARY Telegram|Telegram send' | tail -n 1200 || true
             echo '=== DONE ==='
