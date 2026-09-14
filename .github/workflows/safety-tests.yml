@@ -1,0 +1,35 @@
+name: Takeover Safety Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches:
+      - 'chatgpt/**'
+
+permissions:
+  contents: read
+
+jobs:
+  safety-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Compile safety modules
+        run: |
+          python -m py_compile services/execution_safety_bootstrap.py
+          python -m py_compile ../deploy/bridge_safety.py
+          python -m py_compile ../deploy/mt5_bridge_daemon_hardened.py
+      - name: Run takeover safety tests
+        run: pytest -q tests/test_takeover_execution_safety.py tests/test_bridge_safety.py
