@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import SimpleNamespace
+import threading
 
 from services.execution_safety_bootstrap import (
     disabled_legacy_executor_wrapper,
     fail_closed_check_wrapper,
     fail_closed_reserve_wrapper,
+    strategist_enqueue_cleanup_wrapper,
 )
 
 
@@ -33,6 +34,45 @@ def test_non_reserving_governor_exception_fails_closed():
     assert reason.startswith("GOVERNOR_INTERNAL_ERROR")
     assert snap["mt5_authoritative"] is False
     assert snap["within_limit"] is False
+
+
+class FakeGovernor:
+    def __init__(self):
+        self._GOVERNOR_LOCK = threading.RLock()
+        self._RESERVATIONS = {}
+        self.released = []
+
+    def release_reservation(self, rid, reason):
+        self.released.append((rid, reason))
+        self._RESERVATIONS.pop(rid, None)
+
+
+def test_strategist_cleanup_releases_new_reserved_capacity_on_refusal():
+    gov = FakeGovernor()
+
+    def refusing_enqueue(db, verdict):
+        gov._RESERVATIONS["new-rid"] = ["STRATEGIST", "BUY", 0.01, "RESERVED", 9999999999, None]
+        return None
+
+    wrapped = strategist_enqueue_cleanup_wrapper(refusing_enqueue, gov)
+    result = wrapped(None, {"decision": "BUY"})
+    assert result is None
+    assert gov.released == [("new-rid", "post_reservation_refusal")]
+    assert "new-rid" not in gov._RESERVATIONS
+
+
+def test_strategist_cleanup_never_releases_sent_capacity():
+    gov = FakeGovernor()
+
+    def successful_enqueue(db, verdict):
+        gov._RESERVATIONS["sent-rid"] = ["STRATEGIST", "BUY", 0.01, "SENT", 9999999999, 123]
+        return 77
+
+    wrapped = strategist_enqueue_cleanup_wrapper(successful_enqueue, gov)
+    result = wrapped(None, {"decision": "BUY"})
+    assert result == 77
+    assert gov.released == []
+    assert "sent-rid" in gov._RESERVATIONS
 
 
 @dataclass
