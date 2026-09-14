@@ -1,15 +1,17 @@
-"""Compatibility wrapper for Predator Engine calendar/freshness bugfix (2026-09-14).
+"""Compatibility wrapper for Predator Engine safety/correctness controls.
 
 The frozen engine implementation is preserved verbatim in predator_engine_legacy.py.
-This module patches only operational safety/correctness defects:
+This module patches operational defects and production governance controls:
 1) previous-day levels use the previous XAU trading session (22:00 UTC boundary),
 2) Asian and PDL FIRE events must be fresh, not recycled from a 4h lookback,
 3) PDL narrative says previous-session instead of yesterday,
 4) alert regime/session display uses the signal event session,
-5) legacy pre-fix performance claims are suppressed pending post-fix validation,
-6) a fail-closed FIRE freshness guard validates signal-bar and M5-feed recency.
+5) legacy pre-fix performance claims are suppressed,
+6) a fail-closed FIRE freshness guard validates signal-bar and M5-feed recency,
+7) ASIAN_BREAKDOWN and PDL_BREAK FIREs are quarantined to shadow research after
+   full-history post-fix validation showed no robust production edge.
 
-Sizing, SL/TP geometry, regime direction/volatility gates and SELL mandate are unchanged.
+Sizing, SL/TP geometry, VOL_CONTINUATION logic and SELL mandate are unchanged.
 """
 from __future__ import annotations
 
@@ -29,16 +31,25 @@ format_telegram_invalidated = _legacy.format_telegram_invalidated
 format_predator_execution_summary = _legacy.format_predator_execution_summary
 detect_vol_continuation = _legacy.detect_vol_continuation
 
+# 2026-09-14 full-history post-fix governance decision.
+# These archetypes remain DETECTABLE for research/backtests, but their live FIRE
+# events are shadow-recorded and withheld from the scheduler. That means no
+# actionable Telegram, no batch creation and no execution while quarantined.
+#
+# Evidence basis (2025-03-21 -> 2026-09-14, conservative SL-first replay):
+#   ASIAN_BREAKDOWN production-regime-matched: n=92, E=-0.55, PF=0.91
+#   PDL_BREAK       production-regime-matched: n=105, E=-3.97, PF=0.65
+_QUARANTINED_FIRE_ARCHETYPES = frozenset({"ASIAN_BREAKDOWN", "PDL_BREAK"})
+
 # The old figures were measured against pre-fix trigger semantics and must not
-# be advertised as performance of the corrected production trigger. Preserve
-# the fields/message shape while making their validation status explicit.
+# be advertised as performance of the corrected production trigger.
 _ARCHETYPE_STATS = {
     "ASIAN_BREAKDOWN": {
-        "sample": "POST-FIX VALIDATION PENDING",
+        "sample": "QUARANTINED · POST-FIX EDGE NOT VALIDATED",
         "wr": "—", "expectancy": "—", "pf": "—",
     },
     "PDL_BREAK": {
-        "sample": "POST-FIX VALIDATION PENDING",
+        "sample": "QUARANTINED · NEGATIVE POST-FIX EDGE",
         "wr": "—", "expectancy": "—", "pf": "—",
     },
     "VOL_CONTINUATION": {
@@ -226,6 +237,48 @@ def format_telegram_alert(sig, regime=None, key_level=None, current_price=None,
     )
 
 
+def _record_quarantined_shadow(db, sig) -> None:
+    """Preserve forward research evidence for a quarantined FIRE.
+
+    Mirrors the scheduler's existing shadow-record payload, but happens before
+    the signal is withheld from downstream actionability. Fails silent by design
+    so research bookkeeping can never destabilise the detector loop.
+    """
+    try:
+        from services.shadow_trade_simulator import record_shadow_trade
+
+        synthetic_verdict = {
+            "decision": sig.direction,
+            "archetype": sig.archetype,
+            "setup_score": 85 if sig.confidence == "HIGH" else 75 if sig.confidence == "MED" else 65,
+            "conditions_passed": 4,
+            "trade_plan": {
+                "entry": sig.entry,
+                "stop_loss": sig.stop_loss,
+                "tp1": sig.tp1,
+                "tp2": sig.tp2,
+                "tp1_rr": abs(sig.tp1 - sig.entry) / max(abs(sig.entry - sig.stop_loss), 0.1),
+                "tp2_rr": abs(sig.tp2 - sig.entry) / max(abs(sig.entry - sig.stop_loss), 0.1),
+                "invalidation": sig.stop_loss,
+                "risk_reward": sig.rr,
+            },
+        }
+
+        class _QuarantineGrade:
+            grade = f"PRED_{sig.archetype}_{sig.confidence}_QUARANTINED"
+            reason = f"Research-only quarantine: {sig.thesis}"
+            composite_score = 85 if sig.confidence == "HIGH" else 75
+
+        result = record_shadow_trade(db, synthetic_verdict, grade_result=_QuarantineGrade())
+        log.info(
+            "[predator] QUARANTINE shadow-record %s %s @ %.2f recorded=%s reason=%s",
+            sig.archetype, sig.direction, sig.entry,
+            getattr(result, "recorded", None), getattr(result, "reason", None),
+        )
+    except Exception as exc:
+        log.warning("[predator] quarantine shadow-record failed: %s", exc)
+
+
 # Patch the frozen module because its evaluate() resolves helpers/functions in
 # its own module globals. This keeps every untouched detector path identical.
 _legacy._prev_day_hl = _prev_day_hl
@@ -235,7 +288,7 @@ _legacy.detect_pdl_break = detect_pdl_break
 
 
 def evaluate(db):
-    """Frozen evaluation plus a final fail-closed FIRE freshness boundary."""
+    """Frozen evaluation plus safety boundary and evidence-based quarantine."""
     signals = _legacy_evaluate(db)
     if not signals:
         return signals
@@ -259,6 +312,15 @@ def evaluate(db):
                     reason, getattr(sig, "bar_time", None),
                 )
                 continue
+
+            if getattr(sig, "archetype", None) in _QUARANTINED_FIRE_ARCHETYPES:
+                _record_quarantined_shadow(db, sig)
+                log.warning(
+                    "[predator] FIRE quarantined from actionability: %s %s @ %.2f",
+                    sig.archetype, sig.direction, sig.entry,
+                )
+                continue
+
         out.append(sig)
     return out
 
@@ -273,6 +335,6 @@ __all__ = [
     "PredatorSignal", "evaluate", "format_telegram_alert",
     "format_telegram_invalidated", "format_predator_execution_summary",
     "detect_asian_breakdown", "detect_pdl_break", "detect_vol_continuation",
-    "validate_fire_freshness",
+    "validate_fire_freshness", "_QUARANTINED_FIRE_ARCHETYPES",
     "_ARCHETYPE_STATS", "_EXPECTED_TOTAL_MOVE_PTS", "_EXTENSION_LIMIT",
 ]
