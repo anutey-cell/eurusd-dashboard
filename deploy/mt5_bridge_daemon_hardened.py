@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Hardened launcher for the existing MT5 bridge daemon.
 
-This launcher keeps all existing bridge behaviour but adds an independent,
-local pre-order account/terminal guard immediately before every `order_send`
-path. It protects against an MT5 account switch after the last VPS heartbeat.
+This launcher keeps existing bridge data/reconciliation behaviour but adds:
+1. independent local demo-account/terminal verification immediately before
+   every execution attempt; and
+2. atomic server-side order claiming via `/bridge/claim-v2/{id}` so racing
+   daemons cannot both execute the same PendingExecution row.
 
 Operational cutover: point the Windows Scheduled Task/NSSM service at this file
 instead of `mt5_bridge_daemon.py` after validating in demo mode.
@@ -17,6 +19,24 @@ from bridge_safety import verify_demo_account, verify_terminal
 
 log = logging.getLogger("mt5_bridge_hardened")
 _ORIGINAL_EXECUTE_ORDER = legacy.execute_order
+
+
+def claim_atomic(order_id: int) -> bool:
+    """Claim through the compare-and-set v2 endpoint; any ambiguity blocks."""
+    try:
+        r = legacy.session.post(legacy.api(f"/claim-v2/{order_id}"), timeout=10)
+        if r.status_code == 200:
+            return True
+        if r.status_code == 409:
+            log.warning("atomic claim %d refused (already claimed/expired): %s",
+                        order_id, (r.text or "")[:160])
+            return False
+        log.error("atomic claim %d HTTP %d: %s", order_id, r.status_code,
+                  (r.text or "")[:160])
+        return False
+    except Exception as exc:
+        log.error("atomic claim %d failed CLOSED: %s", order_id, exc)
+        return False
 
 
 def execute_order_fail_closed(order: dict) -> dict:
@@ -58,11 +78,12 @@ def execute_order_fail_closed(order: dict) -> dict:
     return _ORIGINAL_EXECUTE_ORDER(order)
 
 
-# Monkey-patch only the daemon's execution entry point. All candle/tick research,
+# Monkey-patch only executable bridge boundaries. Candle/tick research,
 # heartbeat, reconciliation and monitoring behaviour remain unchanged.
+legacy.claim = claim_atomic
 legacy.execute_order = execute_order_fail_closed
 
 
 if __name__ == "__main__":
-    log.warning("Starting HARDENED MT5 bridge launcher — pre-order demo guard ACTIVE")
+    log.warning("Starting HARDENED MT5 bridge — atomic claim + local demo guard ACTIVE")
     legacy.main()
