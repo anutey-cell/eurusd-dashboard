@@ -31,5 +31,18 @@ jobs:
           python -m py_compile services/execution_safety_bootstrap.py
           python -m py_compile ../deploy/bridge_safety.py
           python -m py_compile ../deploy/mt5_bridge_daemon_hardened.py
+      - name: Parse PowerShell cutover script
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ../deploy/switch_bridge_to_hardened.ps1),
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
       - name: Run takeover safety tests
         run: pytest -q tests/test_takeover_execution_safety.py tests/test_bridge_safety.py
