@@ -42,17 +42,19 @@ jobs:
           SSH="ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
           SCP="scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
+          # Copy the exact exporter from this workflow checkout; never mutate
+          # the VPS repository checkout, so deployment/audit jobs cannot race.
+          $SCP backend/scripts/export_predator_history.py \
+            "$DO_USER@$DO_HOST:/tmp/export_predator_history.py"
+
           $SSH "$DO_USER@$DO_HOST" 'set -eu
-            cd /opt/xauusd
-            git fetch origin main
-            git reset --hard origin/main
             docker inspect --format="backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" xauusd-backend
-            docker cp backend/scripts/export_predator_history.py xauusd-backend:/tmp/export_predator_history.py
+            docker cp /tmp/export_predator_history.py xauusd-backend:/tmp/export_predator_history.py
             docker exec -e PYTHONPATH=/app -w /app xauusd-backend python /tmp/export_predator_history.py /tmp/predator_history.csv.gz
             docker cp xauusd-backend:/tmp/predator_history.csv.gz /tmp/predator_history.csv.gz
           '
           $SCP "$DO_USER@$DO_HOST:/tmp/predator_history.csv.gz" ./predator_history.csv.gz
-          $SSH "$DO_USER@$DO_HOST" 'rm -f /tmp/predator_history.csv.gz; docker exec xauusd-backend rm -f /tmp/predator_history.csv.gz /tmp/export_predator_history.py || true'
+          $SSH "$DO_USER@$DO_HOST" 'rm -f /tmp/predator_history.csv.gz /tmp/export_predator_history.py; docker exec xauusd-backend rm -f /tmp/predator_history.csv.gz /tmp/export_predator_history.py || true'
           ls -lh predator_history.csv.gz
 
       - name: Run corrected full-history replay off-host
