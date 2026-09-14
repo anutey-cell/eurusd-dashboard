@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect full-session alert decisions
+      - name: Reconstruct Sep 14 momentum SELL and post-alert path
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
@@ -26,6 +26,64 @@ jobs:
           script: |
             set -eu
             cd /opt/xauusd
-            echo '=== ALERT DECISIONS LAST 12H ==='
-            docker logs --since 12h xauusd-backend 2>&1 | grep -Ei 'alert fired|alert suppressed|alert SUPPRESSED|watchlist alert|momentum alert|PRIMARY Telegram|Telegram send' | tail -n 1200 || true
-            echo '=== DONE ==='
+            docker exec -i xauusd-backend python - <<'PY'
+            import json
+            from datetime import datetime, timezone
+            from sqlalchemy import text
+            from database import db_session
+            from models.candle import Candle
+            from services.intraday_strategies import analyze_momentum_breakout
+
+            def utc(v):
+                if isinstance(v, str):
+                    v = datetime.fromisoformat(v.replace('Z','+00:00'))
+                if v.tzinfo is None:
+                    v = v.replace(tzinfo=timezone.utc)
+                return v.astimezone(timezone.utc)
+
+            target = datetime(2026, 9, 14, 9, 15, tzinfo=timezone.utc)
+            with db_session() as db:
+                rows = db.execute(text("""
+                    SELECT candle_time, open, high, low, close, volume
+                    FROM historical_candles
+                    WHERE instrument='XAU/USD' AND timeframe='M15'
+                      AND source IN ('csv','tradingview','mt5','provider','sync','broker','twelvedata')
+                      AND candle_time <= :target
+                    ORDER BY candle_time DESC LIMIT 400
+                """), {'target': target}).fetchall()
+                m5 = db.execute(text("""
+                    SELECT candle_time, open, high, low, close, source
+                    FROM historical_candles
+                    WHERE instrument='XAU/USD' AND timeframe='M5'
+                      AND candle_time >= :start
+                    ORDER BY candle_time ASC
+                """), {'start': datetime(2026,9,14,9,30,tzinfo=timezone.utc)}).fetchall()
+            rows = list(reversed(rows))
+            candles = [Candle(time=utc(r[0]), open=float(r[1]), high=float(r[2]), low=float(r[3]), close=float(r[4]), volume=int(r[5] or 0)) for r in rows]
+            r = analyze_momentum_breakout(candles=candles, at=target, macro_events=[], pip_size=1.0, enable_news_filter=False)
+            post = [{
+                'time': utc(x[0]).isoformat(), 'o': float(x[1]), 'h': float(x[2]),
+                'l': float(x[3]), 'c': float(x[4]), 'source': x[5]
+            } for x in m5]
+            after_alert = [x for x in post if datetime.fromisoformat(x['time']) >= datetime(2026,9,14,9,35,tzinfo=timezone.utc)]
+            entry = float(r.entry) if r.entry is not None else None
+            mfe = (entry - min(x['l'] for x in after_alert)) if entry is not None and after_alert else None
+            mae = (max(x['h'] for x in after_alert) - entry) if entry is not None and after_alert else None
+            print(json.dumps({
+                'signal': r.signal,
+                'entry': r.entry,
+                'stop_loss': r.stop_loss,
+                'take_profit': r.take_profit,
+                'rr': r.rr,
+                'risk_points': r.risk_pips,
+                'target_points': r.target_pips,
+                'quality_score': r.quality_score,
+                'reason': r.reason,
+                'alert_logged_at': '2026-09-14T09:34:35.503902+00:00',
+                'bar_open': target.isoformat(),
+                'bar_expected_close': '2026-09-14T09:30:00+00:00',
+                'post_alert_mfe_points': round(mfe,2) if mfe is not None else None,
+                'post_alert_mae_points': round(mae,2) if mae is not None else None,
+                'post_alert_m5': after_alert[:60],
+            }, default=str, sort_keys=True))
+            PY
