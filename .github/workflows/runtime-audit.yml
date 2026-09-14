@@ -31,13 +31,15 @@ jobs:
             printf 'git_head='; git rev-parse HEAD
             printf 'git_branch='; git branch --show-current || true
             printf 'working_tree_changes='; git status --porcelain | wc -l
+            echo 'changed_paths:'
+            git status --short | sed -E 's/^.. //' || true
 
             echo '=== CONTAINERS ==='
             docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.prod ps
             docker inspect --format='backend_status={{.State.Status}} backend_health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} backend_started={{.State.StartedAt}}' xauusd-backend
 
             echo '=== SAFE RUNTIME SWITCHES ==='
-            docker exec xauusd-backend python - <<'PY'
+            docker exec -i xauusd-backend python - <<'PY'
             import json
             from config import settings
 
@@ -59,7 +61,7 @@ jobs:
             PY
 
             echo '=== BACKEND + BRIDGE STATUS ==='
-            docker exec xauusd-backend python - <<'PY'
+            docker exec -i xauusd-backend python - <<'PY'
             import json
             import urllib.request
 
@@ -86,7 +88,7 @@ jobs:
             PY
 
             echo '=== READ-ONLY DB COUNTS ==='
-            docker exec xauusd-backend python - <<'PY'
+            docker exec -i xauusd-backend python - <<'PY'
             import json
             from database import db_session
             from db_models import PendingExecution, StrategistVerdict
