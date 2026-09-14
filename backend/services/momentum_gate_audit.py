@@ -182,5 +182,7 @@ def audit_momentum_gates(
         "closePctPass": gate_close_pass,
         "combinedProductionPass": combined_pass,
         "productionDefaults": defaults,
+        # New, clearer name plus the legacy alias for API compatibility.
         "researchConfigs": research_configs,
+        "recommendedConfigs": research_configs,
     }
