@@ -1,0 +1,37 @@
+name: Predator Regression Tests
+
+on:
+  pull_request:
+    paths:
+      - 'backend/services/predator_engine.py'
+      - 'backend/services/predator_engine_legacy.py'
+      - 'backend/tests/test_predator_calendar_freshness.py'
+      - '.github/workflows/predator-regression.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'backend/services/predator_engine.py'
+      - 'backend/services/predator_engine_legacy.py'
+      - 'backend/tests/test_predator_calendar_freshness.py'
+
+jobs:
+  predator-regression:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Compile Predator modules
+        run: |
+          python -m py_compile services/predator_engine.py
+          python -m py_compile services/predator_engine_legacy.py
+      - name: Run Predator calendar/freshness regression
+        run: pytest -q tests/test_predator_calendar_freshness.py
