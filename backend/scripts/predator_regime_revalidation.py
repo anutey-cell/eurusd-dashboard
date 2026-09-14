@@ -1,17 +1,15 @@
 """Read-only full-history post-fix Predator regime revalidation.
 
 Replays the CURRENT corrected Asian Breakdown and PDL Break detectors across the
-largest reliable historical_candles window available on the VPS, but does so in
-small date chunks to avoid stressing the production container.
-
-The report separates:
-  * all corrected-trigger opportunities; and
-  * production-regime-matched opportunities (regime multiplier >= 0.5).
+largest reliable historical_candles window available on the VPS. Processing is
+chunked and M15 regimes are precomputed once per M15 bar to stay within the
+production host's memory ceiling.
 
 No database writes, no Telegram sends, no execution calls.
 """
 from __future__ import annotations
 
+import gc
 import json
 from bisect import bisect_right
 from collections import defaultdict
@@ -27,7 +25,7 @@ from services.regime_detector import (
     regime_confidence_multiplier,
 )
 
-CHUNK_DAYS = 7
+CHUNK_DAYS = 3
 LOOKBACK_DAYS = 4
 FORWARD_HOURS = 10
 MAX_FORWARD_M5 = 96
@@ -93,18 +91,26 @@ def _rsi_at(t, times, vals):
     return vals[j] if j >= 0 else None
 
 
-def _m15_regime_at(t, m15):
-    times = [b[0] for b in m15]
+def _precompute_m15_regimes(m15):
+    """Compute regime only on M15 closes, then M5 bars look up the latest one."""
+    times, vals = [], []
+    for i in range(len(m15)):
+        # Production classifiers need at most ~214 bars. Keeping 300 is ample
+        # and prevents historical prefix growth from increasing memory/CPU.
+        start = max(0, i - 299)
+        hist = m15[start:i+1]
+        closes = [b[4] for b in hist]
+        bars_for_vol = [(b[0], b[2], b[3], b[4]) for b in hist]
+        d = classify_direction_regime(closes)
+        v = classify_vol_regime(bars_for_vol)
+        vals.append((d, v, regime_confidence_multiplier(d, v)))
+        times.append(m15[i][0])
+    return times, vals
+
+
+def _regime_at(t, times, vals):
     j = bisect_right(times, t) - 1
-    if j < 0:
-        return "unknown", "unknown", 0.0
-    hist = m15[:j+1]
-    closes = [b[4] for b in hist]
-    bars_for_vol = [(b[0], b[2], b[3], b[4]) for b in hist]
-    d = classify_direction_regime(closes)
-    v = classify_vol_regime(bars_for_vol)
-    mult = regime_confidence_multiplier(d, v)
-    return d, v, mult
+    return vals[j] if j >= 0 else ("unknown", "unknown", 0.0)
 
 
 def _replay(m5, idx, sig):
@@ -186,6 +192,7 @@ def main():
             m15 = _load_range(db, "M15", q_start, q_end)
             h1 = _load_range(db, "H1", q_start, q_end)
             rsi_times, rsi_vals = _rsi_series(h1)
+            regime_times, regime_vals = _precompute_m15_regimes(m15)
 
             if m5:
                 for i, bar in enumerate(m5):
@@ -198,7 +205,7 @@ def main():
                     window = m5[i-699:i+1]
                     vol = _vol_ratio(m5, i)
                     rsi = _rsi_at(t, rsi_times, rsi_vals)
-                    d, v, mult = _m15_regime_at(t, m15)
+                    d, v, mult = _regime_at(t, regime_times, regime_vals)
 
                     candidates = []
                     a = pe.detect_asian_breakdown(window, rsi_h1=rsi, vol_r=vol)
@@ -244,6 +251,10 @@ def main():
                 "pdl_matched": len(matched_rows["PDL_BREAK"]),
             }), flush=True)
             cursor = core_end
+
+            # Explicit release matters on the small production droplet.
+            del m5, m15, h1, rsi_times, rsi_vals, regime_times, regime_vals
+            gc.collect()
 
     report = {
         "mode": "READ_ONLY_FULL_HISTORY_POSTFIX_REGIME_REVALIDATION",
