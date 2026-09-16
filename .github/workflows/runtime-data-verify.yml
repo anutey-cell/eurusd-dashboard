@@ -1,0 +1,44 @@
+name: Runtime Market Data Verify
+
+on:
+  push:
+    branches:
+      - 'chatgpt/runtime-data-verify'
+    paths:
+      - '.github/workflows/runtime-data-verify.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify market data on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+          script: |
+            set -eu
+            echo '=== MARKET DATA HEALTH ==='
+            docker exec -i xauusd-backend python - <<'PY'
+            import json
+            import urllib.request
+            with urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=5) as r:
+                health = json.load(r)
+            print(json.dumps({
+                'overall_status': health.get('status'),
+                'market_data': health.get('market_data'),
+                'fx_provider': health.get('fx_provider'),
+                'database': health.get('database'),
+                'broker_execution_enabled': health.get('broker_execution_enabled'),
+            }, indent=2, sort_keys=True))
+            PY
+
+            echo '=== RECENT DATA PIPELINE LOGS ==='
+            docker logs --since 10m xauusd-backend 2>&1 \
+              | grep -E '\[candle_ingestion\]|\[tv_provider\]|\[freshness\]' \
+              | tail -80 || true
