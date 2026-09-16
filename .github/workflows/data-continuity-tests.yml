@@ -15,6 +15,7 @@ on:
       - 'backend/tests/test_candle_ingestion_continuity.py'
       - 'backend/tests/test_market_data_health_endpoint.py'
       - 'backend/tests/test_cme_options_context.py'
+      - 'backend/tests/test_cme_chatgpt_snapshot.py'
       - 'backend/tests/test_cme_relay.py'
       - 'backend/Dockerfile'
       - 'deploy/cme_bulletin_relay.py'
@@ -35,6 +36,7 @@ on:
       - 'backend/tests/test_candle_ingestion_continuity.py'
       - 'backend/tests/test_market_data_health_endpoint.py'
       - 'backend/tests/test_cme_options_context.py'
+      - 'backend/tests/test_cme_chatgpt_snapshot.py'
       - 'backend/tests/test_cme_relay.py'
       - 'backend/Dockerfile'
       - 'deploy/cme_bulletin_relay.py'
@@ -97,16 +99,19 @@ jobs:
       - name: Run continuity regressions
         env:
           CME_OPTIONS_CONTEXT_REFRESH_ENABLED: 'false'
+          CME_CHATGPT_SNAPSHOT_ENABLED: 'false'
         run: |
           pytest -q \
             tests/test_candle_ingestion_continuity.py \
             tests/test_market_data_health_endpoint.py \
             tests/test_cme_options_context.py \
+            tests/test_cme_chatgpt_snapshot.py \
             tests/test_cme_relay.py
 
       - name: Verify production continuity dependencies
         working-directory: .
         run: |
           grep -q 'TRADINGVIEW_ENABLED=true' deploy/docker-compose.prod.yml
+          grep -q 'CME_CHATGPT_SNAPSHOT_ENABLED=true' deploy/docker-compose.prod.yml
           grep -q 'poppler-utils' backend/Dockerfile
           grep -q 'api/v1/cme/bulletin-relay' deploy/cme_bulletin_relay.py
