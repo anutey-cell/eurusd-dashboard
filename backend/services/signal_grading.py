@@ -15,14 +15,21 @@ Grade table:
                data stale, news within block window, spread over cap,
                or conflicted directional bias.
 
+CME gold options context is attached to the verdict before grading. It is
+read-only/unsigned context: it enriches the engine journal and Telegram card
+but does NOT change the grade or direction until forward validation proves an
+edge. This prevents OI concentration from being mislabelled as dealer GEX.
+
 Signal-only mode: no code path here enables execution. Grading is
 purely a filter on which alerts reach the user.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
+log = logging.getLogger(__name__)
 
 GRADE_APLUS  = "A+"
 GRADE_A      = "A"
@@ -53,6 +60,24 @@ class GradeResult:
         }
 
 
+def _attach_cme_context(verdict: dict) -> None:
+    """Attach one read-only CME context snapshot. Never blocks grading."""
+    if "cme_options_context" in verdict:
+        return
+    try:
+        from database import SessionLocal
+        from services.cme_options_context import get_cme_options_context
+        with SessionLocal() as db:
+            verdict["cme_options_context"] = get_cme_options_context(db)
+    except Exception as exc:
+        verdict["cme_options_context"] = {
+            "status": "UNAVAILABLE",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "directional_bias": "UNSIGNED_NEUTRAL",
+        }
+        log.debug("[signal_grading] CME context unavailable: %s", exc)
+
+
 def grade_verdict(verdict: dict, *,
                     min_score_a: int = 80,
                     min_score_aplus: int = 90,
@@ -62,6 +87,8 @@ def grade_verdict(verdict: dict, *,
     """
     Compute the grade for a strategist verdict. Fails safe → STAND_ASIDE.
     """
+    _attach_cme_context(verdict)
+
     decision = verdict.get("decision")
     if decision not in ("BUY", "SELL"):
         return GradeResult(GRADE_ASIDE,
@@ -132,16 +159,50 @@ def grade_verdict(verdict: dict, *,
                         False, False, True)
 
 
+def _format_cme_context(verdict: dict) -> list[str]:
+    ctx = verdict.get("cme_options_context") or {}
+    if ctx.get("status") != "OBSERVED":
+        return []
+
+    lines = [
+        "",
+        "CME OPTIONS CONTEXT (unsigned)",
+        f"Bulletin: {ctx.get('bulletin_date', '—')} {ctx.get('bulletin_status', '')}".rstrip(),
+    ]
+    basis = ctx.get("gc_xau_basis")
+    if basis is not None:
+        lines.append(f"GC-XAU basis: {basis:+.2f}")
+
+    nearest = ctx.get("nearest_zones") or []
+    if nearest:
+        lines.append("Nearest mapped concentrations:")
+        for z in nearest[:2]:
+            xau = z.get("xau_equiv")
+            gc = z.get("gc_strike")
+            oi = z.get("total_oi")
+            score = z.get("sensitivity_score")
+            lines.append(f"  XAU {xau} <- GC {gc} | OI {oi} | sensitivity {score}")
+
+    strongest = ctx.get("strongest_zones") or []
+    if strongest:
+        lines.append("Strongest mapped concentrations:")
+        for z in strongest[:2]:
+            lines.append(
+                f"  XAU {z.get('xau_equiv')} <- GC {z.get('gc_strike')} | "
+                f"OI {z.get('total_oi')} | dOI {z.get('oi_change'):+d}"
+            )
+    lines.append("Context only: no dealer-gamma sign inferred.")
+    return lines
+
+
 def format_signal_grade_body(verdict: dict, grade_result: GradeResult,
                                 *, spread_pts: Optional[float] = None,
-                                data_source: str = "TwelveData + MT5 tick confirmation"
+                                data_source: str = "Canonical XAUUSD + optional MT5 + CME options context"
                                 ) -> str:
     """
-    Render the exact Telegram template requested by the operator spec.
-    Grade goes in the header; body is the standardized signal card.
+    Render the standardized Telegram signal card with read-only CME context.
+    Grade goes in the header; CME context never changes the trade grade here.
     """
-    from datetime import datetime, timezone
-
     decision = verdict.get("decision", "STAND ASIDE")
     tp = verdict.get("trade_plan") or {}
     lm = verdict.get("liquidity_model") or {}
@@ -162,7 +223,6 @@ def format_signal_grade_body(verdict: dict, grade_result: GradeResult,
     tp2 = tp.get("tp2")
     tp3 = tp.get("tp3")
     if tp3 is None and tp1 is not None and tp2 is not None and entry is not None:
-        # Derive TP3 as 1.5× the TP2 distance from entry, same direction as TP2-TP1
         try:
             direction_sign = 1 if tp2 > tp1 else -1
             tp3 = round(tp2 + direction_sign * 0.5 * abs(tp2 - tp1), 2)
@@ -200,19 +260,19 @@ def format_signal_grade_body(verdict: dict, grade_result: GradeResult,
         "",
         "Reason:",
         f"{grade_result.reason}",
+    ]
+    lines.extend(_format_cme_context(verdict))
+    lines.extend([
         "",
         "(Signal-only mode — no automatic order placement.)",
         "",
         "ENGINE: LEGACY",
-    ]
+    ])
     return "\n".join(lines)
 
 
 def format_stand_aside_body(verdict: dict, grade_result: GradeResult) -> str:
-    """
-    Compact stand-aside summary — same header shape as signal, but no
-    trade levels. Used when no valid trade exists in the window.
-    """
+    """Compact stand-aside summary — no trade levels."""
     setup = (verdict.get("liquidity_model") or {}).get("type", "—")
     return "\n".join([
         f"XAUUSD SIGNAL — STAND ASIDE",
@@ -221,7 +281,7 @@ def format_stand_aside_body(verdict: dict, grade_result: GradeResult) -> str:
         f"Setup: {setup}",
         f"Session: {verdict.get('session_classification', '—')}",
         f"Setup Score: {verdict.get('setup_score', 0)}",
-        f"Data Source: TwelveData + MT5 tick confirmation",
+        f"Data Source: Canonical XAUUSD + optional MT5 + CME options context",
         "",
         "Reason:",
         f"{grade_result.reason}",
