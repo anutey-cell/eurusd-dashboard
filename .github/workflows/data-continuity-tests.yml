@@ -1,0 +1,65 @@
+name: Cloud Data Continuity Tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'backend/services/candle_ingestion.py'
+      - 'backend/services/tradingview_provider.py'
+      - 'backend/services/market_data_health.py'
+      - 'backend/routers/health.py'
+      - 'backend/tests/test_candle_ingestion_continuity.py'
+      - 'backend/tests/test_market_data_health_endpoint.py'
+      - 'deploy/docker-compose.prod.yml'
+  push:
+    branches:
+      - 'chatgpt/**'
+    paths:
+      - 'backend/services/candle_ingestion.py'
+      - 'backend/services/tradingview_provider.py'
+      - 'backend/services/market_data_health.py'
+      - 'backend/routers/health.py'
+      - 'backend/tests/test_candle_ingestion_continuity.py'
+      - 'backend/tests/test_market_data_health_endpoint.py'
+      - 'deploy/docker-compose.prod.yml'
+      - '.github/workflows/data-continuity-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  data-continuity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Compile market-data modules
+        run: |
+          python -m py_compile services/candle_ingestion.py
+          python -m py_compile services/tradingview_provider.py
+          python -m py_compile services/market_data_health.py
+          python -m py_compile routers/health.py
+
+      - name: Run cloud continuity regressions
+        run: |
+          pytest -q \
+            tests/test_candle_ingestion_continuity.py \
+            tests/test_market_data_health_endpoint.py
+
+      - name: Verify production TradingView fallback is enabled
+        working-directory: .
+        run: |
+          grep -q 'TRADINGVIEW_ENABLED=true' deploy/docker-compose.prod.yml
