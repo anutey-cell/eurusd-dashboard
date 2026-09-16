@@ -11,6 +11,30 @@ permissions:
   contents: read
 
 jobs:
+  github-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe CME from GitHub-hosted runner
+        shell: bash
+        run: |
+          set -eu
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36'
+          for u in \
+            'https://www.cmegroup.com/market-data/daily-bulletin.html' \
+            'https://www.cmegroup.com/daily_bulletin/current/Section64_Metals_Option_Products.pdf' \
+            'https://www.cmegroup.com/daily_bulletin/current/Section62_Metals_Futures_Products.pdf'
+          do
+            echo "=== $u ==="
+            curl -L --compressed --http1.1 -A "$ua" \
+              -H 'Accept: application/pdf,text/html;q=0.9,*/*;q=0.8' \
+              -H 'Accept-Language: en-US,en;q=0.9' \
+              -H 'Referer: https://www.cmegroup.com/market-data/daily-bulletin.html' \
+              -sS -o /tmp/cme_probe -D /tmp/cme_headers -w 'http=%{http_code} bytes=%{size_download} type=%{content_type}\n' "$u" || true
+            head -c 8 /tmp/cme_probe | od -An -tx1 || true
+            grep -Ei '^(HTTP/|content-type:|content-length:|server:|x-|cf-)' /tmp/cme_headers | tail -20 || true
+          done
+
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 10
