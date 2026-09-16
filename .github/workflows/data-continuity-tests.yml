@@ -7,6 +7,11 @@ on:
       - 'backend/services/candle_ingestion.py'
       - 'backend/services/tradingview_provider.py'
       - 'backend/services/market_data_health.py'
+      - 'backend/services/provider_health.py'
+      - 'backend/services/actionability_gate.py'
+      - 'backend/services/canonical_market_data.py'
+      - 'backend/services/data_freshness.py'
+      - 'backend/services/strategist_runner.py'
       - 'backend/services/cme_options_context.py'
       - 'backend/services/cme_relay_ingest.py'
       - 'backend/services/signal_grading.py'
@@ -14,6 +19,8 @@ on:
       - 'backend/routers/health.py'
       - 'backend/tests/test_candle_ingestion_continuity.py'
       - 'backend/tests/test_market_data_health_endpoint.py'
+      - 'backend/tests/test_provider_health.py'
+      - 'backend/tests/test_actionability_gate.py'
       - 'backend/tests/test_cme_options_context.py'
       - 'backend/tests/test_cme_chatgpt_snapshot.py'
       - 'backend/tests/test_cme_relay.py'
@@ -28,6 +35,11 @@ on:
       - 'backend/services/candle_ingestion.py'
       - 'backend/services/tradingview_provider.py'
       - 'backend/services/market_data_health.py'
+      - 'backend/services/provider_health.py'
+      - 'backend/services/actionability_gate.py'
+      - 'backend/services/canonical_market_data.py'
+      - 'backend/services/data_freshness.py'
+      - 'backend/services/strategist_runner.py'
       - 'backend/services/cme_options_context.py'
       - 'backend/services/cme_relay_ingest.py'
       - 'backend/services/signal_grading.py'
@@ -35,6 +47,8 @@ on:
       - 'backend/routers/health.py'
       - 'backend/tests/test_candle_ingestion_continuity.py'
       - 'backend/tests/test_market_data_health_endpoint.py'
+      - 'backend/tests/test_provider_health.py'
+      - 'backend/tests/test_actionability_gate.py'
       - 'backend/tests/test_cme_options_context.py'
       - 'backend/tests/test_cme_chatgpt_snapshot.py'
       - 'backend/tests/test_cme_relay.py'
@@ -71,6 +85,11 @@ jobs:
           python -m py_compile services/candle_ingestion.py
           python -m py_compile services/tradingview_provider.py
           python -m py_compile services/market_data_health.py
+          python -m py_compile services/provider_health.py
+          python -m py_compile services/actionability_gate.py
+          python -m py_compile services/canonical_market_data.py
+          python -m py_compile services/data_freshness.py
+          python -m py_compile services/strategist_runner.py
           python -m py_compile services/cme_options_context.py
           python -m py_compile services/cme_relay_ingest.py
           python -m py_compile services/signal_grading.py
@@ -104,6 +123,8 @@ jobs:
           pytest -q \
             tests/test_candle_ingestion_continuity.py \
             tests/test_market_data_health_endpoint.py \
+            tests/test_provider_health.py \
+            tests/test_actionability_gate.py \
             tests/test_cme_options_context.py \
             tests/test_cme_chatgpt_snapshot.py \
             tests/test_cme_relay.py
