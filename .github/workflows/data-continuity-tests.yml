@@ -1,10 +1,11 @@
-# Engine C0 remediation regression suite
+# Engine capability + decision-intelligence regression suite
 name: Cloud Data Continuity Tests
 
 on:
   pull_request:
     branches: [main]
     paths:
+      - 'backend/config.py'
       - 'backend/services/candle_ingestion.py'
       - 'backend/services/tradingview_provider.py'
       - 'backend/services/market_data_health.py'
@@ -13,6 +14,8 @@ on:
       - 'backend/services/canonical_market_data.py'
       - 'backend/services/data_freshness.py'
       - 'backend/services/strategist_runner.py'
+      - 'backend/services/background_scheduler.py'
+      - 'backend/services/opportunity_arbiter.py'
       - 'backend/services/cme_options_context.py'
       - 'backend/services/cme_relay_ingest.py'
       - 'backend/services/signal_grading.py'
@@ -22,6 +25,7 @@ on:
       - 'backend/tests/test_market_data_health_endpoint.py'
       - 'backend/tests/test_provider_health.py'
       - 'backend/tests/test_actionability_gate.py'
+      - 'backend/tests/test_opportunity_arbiter.py'
       - 'backend/tests/test_cme_options_context.py'
       - 'backend/tests/test_cme_chatgpt_snapshot.py'
       - 'backend/tests/test_cme_relay.py'
@@ -33,6 +37,7 @@ on:
     branches:
       - 'chatgpt/**'
     paths:
+      - 'backend/config.py'
       - 'backend/services/candle_ingestion.py'
       - 'backend/services/tradingview_provider.py'
       - 'backend/services/market_data_health.py'
@@ -41,6 +46,8 @@ on:
       - 'backend/services/canonical_market_data.py'
       - 'backend/services/data_freshness.py'
       - 'backend/services/strategist_runner.py'
+      - 'backend/services/background_scheduler.py'
+      - 'backend/services/opportunity_arbiter.py'
       - 'backend/services/cme_options_context.py'
       - 'backend/services/cme_relay_ingest.py'
       - 'backend/services/signal_grading.py'
@@ -50,6 +57,7 @@ on:
       - 'backend/tests/test_market_data_health_endpoint.py'
       - 'backend/tests/test_provider_health.py'
       - 'backend/tests/test_actionability_gate.py'
+      - 'backend/tests/test_opportunity_arbiter.py'
       - 'backend/tests/test_cme_options_context.py'
       - 'backend/tests/test_cme_chatgpt_snapshot.py'
       - 'backend/tests/test_cme_relay.py'
@@ -81,8 +89,9 @@ jobs:
       - name: Install backend dependencies
         run: pip install -r requirements.txt pytest
 
-      - name: Compile market-data and CME modules
+      - name: Compile market-data, arbiter and CME modules
         run: |
+          python -m py_compile config.py
           python -m py_compile services/candle_ingestion.py
           python -m py_compile services/tradingview_provider.py
           python -m py_compile services/market_data_health.py
@@ -91,6 +100,8 @@ jobs:
           python -m py_compile services/canonical_market_data.py
           python -m py_compile services/data_freshness.py
           python -m py_compile services/strategist_runner.py
+          python -m py_compile services/background_scheduler.py
+          python -m py_compile services/opportunity_arbiter.py
           python -m py_compile services/cme_options_context.py
           python -m py_compile services/cme_relay_ingest.py
           python -m py_compile services/signal_grading.py
@@ -116,7 +127,7 @@ jobs:
             exit 1
           }
 
-      - name: Run continuity regressions
+      - name: Run capability and intelligence regressions
         env:
           CME_OPTIONS_CONTEXT_REFRESH_ENABLED: 'false'
           CME_CHATGPT_SNAPSHOT_ENABLED: 'false'
@@ -126,14 +137,17 @@ jobs:
             tests/test_market_data_health_endpoint.py \
             tests/test_provider_health.py \
             tests/test_actionability_gate.py \
+            tests/test_opportunity_arbiter.py \
             tests/test_cme_options_context.py \
             tests/test_cme_chatgpt_snapshot.py \
             tests/test_cme_relay.py
 
-      - name: Verify production continuity dependencies
+      - name: Verify production continuity and safety dependencies
         working-directory: .
         run: |
           grep -q 'TRADINGVIEW_ENABLED=true' deploy/docker-compose.prod.yml
           grep -q 'CME_CHATGPT_SNAPSHOT_ENABLED=true' deploy/docker-compose.prod.yml
+          grep -q 'BROKER_EXECUTION_ENABLED=false' deploy/docker-compose.prod.yml
+          grep -q 'PREDATOR_EXECUTION_ENABLED=false' deploy/docker-compose.prod.yml
           grep -q 'poppler-utils' backend/Dockerfile
           grep -q 'api/v1/cme/bulletin-relay' deploy/cme_bulletin_relay.py
