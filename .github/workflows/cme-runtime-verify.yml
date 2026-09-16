@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Verify CME HOME relay on VPS
+      - name: Verify CME ChatGPT snapshot on VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
@@ -26,72 +26,55 @@ jobs:
             echo '=== CONTAINER ==='
             docker inspect --format='status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} started={{.State.StartedAt}}' xauusd-backend
 
+            # Give the non-blocking snapshot worker time for its first pull.
+            sleep 8
+
             echo '=== HEALTH / CME OPTIONS ==='
             docker exec -i xauusd-backend python - <<'PY'
             import json, urllib.request
             with urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=10) as r:
                 h = json.load(r)
             c = h.get('cme_options') or {}
-            print(json.dumps({
+            out = {
                 'status': h.get('status'),
                 'broker_execution_enabled': h.get('broker_execution_enabled'),
                 'cme_status': c.get('status'),
+                'cme_source': c.get('source'),
                 'bulletin_date': c.get('bulletin_date'),
+                'bulletin_status': c.get('bulletin_status'),
                 'age_days': c.get('age_days'),
                 'gc_xau_basis': c.get('gc_xau_basis'),
+                'zone_count': c.get('zone_count'),
+                'nearest_zones': c.get('nearest_zones'),
+                'strongest_zones': c.get('strongest_zones'),
                 'acquisition': c.get('acquisition'),
-            }, indent=2, sort_keys=True))
+            }
+            print(json.dumps(out, indent=2, sort_keys=True))
+            if out['cme_status'] != 'OBSERVED':
+                raise SystemExit(f"expected CME OBSERVED, got {out['cme_status']}")
+            if out['cme_source'] != 'CME_CHATGPT_SNAPSHOT':
+                raise SystemExit(f"expected ChatGPT snapshot source, got {out['cme_source']}")
+            if out['bulletin_date'] != '2026-09-14':
+                raise SystemExit(f"unexpected bulletin date {out['bulletin_date']}")
+            if not out['zone_count']:
+                raise SystemExit('CME snapshot published no zones')
             PY
 
-            echo '=== RELAY ENDPOINT AUTH ==='
-            docker exec -i xauusd-backend python - <<'PY'
-            import json
-            import urllib.error
-            import urllib.request
-            from config import settings
-
-            url = 'http://127.0.0.1:8000/api/v1/cme/bulletin-relay'
-            body = json.dumps({
-                'source': 'runtime-verifier',
-                'options_pdf_b64': 'A' * 1200,
-                'futures_pdf_b64': 'A' * 1200,
-            }).encode()
-
-            def post(secret=None):
-                headers = {'Content-Type': 'application/json'}
-                if secret is not None:
-                    headers['X-Bridge-Secret'] = secret
-                req = urllib.request.Request(url, data=body, headers=headers, method='POST')
-                try:
-                    with urllib.request.urlopen(req, timeout=10) as r:
-                        return r.status, r.read().decode()[:300]
-                except urllib.error.HTTPError as e:
-                    return e.code, e.read().decode()[:300]
-
-            missing = post()
-            authenticated = post((settings.mt5_bridge_shared_secret or '').strip())
-            print(json.dumps({
-                'missing_secret_status': missing[0],
-                'authenticated_invalid_pdf_status': authenticated[0],
-            }, sort_keys=True))
-            if missing[0] != 401:
-                raise SystemExit(f'expected 401 without bridge secret, got {missing}')
-            if authenticated[0] != 422:
-                raise SystemExit(f'expected 422 after auth for invalid payload, got {authenticated}')
-            PY
-
-            echo '=== CME CLOUD WORKER / EXECUTION SAFETY ==='
+            echo '=== EXECUTION SAFETY ==='
             docker exec -i xauusd-backend python - <<'PY'
             import json, os
             from config import settings
             out = {
                 'cme_direct_cloud_refresh_enabled': os.getenv('CME_OPTIONS_CONTEXT_REFRESH_ENABLED'),
+                'cme_chatgpt_snapshot_enabled': os.getenv('CME_CHATGPT_SNAPSHOT_ENABLED'),
                 'broker_execution_enabled': bool(getattr(settings,'broker_execution_enabled',False)),
                 'live_trading_authorized': bool(getattr(settings,'live_trading_authorized',False)),
             }
             print(json.dumps(out, sort_keys=True))
             if str(out['cme_direct_cloud_refresh_enabled']).lower() != 'false':
-                raise SystemExit('direct CME cloud worker must be disabled in production')
+                raise SystemExit('direct CME cloud worker must remain disabled')
+            if str(out['cme_chatgpt_snapshot_enabled']).lower() != 'true':
+                raise SystemExit('ChatGPT CME snapshot worker is not enabled')
             if out['broker_execution_enabled'] or out['live_trading_authorized']:
                 raise SystemExit('execution safety regression')
             PY
