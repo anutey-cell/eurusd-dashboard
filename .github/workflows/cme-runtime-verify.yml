@@ -1,0 +1,70 @@
+name: CME Runtime Verify
+
+on:
+  push:
+    branches:
+      - 'chatgpt/cme-runtime-verify'
+    paths:
+      - '.github/workflows/cme-runtime-verify.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify CME intelligence on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+          script: |
+            set -eu
+            echo '=== CONTAINER ==='
+            docker inspect --format='status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} started={{.State.StartedAt}}' xauusd-backend
+
+            echo '=== HEALTH / CME OPTIONS ==='
+            docker exec -i xauusd-backend python - <<'PY'
+            import json, urllib.request
+            with urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=10) as r:
+                h = json.load(r)
+            print(json.dumps({
+                'status': h.get('status'),
+                'broker_execution_enabled': h.get('broker_execution_enabled'),
+                'market_data': h.get('market_data'),
+                'cme_options': h.get('cme_options'),
+            }, indent=2, sort_keys=True))
+            PY
+
+            echo '=== CME TABLE COUNTS ==='
+            docker exec -i xauusd-backend python - <<'PY'
+            import json
+            from sqlalchemy import text
+            from database import SessionLocal
+            tables = ['cme_bulletin_archive','cme_gc_options_eod','cme_gc_futures_eod','cme_contract_reconciliation','cme_ingestion_runs']
+            out = {}
+            with SessionLocal() as db:
+                for t in tables:
+                    try:
+                        out[t] = db.execute(text(f'SELECT COUNT(*) FROM {t}')).scalar()
+                    except Exception as e:
+                        out[t] = f'ERROR:{type(e).__name__}:{e}'
+            print(json.dumps(out, indent=2, sort_keys=True))
+            PY
+
+            echo '=== CME REFRESH LOGS ==='
+            docker logs --since 15m xauusd-backend 2>&1 | grep -E '\[cme_context\]|\[cme_refresh\]' | tail -80 || true
+
+            echo '=== EXECUTION SAFETY ==='
+            docker exec -i xauusd-backend python - <<'PY'
+            import json
+            from config import settings
+            print(json.dumps({
+                'broker_execution_enabled': bool(getattr(settings,'broker_execution_enabled',False)),
+                'live_trading_authorized': bool(getattr(settings,'live_trading_authorized',False)),
+                'mt5_execution_enabled': bool(getattr(settings,'mt5_execution_enabled',False)),
+            }, sort_keys=True))
+            PY
