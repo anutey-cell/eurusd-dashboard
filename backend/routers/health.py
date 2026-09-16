@@ -2,8 +2,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
 from config import settings
 
@@ -23,6 +23,12 @@ class HealthDetail(BaseModel):
     market_data:              dict[str, Any]
     cme_options:              dict[str, Any]
     timestamp:                datetime
+
+
+class CmeBulletinRelayPayload(BaseModel):
+    source: str = Field(default="windows_edge", max_length=64)
+    options_pdf_b64: str = Field(..., min_length=1000)
+    futures_pdf_b64: str = Field(..., min_length=1000)
 
 
 def _db_status() -> str:
@@ -95,6 +101,57 @@ def _cme_options_status() -> dict[str, Any]:
             "gamma_status": "NOT_COMPUTED",
             "refresh": {"status": "UNKNOWN"},
         }
+
+
+@router.post(
+    "/cme/bulletin-relay",
+    summary="Receive CME Metals bulletins from the authenticated Windows edge",
+)
+def cme_bulletin_relay(payload: CmeBulletinRelayPayload) -> dict[str, Any]:
+    # Import the existing bridge auth dependency here so the CME relay uses the
+    # same secret rotation and fail-closed behavior as the MT5 bridge.
+    from fastapi import Header
+    from routers.bridge import _require_bridge_secret
+    # FastAPI dependency injection cannot be called manually. The endpoint's
+    # actual authenticated variant is installed below as a wrapper.
+    raise HTTPException(status_code=500, detail="relay auth wrapper misconfigured")
+
+
+def _cme_relay_impl(payload: CmeBulletinRelayPayload) -> dict[str, Any]:
+    try:
+        from services.cme_relay_ingest import ingest_relay_pair
+        result = ingest_relay_pair(payload.options_pdf_b64, payload.futures_pdf_b64)
+        logger.info(
+            "[cme_relay] accepted source=%s date=%s status=%s options=%s futures=%s",
+            payload.source,
+            result.get("bulletin_date"),
+            result.get("bulletin_status"),
+            result.get("options_rows_written"),
+            result.get("futures_rows_written"),
+        )
+        return {"ok": True, "data": result, "source": payload.source}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("[cme_relay] rejected: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)[:500]) from exc
+
+
+# Re-register the same path with bridge authentication and hide the placeholder
+# above from the schema. This keeps authentication centralized in bridge.py.
+router.routes.pop()
+from routers.bridge import _require_bridge_secret
+
+
+@router.post(
+    "/cme/bulletin-relay",
+    summary="Receive CME Metals bulletins from the authenticated Windows edge",
+)
+def cme_bulletin_relay_authenticated(
+    payload: CmeBulletinRelayPayload,
+    _: None = Depends(_require_bridge_secret),
+) -> dict[str, Any]:
+    return _cme_relay_impl(payload)
 
 
 @router.get("/health", response_model=HealthDetail, summary="API health check")
