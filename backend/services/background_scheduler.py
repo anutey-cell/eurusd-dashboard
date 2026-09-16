@@ -1249,12 +1249,12 @@ def _run_predator_iteration():
 
 # ── Phase 11: market-intelligence alert loop ──────────────────────────────
 #
-# Every 60s, run the full Phase 2-10 pipeline and let the intel engine
-# decide whether any new alert candidates fire. Governed by two flags:
-#   xauusd_market_intelligence_telegram_enabled — master switch
-#   xauusd_market_intel_shadow_mode              — persist-only (no send)
-# When flag is False, this loop still runs but all candidates are
-# suppressed with reason "flag off" — so nothing sends, nothing is stored.
+# Every 60s, run the full Phase 2-10 pipeline and publish one canonical
+# opportunity-arbiter context. Computation and Telegram delivery are separate:
+#   xauusd_market_intelligence_compute_enabled  — keeps the market brain alive
+#   xauusd_market_intelligence_telegram_enabled — optional intelligence alerts
+#   xauusd_market_intel_shadow_mode             — delivery dry-run when enabled
+# The arbiter is context only; it is never an execution authority.
 
 _MARKET_INTEL_INTERVAL_S = 60
 
@@ -1268,8 +1268,7 @@ async def _market_intel_loop():
     await asyncio.sleep(30)
     while True:
         try:
-            # Only run pipeline if flag is on — else save the compute
-            if getattr(settings, "xauusd_market_intelligence_telegram_enabled", False):
+            if getattr(settings, "xauusd_market_intelligence_compute_enabled", True):
                 await asyncio.to_thread(_run_market_intel_iteration)
         except asyncio.CancelledError:
             log.info("[scheduler] market-intel loop cancelled")
@@ -1292,6 +1291,8 @@ def _run_market_intel_iteration():
     from services.key_level_ranking import rank_key_levels
     from services.macro_interpretation import compute_macro_context
     from services.market_intelligence_alerts import fire_intel_alerts
+    from services.actionability_gate import evaluate_db_actionability
+    from services.opportunity_arbiter import build_arbiter_context, publish_arbiter_context
     from config import settings
 
     cmd = get_canonical(cache_ttl_s=settings.xauusd_canonical_data_cache_ttl_s)
@@ -1346,18 +1347,51 @@ def _run_market_intel_iteration():
         except Exception as exc:
             log.debug("[market-intel] macro assembly skipped: %s", exc)
 
-        outcomes = fire_intel_alerts(
-            db, prev_state=state_tr.prev_state, new_state=state_tr.new_state,
-            trigger_condition=state_tr.trigger_condition,
-            trigger_price=state_tr.price,
-            snapshot=snap, verdict=verdict, evidence=evidence, ranking=ranking,
-            macro=macro, state_transition=state_tr, breakouts=breakouts,
+        # Publish one canonical opportunity-arbiter context every cycle.
+        # Optional layers are best-effort and never become hard signal gates.
+        actionability = evaluate_db_actionability(db)
+        cme = None
+        try:
+            from services.cme_options_context import get_cme_options_context
+            current_xau = None
+            if snap.bid is not None and snap.ask is not None:
+                current_xau = (float(snap.bid) + float(snap.ask)) / 2.0
+            cme = get_cme_options_context(db, current_xau=current_xau, top_n=5)
+        except Exception as exc:
+            log.debug("[market-intel] CME context unavailable: %s", exc)
+
+        arbiter = build_arbiter_context(
+            snapshot=snap, htf_alignment=htf, regime=regime, evidence=evidence,
+            breakouts=breakouts, state_transition=state_tr,
+            separated_verdict=verdict, ranking=ranking, macro=macro,
+            cme=cme, actionability=actionability,
         )
-        # Log only if something happened
+        publish_arbiter_context(arbiter)
+
+        structure = arbiter.get("structure") or {}
+        if structure.get("manipulation_candidate"):
+            log.info(
+                "[market-intel] liquidity-event candidate %s %s %.2f class=%s conf=%s",
+                structure.get("liquidity_side"), structure.get("level_name"),
+                float(structure.get("level") or 0.0), structure.get("classification"),
+                structure.get("confidence"),
+            )
+
+        # Delivery remains independently gated. With Telegram off, the engine
+        # still computes/persists market state but emits no extra alert stream.
+        outcomes = []
+        if getattr(settings, "xauusd_market_intelligence_telegram_enabled", False):
+            outcomes = fire_intel_alerts(
+                db, prev_state=state_tr.prev_state, new_state=state_tr.new_state,
+                trigger_condition=state_tr.trigger_condition,
+                trigger_price=state_tr.price,
+                snapshot=snap, verdict=verdict, evidence=evidence, ranking=ranking,
+                macro=macro, state_transition=state_tr, breakouts=breakouts,
+            )
         interesting = [o for o in outcomes if o.result in ("sent", "shadow")]
         if interesting:
             log.info("[market-intel] fired: %s",
-                      [(o.alert_type, o.result) for o in interesting])
+                     [(o.alert_type, o.result) for o in interesting])
 
 
 def _run_auto_executor_iteration():

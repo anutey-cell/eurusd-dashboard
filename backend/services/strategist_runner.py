@@ -175,6 +175,18 @@ def run_once(db: Session) -> dict:
             permission["allow_execute"] = False
             verdict["execution_permission"] = permission
 
+    # Attach the always-on market-intelligence/structure context. This is
+    # observational reinforcement only; it does not allow/deny a Strategist signal.
+    try:
+        from services.opportunity_arbiter import get_latest_arbiter_context
+        verdict["opportunity_arbiter"] = get_latest_arbiter_context(max_age_s=180)
+    except Exception as exc:
+        log.debug("[strategist_runner] arbiter context unavailable: %s", exc)
+        verdict["opportunity_arbiter"] = {
+            "status": "UNAVAILABLE", "stale": True,
+            "policy": {"arbiter_is_execution_authority": False},
+        }
+
     # Pre-compute signal grade so downstream side-effects (enqueue + alert)
     # both see the same grade. Enqueue uses it for sizing; alert uses it for
     # gating/formatting. Only applies to BUY/SELL decisions.
