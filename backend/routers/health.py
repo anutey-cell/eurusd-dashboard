@@ -21,6 +21,7 @@ class HealthDetail(BaseModel):
     calendar_provider:        str
     broker_execution_enabled: bool
     market_data:              dict[str, Any]
+    cme_options:              dict[str, Any]
     timestamp:                datetime
 
 
@@ -58,6 +59,44 @@ def _market_data_status() -> dict[str, Any]:
         }
 
 
+def _cme_options_status() -> dict[str, Any]:
+    """CME gold-options intelligence health, independent of spot-feed health."""
+    try:
+        from database import SessionLocal
+        from services.cme_options_context import get_cme_options_context
+        from research.gold_intel.cme_live_refresh import get_last_refresh_status
+        with SessionLocal() as db:
+            ctx = get_cme_options_context(db, top_n=3)
+        refresh = get_last_refresh_status()
+        return {
+            "status": ctx.get("status"),
+            "bulletin_date": ctx.get("bulletin_date"),
+            "bulletin_status": ctx.get("bulletin_status"),
+            "age_days": ctx.get("age_days"),
+            "gc_price": ctx.get("gc_price"),
+            "xau_price": ctx.get("xau_price"),
+            "gc_xau_basis": ctx.get("gc_xau_basis"),
+            "basis_status": ctx.get("basis_status"),
+            "directional_bias": ctx.get("directional_bias", "UNSIGNED_NEUTRAL"),
+            "gamma_status": ctx.get("gamma_status"),
+            "nearest_zones": (ctx.get("nearest_zones") or [])[:3],
+            "strongest_zones": (ctx.get("strongest_zones") or [])[:3],
+            "largest_oi_changes": (ctx.get("largest_oi_changes") or [])[:3],
+            "zone_count": ctx.get("zone_count", 0),
+            "reason": ctx.get("reason"),
+            "refresh": refresh,
+        }
+    except Exception as exc:
+        logger.warning("CME-options health check failed: %s", exc)
+        return {
+            "status": "UNAVAILABLE",
+            "reason": str(exc)[:400],
+            "directional_bias": "UNSIGNED_NEUTRAL",
+            "gamma_status": "NOT_COMPUTED",
+            "refresh": {"status": "UNKNOWN"},
+        }
+
+
 @router.get("/health", response_model=HealthDetail, summary="API health check")
 def health_check() -> HealthDetail:
     db = _db_status()
@@ -73,6 +112,13 @@ def health_check() -> HealthDetail:
         "tradingview_enabled": None,
         "weekend": False,
     }
+    cme = _cme_options_status() if db == "connected" else {
+        "status": "UNAVAILABLE",
+        "reason": "database unavailable",
+        "directional_bias": "UNSIGNED_NEUTRAL",
+        "gamma_status": "NOT_COMPUTED",
+        "refresh": {"status": "UNKNOWN"},
+    }
 
     if db != "connected":
         overall = "error"
@@ -82,11 +128,12 @@ def health_check() -> HealthDetail:
         overall = "ok"
 
     logger.info(
-        "Health check db=%s market=%s quality=%s provider=%s mode=%s instrument=XAU/USD",
+        "Health check db=%s market=%s quality=%s provider=%s cme=%s mode=%s instrument=XAU/USD",
         db,
         market.get("status"),
         market.get("data_quality_score"),
         market.get("active_provider"),
+        cme.get("status"),
         settings.data_mode,
     )
     return HealthDetail(
@@ -99,6 +146,7 @@ def health_check() -> HealthDetail:
         calendar_provider=settings.active_calendar_provider,
         broker_execution_enabled=settings.broker_execution_enabled,
         market_data=market,
+        cme_options=cme,
         timestamp=datetime.now(timezone.utc),
     )
 
