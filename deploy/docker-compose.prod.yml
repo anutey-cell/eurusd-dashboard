@@ -32,6 +32,10 @@ services:
     environment:
       - DATABASE_URL=sqlite:////app/storage/eurusd_signals.db
       - DATA_MODE=live
+      # Cloud continuity must work even when the Windows/MT5 bridge is offline.
+      # Explicit compose value overrides the provider module's conservative
+      # default and permits anonymous OANDA:XAUUSD retrieval via tvDatafeed.
+      - TRADINGVIEW_ENABLED=true
       - PYTHONUNBUFFERED=1
     volumes:
       - /opt/xauusd/data:/app/storage          # SQLite DB lives on host
