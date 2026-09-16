@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from config import settings
+from routers.bridge import _require_bridge_secret
 
 router = APIRouter(tags=["health"])
 logger = logging.getLogger(__name__)
@@ -107,17 +108,15 @@ def _cme_options_status() -> dict[str, Any]:
     "/cme/bulletin-relay",
     summary="Receive CME Metals bulletins from the authenticated Windows edge",
 )
-def cme_bulletin_relay(payload: CmeBulletinRelayPayload) -> dict[str, Any]:
-    # Import the existing bridge auth dependency here so the CME relay uses the
-    # same secret rotation and fail-closed behavior as the MT5 bridge.
-    from fastapi import Header
-    from routers.bridge import _require_bridge_secret
-    # FastAPI dependency injection cannot be called manually. The endpoint's
-    # actual authenticated variant is installed below as a wrapper.
-    raise HTTPException(status_code=500, detail="relay auth wrapper misconfigured")
+def cme_bulletin_relay(
+    payload: CmeBulletinRelayPayload,
+    _: None = Depends(_require_bridge_secret),
+) -> dict[str, Any]:
+    """Validate and ingest Section 64/62 PDFs relayed by the HOME edge.
 
-
-def _cme_relay_impl(payload: CmeBulletinRelayPayload) -> dict[str, Any]:
+    Uses the same rotating shared-secret guard as the MT5 bridge. The endpoint
+    only updates CME research/context tables; it cannot create or execute orders.
+    """
     try:
         from services.cme_relay_ingest import ingest_relay_pair
         result = ingest_relay_pair(payload.options_pdf_b64, payload.futures_pdf_b64)
@@ -135,23 +134,6 @@ def _cme_relay_impl(payload: CmeBulletinRelayPayload) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("[cme_relay] rejected: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)[:500]) from exc
-
-
-# Re-register the same path with bridge authentication and hide the placeholder
-# above from the schema. This keeps authentication centralized in bridge.py.
-router.routes.pop()
-from routers.bridge import _require_bridge_secret
-
-
-@router.post(
-    "/cme/bulletin-relay",
-    summary="Receive CME Metals bulletins from the authenticated Windows edge",
-)
-def cme_bulletin_relay_authenticated(
-    payload: CmeBulletinRelayPayload,
-    _: None = Depends(_require_bridge_secret),
-) -> dict[str, Any]:
-    return _cme_relay_impl(payload)
 
 
 @router.get("/health", response_model=HealthDetail, summary="API health check")
