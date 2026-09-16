@@ -7,8 +7,9 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
-# Unit tests must never start the network refresh worker.
+# Unit tests must never start network refresh workers.
 os.environ["CME_OPTIONS_CONTEXT_REFRESH_ENABLED"] = "false"
+os.environ["CME_CHATGPT_SNAPSHOT_ENABLED"] = "false"
 
 from services.cme_options_context import get_cme_options_context, _sensitivity_weight
 
@@ -125,7 +126,7 @@ def test_stale_bulletin_fails_closed_and_publishes_no_zones():
         assert ctx["status"] == "STALE"
         assert ctx["directional_bias"] == "UNSIGNED_NEUTRAL"
         assert ctx["zones"] == []
-        assert "too old" in ctx["reason"]
+        assert "fresh validated" in ctx["reason"]
     finally:
         db.close()
 
