@@ -70,15 +70,20 @@ def _cme_options_status() -> dict[str, Any]:
     """CME gold-options intelligence health, independent of spot-feed health."""
     try:
         from database import SessionLocal
-        from services.cme_options_context import get_cme_options_context
+        from services.cme_options_context import (
+            get_cme_options_context,
+            get_chatgpt_snapshot_status,
+        )
         from services.cme_relay_ingest import get_last_relay_status
         from research.gold_intel.cme_live_refresh import get_last_refresh_status
         with SessionLocal() as db:
             ctx = get_cme_options_context(db, top_n=3)
         direct = get_last_refresh_status()
         relay = get_last_relay_status()
+        snapshot = get_chatgpt_snapshot_status()
         return {
             "status": ctx.get("status"),
+            "source": ctx.get("source"),
             "bulletin_date": ctx.get("bulletin_date"),
             "bulletin_status": ctx.get("bulletin_status"),
             "age_days": ctx.get("age_days"),
@@ -98,6 +103,7 @@ def _cme_options_status() -> dict[str, Any]:
             "acquisition": {
                 "direct_cloud": direct,
                 "home_relay": relay,
+                "chatgpt_snapshot": snapshot,
             },
         }
     except Exception as exc:
@@ -111,6 +117,7 @@ def _cme_options_status() -> dict[str, Any]:
             "acquisition": {
                 "direct_cloud": {"status": "UNKNOWN"},
                 "home_relay": {"status": "UNKNOWN"},
+                "chatgpt_snapshot": {"status": "UNKNOWN"},
             },
         }
 
@@ -171,6 +178,7 @@ def health_check() -> HealthDetail:
         "acquisition": {
             "direct_cloud": {"status": "UNKNOWN"},
             "home_relay": {"status": "UNKNOWN"},
+            "chatgpt_snapshot": {"status": "UNKNOWN"},
         },
     }
 
@@ -182,12 +190,13 @@ def health_check() -> HealthDetail:
         overall = "ok"
 
     logger.info(
-        "Health check db=%s market=%s quality=%s provider=%s cme=%s mode=%s instrument=XAU/USD",
+        "Health check db=%s market=%s quality=%s provider=%s cme=%s cme_source=%s mode=%s instrument=XAU/USD",
         db,
         market.get("status"),
         market.get("data_quality_score"),
         market.get("active_provider"),
         cme.get("status"),
+        cme.get("source"),
         settings.data_mode,
     )
     return HealthDetail(
