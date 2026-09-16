@@ -223,11 +223,15 @@ def _fetch_bars(db: Session, instrument: str, tf: str, lookback: int) -> list[Ba
     for row in reversed(rows):
         ts = row[0]
         if isinstance(ts, str):
-            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    ts = datetime.strptime(ts.split("+")[0], fmt); break
-                except ValueError:
-                    continue
+            raw = ts
+            try:
+                ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                    try:
+                        ts = datetime.strptime(raw.split("+")[0], fmt); break
+                    except ValueError:
+                        continue
         if not isinstance(ts, datetime):
             continue
         if ts.tzinfo is None:

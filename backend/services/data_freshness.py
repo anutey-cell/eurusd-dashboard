@@ -122,11 +122,15 @@ def _last_candle_at(db, instrument: str, tf: str) -> Optional[datetime]:
     if ts is None:
         return None
     if isinstance(ts, str):
-        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-            try:
-                ts = datetime.strptime(ts.split("+")[0], fmt); break
-            except ValueError:
-                continue
+        raw = ts
+        try:
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    ts = datetime.strptime(raw.split("+")[0], fmt); break
+                except ValueError:
+                    continue
     if isinstance(ts, datetime):
         return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
     return None
