@@ -8,13 +8,17 @@ on:
       - 'backend/services/tradingview_provider.py'
       - 'backend/services/market_data_health.py'
       - 'backend/services/cme_options_context.py'
+      - 'backend/services/cme_relay_ingest.py'
       - 'backend/services/signal_grading.py'
       - 'backend/research/gold_intel/**'
       - 'backend/routers/health.py'
       - 'backend/tests/test_candle_ingestion_continuity.py'
       - 'backend/tests/test_market_data_health_endpoint.py'
       - 'backend/tests/test_cme_options_context.py'
+      - 'backend/tests/test_cme_relay.py'
       - 'backend/Dockerfile'
+      - 'deploy/cme_bulletin_relay.py'
+      - 'deploy/install_cme_relay_task.ps1'
       - 'deploy/docker-compose.prod.yml'
   push:
     branches:
@@ -24,13 +28,17 @@ on:
       - 'backend/services/tradingview_provider.py'
       - 'backend/services/market_data_health.py'
       - 'backend/services/cme_options_context.py'
+      - 'backend/services/cme_relay_ingest.py'
       - 'backend/services/signal_grading.py'
       - 'backend/research/gold_intel/**'
       - 'backend/routers/health.py'
       - 'backend/tests/test_candle_ingestion_continuity.py'
       - 'backend/tests/test_market_data_health_endpoint.py'
       - 'backend/tests/test_cme_options_context.py'
+      - 'backend/tests/test_cme_relay.py'
       - 'backend/Dockerfile'
+      - 'deploy/cme_bulletin_relay.py'
+      - 'deploy/install_cme_relay_task.ps1'
       - 'deploy/docker-compose.prod.yml'
       - '.github/workflows/data-continuity-tests.yml'
 
@@ -62,6 +70,7 @@ jobs:
           python -m py_compile services/tradingview_provider.py
           python -m py_compile services/market_data_health.py
           python -m py_compile services/cme_options_context.py
+          python -m py_compile services/cme_relay_ingest.py
           python -m py_compile services/signal_grading.py
           python -m py_compile routers/health.py
           python -m py_compile research/gold_intel/cme_live_refresh.py
@@ -69,6 +78,21 @@ jobs:
           python -m py_compile research/gold_intel/cme_bulletin_detector.py
           python -m py_compile research/gold_intel/cme_bulletin_parser.py
           python -m py_compile research/gold_intel/cme_futures_parser.py
+          python -m py_compile ../deploy/cme_bulletin_relay.py
+
+      - name: Parse HOME relay scheduled-task installer
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ../deploy/install_cme_relay_task.ps1),
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
 
       - name: Run continuity regressions
         env:
@@ -77,10 +101,12 @@ jobs:
           pytest -q \
             tests/test_candle_ingestion_continuity.py \
             tests/test_market_data_health_endpoint.py \
-            tests/test_cme_options_context.py
+            tests/test_cme_options_context.py \
+            tests/test_cme_relay.py
 
       - name: Verify production continuity dependencies
         working-directory: .
         run: |
           grep -q 'TRADINGVIEW_ENABLED=true' deploy/docker-compose.prod.yml
           grep -q 'poppler-utils' backend/Dockerfile
+          grep -q 'api/v1/cme/bulletin-relay' deploy/cme_bulletin_relay.py
