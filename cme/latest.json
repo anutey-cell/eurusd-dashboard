@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "source": "CME Daily Bulletin / ChatGPT retrieval",
+  "bulletin_date": "2026-09-04",
+  "bulletin_status": "FINAL",
+  "fetched_at": "2026-09-16T00:00:00Z",
+  "options": [],
+  "note": "Bootstrap placeholder only. Fails validation until ChatGPT publishes a fresh whole-surface snapshot."
+}
