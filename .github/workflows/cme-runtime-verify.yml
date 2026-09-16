@@ -43,9 +43,11 @@ jobs:
                     'health': health,
                     'gate': gate,
                     'canonical': {
-                        'bid': snap.bid, 'ask': snap.ask, 'mid': snap.mid,
-                        'spread': snap.spread, 'tick_source': snap.tick_source,
+                        'ts': snap.ts, 'bid': snap.bid, 'ask': snap.ask,
+                        'spread': snap.spread, 'last_tick_at': snap.last_tick_at,
+                        'tick_source': snap.tick_source,
                         'data_quality_score': snap.data_quality_score,
+                        'session': snap.session.to_dict(), 'levels': snap.levels.to_dict(),
                         'tf_sources': {tf: sl.source for tf, sl in snap.timeframes.items()},
                         'tf_status': {tf: sl.status for tf, sl in snap.timeframes.items()},
                     },
