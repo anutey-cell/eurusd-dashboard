@@ -14,10 +14,18 @@ Outputs:
 The `sensitivity_score` is NOT GEX. It simply weights OI highest when the
 CME-published |delta| is near 0.50 and lower as delta approaches 0 or 1.
 Signed dealer gamma is not inferred.
+
+The first live caller starts one daemon refresh worker. It performs an
+immediate bootstrap pull, then retries CME at the publication windows without
+blocking Strategist/Predator. A failed CME fetch never deletes the last
+accepted bulletin.
 """
 from __future__ import annotations
 
 import logging
+import os
+import threading
+import time
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from typing import Any, Optional
@@ -28,6 +36,67 @@ from sqlalchemy.orm import Session
 log = logging.getLogger(__name__)
 
 _STD_GOLD_PRODUCTS = ("OG", "OG1", "OG2", "OG3", "OG4", "GMW", "GWR", "GWT", "GWW")
+_REFRESH_LOCK = threading.Lock()
+_REFRESH_THREAD: threading.Thread | None = None
+
+
+def _refresh_slot(now: datetime) -> str:
+    """Publication slot key. Also gives every backend boot one bootstrap pull."""
+    if now.hour >= 15:
+        return f"{now.date().isoformat()}:FINAL"
+    if now.hour >= 5:
+        return f"{now.date().isoformat()}:PRELIM"
+    return f"{now.date().isoformat()}:BOOTSTRAP"
+
+
+def _refresh_worker() -> None:
+    last_ok_slot: str | None = None
+    # Retry failures every 30m. Successful slot sleeps until a new publication
+    # window appears, while still waking every 5m to notice the transition.
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            slot = _refresh_slot(now)
+            if slot != last_ok_slot:
+                from research.gold_intel.cme_live_refresh import refresh_cme_bulletins
+                result = refresh_cme_bulletins()
+                if result.get("status") == "OK":
+                    last_ok_slot = slot
+                    log.info(
+                        "[cme_context] autonomous refresh OK slot=%s bulletin=%s %s",
+                        slot, result.get("bulletin_date"), result.get("bulletin_status"),
+                    )
+                    time.sleep(300)
+                    continue
+                log.warning(
+                    "[cme_context] autonomous refresh failed slot=%s detail=%s",
+                    slot, result.get("detail"),
+                )
+                time.sleep(1800)
+                continue
+        except Exception as exc:
+            log.warning("[cme_context] refresh worker error: %s", exc)
+            time.sleep(1800)
+            continue
+        time.sleep(300)
+
+
+def ensure_cme_refresh_worker() -> bool:
+    """Start the single process-local daemon worker. Returns True if running."""
+    global _REFRESH_THREAD
+    if str(os.getenv("CME_OPTIONS_CONTEXT_REFRESH_ENABLED", "true")).lower() not in ("1", "true", "yes"):
+        return False
+    with _REFRESH_LOCK:
+        if _REFRESH_THREAD and _REFRESH_THREAD.is_alive():
+            return True
+        _REFRESH_THREAD = threading.Thread(
+            target=_refresh_worker,
+            name="cme-options-refresh",
+            daemon=True,
+        )
+        _REFRESH_THREAD.start()
+        log.info("[cme_context] autonomous CME refresh worker started")
+        return True
 
 
 def _latest_price(db: Session, sql: str, params: Optional[dict] = None) -> Optional[float]:
@@ -64,6 +133,9 @@ def get_cme_options_context(
     max_raw_distance: float = 300.0,
     top_n: int = 8,
 ) -> dict[str, Any]:
+    # Non-blocking: this only starts a daemon; HTTP/PDF work happens off-thread.
+    ensure_cme_refresh_worker()
+
     try:
         bulletin_date, bulletin_status = _canonical_bulletin(db)
     except Exception as exc:
