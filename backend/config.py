@@ -419,8 +419,12 @@ class Settings(BaseSettings):
     xauusd_separated_verdicts_enabled: bool = False
     xauusd_key_level_ranking_enabled: bool = False
     xauusd_macro_interpretation_enabled: bool = False
+    # Always-on computation is independent of Telegram delivery. This lets the
+    # opportunity state / breakout acceptance stack continuously inform other
+    # engines without turning on a separate alert stream.
+    xauusd_market_intelligence_compute_enabled: bool = True
     xauusd_market_intelligence_telegram_enabled: bool = False
-    xauusd_market_intel_shadow_mode: bool = True     # canonical shadow while true
+    xauusd_market_intel_shadow_mode: bool = True     # delivery dry-run while true
     xauusd_opportunity_coverage_enabled: bool = False
     xauusd_replay_validation_enabled: bool = False
 
