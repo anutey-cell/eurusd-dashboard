@@ -31,6 +31,8 @@ backend/.env.*
 # Deploy kit: keep the *.example templates, ignore the real ones
 deploy/.env.prod
 deploy/.env.bridge
+deploy/.cme_relay_state.json
+deploy/.cme_relay_state.json.tmp
 !deploy/.env.prod.example
 !deploy/.env.bridge.example
 
