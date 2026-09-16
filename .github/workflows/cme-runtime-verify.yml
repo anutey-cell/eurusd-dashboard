@@ -1,3 +1,4 @@
+# Recheck after production execution-safety pin
 name: C0 Runtime Verify
 
 on:
@@ -84,7 +85,12 @@ jobs:
                 'broker_execution_enabled': bool(getattr(settings,'broker_execution_enabled',False)),
                 'live_trading_authorized': bool(getattr(settings,'live_trading_authorized',False)),
                 'auto_execution_enabled': bool(getattr(settings,'auto_execution_enabled',False)),
+                'mt5_execution_enabled': bool(getattr(settings,'mt5_execution_enabled',False)),
+                'allow_demo_trading': bool(getattr(settings,'allow_demo_trading',False)),
+                'demo_auto_enqueue': bool(getattr(settings,'demo_auto_enqueue',False)),
                 'predator_execution_enabled': bool(getattr(settings,'predator_execution_enabled',False)),
+                'predator_expansion_enabled': bool(getattr(settings,'predator_expansion_enabled',False)),
+                'vp_trap_auto_execute': bool(getattr(settings,'vp_trap_auto_execute',False)),
             }
             print(json.dumps(out, sort_keys=True))
             if any(out.values()):
