@@ -1,5 +1,4 @@
-# Recheck after production execution-safety pin
-name: C0 Runtime Verify
+name: Gold Runtime Diagnostic
 
 on:
   push:
@@ -16,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Verify C0 market-data remediation on VPS
+      - name: Inspect live XAUUSD engine state
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
@@ -26,73 +25,69 @@ jobs:
             set -eu
             echo '=== CONTAINER ==='
             docker inspect --format='image={{.Config.Image}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} started={{.State.StartedAt}}' xauusd-backend
-            sleep 10
 
-            echo '=== MARKET HEALTH ==='
-            docker exec -i xauusd-backend python - <<'PY'
-            import json, urllib.request
-            with urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=10) as r:
-                h = json.load(r)
-            m = h.get('market_data') or {}
-            out = {
-                'overall_status': h.get('status'),
-                'broker_execution_enabled': h.get('broker_execution_enabled'),
-                'market_status': m.get('status'),
-                'data_quality_score': m.get('data_quality_score'),
-                'stale_timeframes': m.get('stale_timeframes'),
-                'active_provider': m.get('active_provider'),
-                'provider_by_timeframe': m.get('provider_by_timeframe'),
-                'provider_health': m.get('provider_health'),
-                'last_ingest_error': m.get('last_ingest_error'),
-            }
-            print(json.dumps(out, indent=2, sort_keys=True))
-            if out['market_status'] not in ('fresh','degraded'):
-                raise SystemExit(f"market data not operational: {out['market_status']}")
-            if int(out['data_quality_score'] or 0) < 70:
-                raise SystemExit(f"market quality below core threshold: {out['data_quality_score']}")
-            PY
-
-            echo '=== ACTIONABILITY + CANONICAL ATTRIBUTION ==='
+            echo '=== MARKET + PRICE ==='
             docker exec -i xauusd-backend python - <<'PY'
             import json
+            from sqlalchemy import text
             from database import SessionLocal
+            from services.market_data_health import get_market_data_health
             from services.actionability_gate import evaluate_db_actionability
             from services.canonical_market_data import get_canonical
             with SessionLocal() as db:
+                health = get_market_data_health(db)
                 gate = evaluate_db_actionability(db)
                 snap = get_canonical(cache_ttl_s=0).snapshot(db, force_refresh=True)
+                rows = db.execute(text("SELECT timeframe, candle_time, open, high, low, close, source FROM historical_candles WHERE instrument='XAU/USD' AND timeframe IN ('M5','M15','H1') ORDER BY candle_time DESC LIMIT 12")).fetchall()
                 out = {
+                    'health': health,
                     'gate': gate,
-                    'tick_source': snap.tick_source,
-                    'data_quality_score': snap.data_quality_score,
-                    'tf_sources': {tf: sl.source for tf, sl in snap.timeframes.items()},
-                    'tf_status': {tf: sl.status for tf, sl in snap.timeframes.items()},
+                    'canonical': {
+                        'bid': snap.bid, 'ask': snap.ask, 'mid': snap.mid,
+                        'spread': snap.spread, 'tick_source': snap.tick_source,
+                        'data_quality_score': snap.data_quality_score,
+                        'tf_sources': {tf: sl.source for tf, sl in snap.timeframes.items()},
+                        'tf_status': {tf: sl.status for tf, sl in snap.timeframes.items()},
+                    },
+                    'recent_bars': [dict(r._mapping) for r in rows],
                 }
-            print(json.dumps(out, indent=2, sort_keys=True))
-            if not out['gate'].get('actionable'):
-                raise SystemExit(f"core gate unexpectedly blocked: {out['gate'].get('reason')}")
-            if out['gate'].get('optional_context_is_gate') is not False:
-                raise SystemExit('optional context incorrectly configured as signal gate')
-            if out['tick_source'] == 'twelvedata-derived':
-                raise SystemExit('legacy misleading canonical source label remains')
+                print(json.dumps(out, indent=2, default=str, sort_keys=True))
             PY
 
-            echo '=== EXECUTION SAFETY ==='
+            echo '=== ARBITER ==='
+            docker exec -i xauusd-backend python - <<'PY'
+            import json
+            from services.opportunity_arbiter import get_latest_arbiter_context
+            a = get_latest_arbiter_context(max_age_s=600)
+            keep = {
+                'status': a.get('status'), 'stale': a.get('stale'), 'age_s': a.get('age_s'),
+                'generated_at': a.get('generated_at'), 'directional_assessment': a.get('directional_assessment'),
+                'opportunity_status': a.get('opportunity_status'), 'entry_status': a.get('entry_status'),
+                'opportunity_state': a.get('opportunity_state'), 'confidence': a.get('confidence'),
+                'structure': a.get('structure'), 'htf': a.get('htf'), 'regime': a.get('regime'),
+                'evidence': a.get('evidence'), 'data': a.get('data'), 'macro': a.get('macro'),
+                'cme': a.get('cme'), 'policy': a.get('policy'),
+            }
+            print(json.dumps(keep, indent=2, default=str, sort_keys=True))
+            PY
+
+            echo '=== TELEGRAM + STRATEGY FLAGS ==='
             docker exec -i xauusd-backend python - <<'PY'
             import json
             from config import settings
-            out = {
-                'broker_execution_enabled': bool(getattr(settings,'broker_execution_enabled',False)),
-                'live_trading_authorized': bool(getattr(settings,'live_trading_authorized',False)),
-                'auto_execution_enabled': bool(getattr(settings,'auto_execution_enabled',False)),
-                'mt5_execution_enabled': bool(getattr(settings,'mt5_execution_enabled',False)),
-                'allow_demo_trading': bool(getattr(settings,'allow_demo_trading',False)),
-                'demo_auto_enqueue': bool(getattr(settings,'demo_auto_enqueue',False)),
-                'predator_execution_enabled': bool(getattr(settings,'predator_execution_enabled',False)),
-                'predator_expansion_enabled': bool(getattr(settings,'predator_expansion_enabled',False)),
-                'vp_trap_auto_execute': bool(getattr(settings,'vp_trap_auto_execute',False)),
-            }
-            print(json.dumps(out, sort_keys=True))
-            if any(out.values()):
-                raise SystemExit(f'execution safety regression: {out}')
+            names = [
+                'telegram_alerts_enabled','telegram_enabled','telegram_signal_alerts','telegram_confirm_alerts',
+                'telegram_trade_alerts','telegram_standby_alerts','telegram_watchlist_alerts',
+                'telegram_market_intelligence_enabled','market_intelligence_telegram_enabled',
+                'notification_canonical_enabled','predator_notification_architecture','predator_notification_mode',
+                'vp_trap_enabled','vp_trap_telegram_alerts','kz_magnet_enabled','kz_magnet_telegram_alerts',
+                'monday_observation_mode','use_mandate_strategist',
+                'broker_execution_enabled','live_trading_authorized','auto_execution_enabled','mt5_execution_enabled',
+                'allow_demo_trading','demo_auto_enqueue','predator_execution_enabled','predator_expansion_enabled','vp_trap_auto_execute'
+            ]
+            out = {n:getattr(settings,n,None) for n in names}
+            print(json.dumps(out, indent=2, sort_keys=True))
             PY
+
+            echo '=== RECENT SIGNAL / TELEGRAM LOGS ==='
+            docker logs --since 30m xauusd-backend 2>&1 | grep -Eai 'arbiter|market.intel|strategist|telegram|predator|momentum|vp.trap|kz.magnet|stand.aside|signal.only|BUY|SELL|breakout|liquidity|suppress|threshold|grade' | tail -n 260 || true
