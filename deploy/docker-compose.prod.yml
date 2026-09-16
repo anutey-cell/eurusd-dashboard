@@ -36,6 +36,10 @@ services:
       # Explicit compose value overrides the provider module's conservative
       # default and permits anonymous OANDA:XAUUSD retrieval via tvDatafeed.
       - TRADINGVIEW_ENABLED=true
+      # CME/Akamai currently rejects DigitalOcean and GitHub-hosted fetches.
+      # Production CME acquisition therefore comes from the authenticated HOME
+      # relay. Keep the blocked direct-cloud worker off to avoid noisy retries.
+      - CME_OPTIONS_CONTEXT_REFRESH_ENABLED=false
       - PYTHONUNBUFFERED=1
     volumes:
       - /opt/xauusd/data:/app/storage          # SQLite DB lives on host
