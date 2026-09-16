@@ -71,10 +71,12 @@ def _cme_options_status() -> dict[str, Any]:
     try:
         from database import SessionLocal
         from services.cme_options_context import get_cme_options_context
+        from services.cme_relay_ingest import get_last_relay_status
         from research.gold_intel.cme_live_refresh import get_last_refresh_status
         with SessionLocal() as db:
             ctx = get_cme_options_context(db, top_n=3)
-        refresh = get_last_refresh_status()
+        direct = get_last_refresh_status()
+        relay = get_last_relay_status()
         return {
             "status": ctx.get("status"),
             "bulletin_date": ctx.get("bulletin_date"),
@@ -91,7 +93,12 @@ def _cme_options_status() -> dict[str, Any]:
             "largest_oi_changes": (ctx.get("largest_oi_changes") or [])[:3],
             "zone_count": ctx.get("zone_count", 0),
             "reason": ctx.get("reason"),
-            "refresh": refresh,
+            # Back-compat field: direct cloud pull status only.
+            "refresh": direct,
+            "acquisition": {
+                "direct_cloud": direct,
+                "home_relay": relay,
+            },
         }
     except Exception as exc:
         logger.warning("CME-options health check failed: %s", exc)
@@ -101,6 +108,10 @@ def _cme_options_status() -> dict[str, Any]:
             "directional_bias": "UNSIGNED_NEUTRAL",
             "gamma_status": "NOT_COMPUTED",
             "refresh": {"status": "UNKNOWN"},
+            "acquisition": {
+                "direct_cloud": {"status": "UNKNOWN"},
+                "home_relay": {"status": "UNKNOWN"},
+            },
         }
 
 
@@ -157,6 +168,10 @@ def health_check() -> HealthDetail:
         "directional_bias": "UNSIGNED_NEUTRAL",
         "gamma_status": "NOT_COMPUTED",
         "refresh": {"status": "UNKNOWN"},
+        "acquisition": {
+            "direct_cloud": {"status": "UNKNOWN"},
+            "home_relay": {"status": "UNKNOWN"},
+        },
     }
 
     if db != "connected":
