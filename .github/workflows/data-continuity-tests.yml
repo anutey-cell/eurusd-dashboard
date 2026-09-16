@@ -7,9 +7,14 @@ on:
       - 'backend/services/candle_ingestion.py'
       - 'backend/services/tradingview_provider.py'
       - 'backend/services/market_data_health.py'
+      - 'backend/services/cme_options_context.py'
+      - 'backend/services/signal_grading.py'
+      - 'backend/research/gold_intel/**'
       - 'backend/routers/health.py'
       - 'backend/tests/test_candle_ingestion_continuity.py'
       - 'backend/tests/test_market_data_health_endpoint.py'
+      - 'backend/tests/test_cme_options_context.py'
+      - 'backend/Dockerfile'
       - 'deploy/docker-compose.prod.yml'
   push:
     branches:
@@ -18,9 +23,14 @@ on:
       - 'backend/services/candle_ingestion.py'
       - 'backend/services/tradingview_provider.py'
       - 'backend/services/market_data_health.py'
+      - 'backend/services/cme_options_context.py'
+      - 'backend/services/signal_grading.py'
+      - 'backend/research/gold_intel/**'
       - 'backend/routers/health.py'
       - 'backend/tests/test_candle_ingestion_continuity.py'
       - 'backend/tests/test_market_data_health_endpoint.py'
+      - 'backend/tests/test_cme_options_context.py'
+      - 'backend/Dockerfile'
       - 'deploy/docker-compose.prod.yml'
       - '.github/workflows/data-continuity-tests.yml'
 
@@ -46,20 +56,31 @@ jobs:
       - name: Install backend dependencies
         run: pip install -r requirements.txt pytest
 
-      - name: Compile market-data modules
+      - name: Compile market-data and CME modules
         run: |
           python -m py_compile services/candle_ingestion.py
           python -m py_compile services/tradingview_provider.py
           python -m py_compile services/market_data_health.py
+          python -m py_compile services/cme_options_context.py
+          python -m py_compile services/signal_grading.py
           python -m py_compile routers/health.py
+          python -m py_compile research/gold_intel/cme_live_refresh.py
+          python -m py_compile research/gold_intel/cme_ingestion.py
+          python -m py_compile research/gold_intel/cme_bulletin_detector.py
+          python -m py_compile research/gold_intel/cme_bulletin_parser.py
+          python -m py_compile research/gold_intel/cme_futures_parser.py
 
-      - name: Run cloud continuity regressions
+      - name: Run continuity regressions
+        env:
+          CME_OPTIONS_CONTEXT_REFRESH_ENABLED: 'false'
         run: |
           pytest -q \
             tests/test_candle_ingestion_continuity.py \
-            tests/test_market_data_health_endpoint.py
+            tests/test_market_data_health_endpoint.py \
+            tests/test_cme_options_context.py
 
-      - name: Verify production TradingView fallback is enabled
+      - name: Verify production continuity dependencies
         working-directory: .
         run: |
           grep -q 'TRADINGVIEW_ENABLED=true' deploy/docker-compose.prod.yml
+          grep -q 'poppler-utils' backend/Dockerfile
