@@ -31,6 +31,8 @@ backend/.env.*
 # Deploy kit: keep the *.example templates, ignore the real ones
 deploy/.env.prod
 deploy/.env.bridge
+deploy/.cme_relay_state.json
+deploy/.cme_relay_state.json.tmp
 !deploy/.env.prod.example
 !deploy/.env.bridge.example
 
@@ -44,12 +46,12 @@ frontend_last_*.log
 tools/*.csv
 tools/xauusd_*.csv
 
-# ── Node / Frontend ───────────────────────────────────────────────────────────
+# ── Node / Frontend ────────────────────────────────────────────────────────────
 node_modules/
 dist/
 .vite/
 
-# ── OS / Editor ───────────────────────────────────────────────────────────────
+# ── OS / Editor ────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 .idea/
