@@ -36,10 +36,13 @@ services:
       # Explicit compose value overrides the provider module's conservative
       # default and permits anonymous OANDA:XAUUSD retrieval via tvDatafeed.
       - TRADINGVIEW_ENABLED=true
-      # CME/Akamai currently rejects DigitalOcean and GitHub-hosted fetches.
-      # Production CME acquisition therefore comes from the authenticated HOME
-      # relay. Keep the blocked direct-cloud worker off to avoid noisy retries.
+      # CME/Akamai currently rejects ordinary hosted/direct bulletin downloads.
+      # Keep that direct worker disabled. The primary unattended CME context
+      # channel is a validated whole-surface snapshot produced by ChatGPT and
+      # published on the dedicated cme-snapshots GitHub branch.
       - CME_OPTIONS_CONTEXT_REFRESH_ENABLED=false
+      - CME_CHATGPT_SNAPSHOT_ENABLED=true
+      - CME_CHATGPT_SNAPSHOT_URL=https://raw.githubusercontent.com/anutey-cell/eurusd-dashboard/cme-snapshots/cme/latest.json
       - PYTHONUNBUFFERED=1
     volumes:
       - /opt/xauusd/data:/app/storage          # SQLite DB lives on host
