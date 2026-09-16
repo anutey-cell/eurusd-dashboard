@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -19,6 +20,7 @@ class HealthDetail(BaseModel):
     fx_provider:              str
     calendar_provider:        str
     broker_execution_enabled: bool
+    market_data:              dict[str, Any]
     timestamp:                datetime
 
 
@@ -33,12 +35,62 @@ def _db_status() -> str:
         return "error"
 
 
+def _market_data_status() -> dict[str, Any]:
+    """Read-only canonical market-data snapshot; never makes provider HTTP calls."""
+    try:
+        from database import SessionLocal
+        from services.market_data_health import market_data_health
+        with SessionLocal() as db:
+            return market_data_health(db, instrument="XAU/USD")
+    except Exception as exc:
+        logger.warning("Market-data health check failed: %s", exc)
+        return {
+            "status": "unknown",
+            "data_quality_score": 0,
+            "stale_timeframes": [],
+            "fresh_timeframes": [],
+            "active_provider": None,
+            "last_bar_time": None,
+            "provider_by_timeframe": {},
+            "last_ingest_error": {"message": str(exc)[:400]},
+            "tradingview_enabled": None,
+            "weekend": False,
+        }
+
+
 @router.get("/health", response_model=HealthDetail, summary="API health check")
 def health_check() -> HealthDetail:
     db = _db_status()
-    logger.info("Health check db=%s mode=%s instrument=XAU/USD", db, settings.data_mode)
+    market = _market_data_status() if db == "connected" else {
+        "status": "unknown",
+        "data_quality_score": 0,
+        "stale_timeframes": [],
+        "fresh_timeframes": [],
+        "active_provider": None,
+        "last_bar_time": None,
+        "provider_by_timeframe": {},
+        "last_ingest_error": {"message": "database unavailable"},
+        "tradingview_enabled": None,
+        "weekend": False,
+    }
+
+    if db != "connected":
+        overall = "error"
+    elif market.get("status") in ("stale", "degraded", "unknown"):
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    logger.info(
+        "Health check db=%s market=%s quality=%s provider=%s mode=%s instrument=XAU/USD",
+        db,
+        market.get("status"),
+        market.get("data_quality_score"),
+        market.get("active_provider"),
+        settings.data_mode,
+    )
     return HealthDetail(
-        status="ok",
+        status=overall,
         version=settings.version,
         instrument="XAU/USD",
         data_mode=settings.data_mode,
@@ -46,6 +98,7 @@ def health_check() -> HealthDetail:
         fx_provider=settings.active_fx_provider,
         calendar_provider=settings.active_calendar_provider,
         broker_execution_enabled=settings.broker_execution_enabled,
+        market_data=market,
         timestamp=datetime.now(timezone.utc),
     )
 
