@@ -1,0 +1,41 @@
+name: Engine C1 Arbiter Patcher
+
+on:
+  push:
+    branches:
+      - 'chatgpt/engine-resolution-c1'
+    paths:
+      - '.github/workflows/engine-c1-patcher.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chatgpt/engine-resolution-c1
+          fetch-depth: 0
+
+      - name: Apply C1 source patches
+        run: python .github/scripts/engine_c1_patch.py
+
+      - name: Validate syntax and focused tests
+        run: |
+          python -m py_compile backend/services/opportunity_arbiter.py
+          python -m py_compile backend/services/background_scheduler.py
+          python -m py_compile backend/services/strategist_runner.py
+          python -m py_compile backend/config.py
+          cd backend
+          pip install -r requirements.txt pytest
+          CME_OPTIONS_CONTEXT_REFRESH_ENABLED=false CME_CHATGPT_SNAPSHOT_ENABLED=false pytest -q tests/test_opportunity_arbiter.py tests/test_actionability_gate.py tests/test_provider_health.py
+
+      - name: Commit C1 wiring
+        run: |
+          git config user.name "ChatGPT Engine Agent"
+          git config user.email "actions@users.noreply.github.com"
+          git add backend/config.py backend/services/background_scheduler.py backend/services/strategist_runner.py
+          git commit -m "feat(intel): keep opportunity arbiter always on"
+          git push origin HEAD:chatgpt/engine-resolution-c1
