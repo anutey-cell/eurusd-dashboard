@@ -32,6 +32,22 @@ services:
     environment:
       - DATABASE_URL=sqlite:////app/storage/eurusd_signals.db
       - DATA_MODE=live
+
+      # ----------------------------------------------------------------------
+      # EXECUTION SAFETY — compose is authoritative over stale .env values.
+      # Signal/research layers may run, but no strategy is permitted to enqueue
+      # or send orders until these are deliberately changed in reviewed code.
+      # ----------------------------------------------------------------------
+      - BROKER_EXECUTION_ENABLED=false
+      - LIVE_TRADING_AUTHORIZED=false
+      - AUTO_EXECUTION_ENABLED=false
+      - MT5_EXECUTION_ENABLED=false
+      - ALLOW_DEMO_TRADING=false
+      - DEMO_AUTO_ENQUEUE=false
+      - PREDATOR_EXECUTION_ENABLED=false
+      - PREDATOR_EXPANSION_ENABLED=false
+      - VP_TRAP_AUTO_EXECUTE=false
+
       # Cloud continuity must work even when the Windows/MT5 bridge is offline.
       # Explicit compose value overrides the provider module's conservative
       # default and permits anonymous OANDA:XAUUSD retrieval via tvDatafeed.
