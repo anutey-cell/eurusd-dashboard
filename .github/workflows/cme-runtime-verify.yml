@@ -11,35 +11,11 @@ permissions:
   contents: read
 
 jobs:
-  github-probe:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Probe CME from GitHub-hosted runner
-        shell: bash
-        run: |
-          set -eu
-          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36'
-          for u in \
-            'https://www.cmegroup.com/market-data/daily-bulletin.html' \
-            'https://www.cmegroup.com/daily_bulletin/current/Section64_Metals_Option_Products.pdf' \
-            'https://www.cmegroup.com/daily_bulletin/current/Section62_Metals_Futures_Products.pdf'
-          do
-            echo "=== $u ==="
-            curl -L --compressed --http1.1 -A "$ua" \
-              -H 'Accept: application/pdf,text/html;q=0.9,*/*;q=0.8' \
-              -H 'Accept-Language: en-US,en;q=0.9' \
-              -H 'Referer: https://www.cmegroup.com/market-data/daily-bulletin.html' \
-              -sS -o /tmp/cme_probe -D /tmp/cme_headers -w 'http=%{http_code} bytes=%{size_download} type=%{content_type}\n' "$u" || true
-            head -c 8 /tmp/cme_probe | od -An -tx1 || true
-            grep -Ei '^(HTTP/|content-type:|content-length:|server:|x-|cf-)' /tmp/cme_headers | tail -20 || true
-          done
-
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Verify CME intelligence on VPS
+      - name: Verify CME HOME relay on VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
@@ -55,40 +31,67 @@ jobs:
             import json, urllib.request
             with urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=10) as r:
                 h = json.load(r)
+            c = h.get('cme_options') or {}
             print(json.dumps({
                 'status': h.get('status'),
                 'broker_execution_enabled': h.get('broker_execution_enabled'),
-                'market_data': h.get('market_data'),
-                'cme_options': h.get('cme_options'),
+                'cme_status': c.get('status'),
+                'bulletin_date': c.get('bulletin_date'),
+                'age_days': c.get('age_days'),
+                'gc_xau_basis': c.get('gc_xau_basis'),
+                'acquisition': c.get('acquisition'),
             }, indent=2, sort_keys=True))
             PY
 
-            echo '=== CME TABLE COUNTS ==='
+            echo '=== RELAY ENDPOINT AUTH ==='
             docker exec -i xauusd-backend python - <<'PY'
             import json
-            from sqlalchemy import text
-            from database import SessionLocal
-            tables = ['cme_bulletin_archive','cme_gc_options_eod','cme_gc_futures_eod','cme_contract_reconciliation','cme_ingestion_runs']
-            out = {}
-            with SessionLocal() as db:
-                for t in tables:
-                    try:
-                        out[t] = db.execute(text(f'SELECT COUNT(*) FROM {t}')).scalar()
-                    except Exception as e:
-                        out[t] = f'ERROR:{type(e).__name__}:{e}'
-            print(json.dumps(out, indent=2, sort_keys=True))
+            import urllib.error
+            import urllib.request
+            from config import settings
+
+            url = 'http://127.0.0.1:8000/api/v1/cme/bulletin-relay'
+            body = json.dumps({
+                'source': 'runtime-verifier',
+                'options_pdf_b64': 'A' * 1200,
+                'futures_pdf_b64': 'A' * 1200,
+            }).encode()
+
+            def post(secret=None):
+                headers = {'Content-Type': 'application/json'}
+                if secret is not None:
+                    headers['X-Bridge-Secret'] = secret
+                req = urllib.request.Request(url, data=body, headers=headers, method='POST')
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        return r.status, r.read().decode()[:300]
+                except urllib.error.HTTPError as e:
+                    return e.code, e.read().decode()[:300]
+
+            missing = post()
+            authenticated = post((settings.mt5_bridge_shared_secret or '').strip())
+            print(json.dumps({
+                'missing_secret_status': missing[0],
+                'authenticated_invalid_pdf_status': authenticated[0],
+            }, sort_keys=True))
+            if missing[0] != 401:
+                raise SystemExit(f'expected 401 without bridge secret, got {missing}')
+            if authenticated[0] != 422:
+                raise SystemExit(f'expected 422 after auth for invalid payload, got {authenticated}')
             PY
 
-            echo '=== CME REFRESH LOGS ==='
-            docker logs --since 15m xauusd-backend 2>&1 | grep -E '\[cme_context\]|\[cme_refresh\]' | tail -80 || true
-
-            echo '=== EXECUTION SAFETY ==='
+            echo '=== CME CLOUD WORKER / EXECUTION SAFETY ==='
             docker exec -i xauusd-backend python - <<'PY'
-            import json
+            import json, os
             from config import settings
-            print(json.dumps({
+            out = {
+                'cme_direct_cloud_refresh_enabled': os.getenv('CME_OPTIONS_CONTEXT_REFRESH_ENABLED'),
                 'broker_execution_enabled': bool(getattr(settings,'broker_execution_enabled',False)),
                 'live_trading_authorized': bool(getattr(settings,'live_trading_authorized',False)),
-                'mt5_execution_enabled': bool(getattr(settings,'mt5_execution_enabled',False)),
-            }, sort_keys=True))
+            }
+            print(json.dumps(out, sort_keys=True))
+            if str(out['cme_direct_cloud_refresh_enabled']).lower() != 'false':
+                raise SystemExit('direct CME cloud worker must be disabled in production')
+            if out['broker_execution_enabled'] or out['live_trading_authorized']:
+                raise SystemExit('execution safety regression')
             PY
