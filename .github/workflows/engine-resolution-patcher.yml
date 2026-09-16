@@ -19,25 +19,18 @@ jobs:
           ref: chatgpt/engine-resolution-c0-c1
           fetch-depth: 0
 
-      - name: Apply C0 source patches
-        run: python .github/scripts/engine_c0_patch.py
+      - name: Apply C0 timestamp follow-up
+        run: python .github/scripts/engine_c0_followup.py
 
       - name: Validate patched Python syntax
         run: |
-          python -m py_compile backend/services/provider_health.py
-          python -m py_compile backend/services/actionability_gate.py
-          python -m py_compile backend/services/candle_ingestion.py
           python -m py_compile backend/services/canonical_market_data.py
-          python -m py_compile backend/services/market_data_health.py
           python -m py_compile backend/services/data_freshness.py
-          python -m py_compile backend/services/signal_grading.py
-          python -m py_compile backend/services/strategist_runner.py
 
       - name: Commit remediation
         run: |
           git config user.name "ChatGPT Engine Agent"
           git config user.email "actions@users.noreply.github.com"
-          git checkout -- .github/workflows/data-continuity-tests.yml
-          git add backend
-          git commit -m "fix(engine): harden canonical data and signal actionability"
+          git add backend/services/canonical_market_data.py backend/services/data_freshness.py
+          git commit -m "fix(data): normalize ISO candle timestamps"
           git push origin HEAD:chatgpt/engine-resolution-c0-c1
