@@ -8,6 +8,14 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from services import candle_ingestion as ci
+from services.provider_health import reset_provider_health
+
+
+@pytest.fixture(autouse=True)
+def _reset_provider_state():
+    reset_provider_health()
+    yield
+    reset_provider_health()
 
 
 def _bar(ts: datetime, source: str = "test") -> dict:

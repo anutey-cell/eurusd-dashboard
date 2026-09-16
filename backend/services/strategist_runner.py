@@ -154,6 +154,27 @@ def run_once(db: Session) -> dict:
     """
     verdict = make_decision(db)
 
+    # Universal core-data gate. Optional context (CME/CFTC/macro/MT5)
+    # never blocks a signal, but stale M5/M15/H1 spot perception does.
+    try:
+        from services.actionability_gate import attach_actionability
+        attach_actionability(verdict, db)
+    except Exception as exc:
+        log.warning("[strategist_runner] actionability gate failed closed: %s", exc)
+        verdict["data_actionability"] = {
+            "actionable": False,
+            "status": "DATA_STALE",
+            "reason": f"gate_error:{type(exc).__name__}",
+            "optional_context_is_gate": False,
+        }
+        if verdict.get("decision") in ("BUY", "SELL"):
+            verdict["execution_status"] = "DATA_STALE"
+            verdict["execution_status_reason"] = "Core market-data gate unavailable"
+            permission = verdict.get("execution_permission") or {}
+            permission["allow_alert"] = False
+            permission["allow_execute"] = False
+            verdict["execution_permission"] = permission
+
     # Pre-compute signal grade so downstream side-effects (enqueue + alert)
     # both see the same grade. Enqueue uses it for sizing; alert uses it for
     # gating/formatting. Only applies to BUY/SELL decisions.

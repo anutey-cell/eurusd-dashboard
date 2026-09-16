@@ -338,14 +338,15 @@ def maybe_alert(db, client=None) -> Optional[dict]:
 
     lines.append("")
     lines.append("Action:")
+    lines.append("  - Cloud XAU/USD continuity is primary: check provider_health and last_ingest_error.")
+    lines.append("  - TradingView OANDA:XAUUSD is the independent spot fallback when Twelve Data is unavailable.")
     if "mt5" in provider_by_tf.values():
-        lines.append("  - MT5 daemon push is active. If persistently stale, check laptop daemon logs")
-        lines.append("    and MT5 terminal (open a chart for the stale TF to force server subscription).")
+        lines.append("  - HOME MT5 is online and adds broker bars/ticks; it is not required for signal continuity.")
     else:
-        lines.append("  - MT5 daemon not pushing. Restart mt5_bridge_daemon.py on laptop.")
-    lines.append("  - Yahoo GC=F backup engages when TV empties.")
-    lines.append("  - Transient drop (recovers in 1-2 cycles): no action needed.")
-    lines.append("Engine will refuse to trade on stale data until it clears.")
+        lines.append("  - HOME MT5 is offline/absent; cloud signal generation should continue if spot data is fresh.")
+    lines.append("  - Yahoo GC=F is futures context only and never satisfies XAU/USD spot freshness.")
+    lines.append("  - Transient provider drops normally recover through the fallback chain.")
+    lines.append("Actionable signals fail closed only when core XAU/USD M5/M15/H1 data is stale.")
     text = "\n".join(lines)
 
     sent = _send_operator_alert(text)

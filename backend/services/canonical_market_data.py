@@ -143,7 +143,7 @@ class CanonicalSnapshot:
     ask:                 Optional[float] = None
     spread:              Optional[float] = None
     last_tick_at:        Optional[datetime] = None
-    tick_source:         str = "unknown"      # mt5 | twelvedata-derived | none
+    tick_source:         str = "unknown"      # mt5 | <db-provider>-close-proxy | none
     tick_latency_ms:     Optional[float] = None
 
     timeframes:          dict[str, TimeframeSlice] = field(default_factory=dict)
@@ -241,7 +241,23 @@ def _fetch_bars(db: Session, instrument: str, tf: str, lookback: int) -> list[Ba
     return bars
 
 
-def _live_tick(instrument: str, m5_bars: Sequence[Bar]) -> tuple[Optional[float], Optional[float], Optional[float], Optional[datetime], str, Optional[float]]:
+def _latest_bar_source(db: Session, instrument: str, tf: str) -> str:
+    """Return the provider that supplied the newest persisted candle."""
+    try:
+        row = db.execute(text(
+            "SELECT source FROM historical_candles "
+            "WHERE instrument=:i AND timeframe=:t "
+            "ORDER BY candle_time DESC LIMIT 1"
+        ), {"i": instrument, "t": tf}).fetchone()
+        if row and row[0]:
+            return str(row[0]).strip().lower()
+    except Exception:
+        pass
+    return "historical-candles"
+
+
+def _live_tick(instrument: str, m5_bars: Sequence[Bar],
+               m5_source: str = "historical-candles") -> tuple[Optional[float], Optional[float], Optional[float], Optional[datetime], str, Optional[float]]:
     """
     Best-effort live bid/ask/spread. Returns (bid, ask, spread, ts, source, latency_ms).
 
@@ -274,7 +290,7 @@ def _live_tick(instrument: str, m5_bars: Sequence[Bar]) -> tuple[Optional[float]
         return (last.close - half_spread,
                 last.close + half_spread,
                 2 * half_spread,
-                last.time, "twelvedata-derived", 0.0)
+                last.time, f"{m5_source}-close-proxy", 0.0)
 
     return (None, None, None, None, "none", None)
 
@@ -419,11 +435,13 @@ class CanonicalMarketData:
                 latest_closed=latest_closed,
                 age_min=age_min, threshold_min=threshold,
                 status=status,
+                source=_latest_bar_source(db, instrument, tf),
             )
 
         # 2) Live tick
         m5_bars = tf_slices.get("M5", TimeframeSlice("M5")).candles
-        bid, ask, spread, tick_ts, tick_src, tick_lat = _live_tick(instrument, m5_bars)
+        m5_source = tf_slices.get("M5", TimeframeSlice("M5")).source
+        bid, ask, spread, tick_ts, tick_src, tick_lat = _live_tick(instrument, m5_bars, m5_source)
         if tick_src == "none":
             warnings.append("no live tick source available")
 

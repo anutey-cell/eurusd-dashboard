@@ -89,6 +89,14 @@ def grade_verdict(verdict: dict, *,
     """
     _attach_cme_context(verdict)
 
+    data_gate = verdict.get("data_actionability")
+    if isinstance(data_gate, dict) and not data_gate.get("actionable", True):
+        return GradeResult(
+            GRADE_ASIDE,
+            f"core market data not actionable: {data_gate.get('reason', 'unknown')}",
+            False, False, True,
+        )
+
     decision = verdict.get("decision")
     if decision not in ("BUY", "SELL"):
         return GradeResult(GRADE_ASIDE,

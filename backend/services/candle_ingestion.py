@@ -153,64 +153,80 @@ def _payload_fresh(candles: list, interval: str,
 
 def _fetch_with_fallback(pair: str, interval: str,
                           lookback: int) -> tuple[list, str]:
-    """Fetch a FRESH spot payload using the production cloud fallback chain.
+    """Fetch a fresh spot payload using a health-aware fallback chain.
 
-    MT5 bars are pushed separately by the Windows bridge; they are not pulled
-    here. If MT5 is offline, the VPS tries:
-
-      1. Twelve Data XAU/USD
-      2. TradingView OANDA:XAUUSD (with bounded retries)
-
-    Raw Yahoo GC=F is intentionally excluded from this XAU/USD spot history
-    path. A futures proxy may be used by research/context layers, but it must
-    never silently become the price series used for spot entries, stops and
-    targets.
-
-    Raises RuntimeError only when no fresh spot provider is available so the
-    freshness sentinel receives an actionable root-cause string.
+    MT5 bars are pushed independently by the Windows bridge. The VPS cloud
+    path uses Twelve Data then TradingView OANDA:XAUUSD. Provider health
+    circuits prevent a known-broken credential/quota from being retried on
+    every timeframe/cycle. Yahoo GC=F is never a spot fallback.
     """
     from services.tradingview_provider import invalidate_cache as _tv_invalidate
+    from services.provider_health import should_attempt, note_success, note_failure
 
     failures: list[str] = []
 
-    # 1. Twelve Data — configured production cloud spot source.
-    try:
-        candles = _fetch_twelvedata(pair, interval, lookback)
-        ok, detail = _payload_fresh(candles, interval)
-        if ok:
-            return candles, "twelvedata"
-        failures.append(f"TwelveData rejected: {detail}")
-        log.warning("[candle_ingestion] %s %s TwelveData rejected: %s",
-                    pair, interval, detail)
-    except Exception as exc:
-        failures.append(f"TwelveData {type(exc).__name__}: {exc}")
-        log.warning("[candle_ingestion] %s %s TwelveData failed: %s: %s",
-                    pair, interval, type(exc).__name__, exc)
-
-    # 2. TradingView OANDA:XAUUSD — independent spot fallback.
-    for attempt, backoff in enumerate([0.0] + _TV_RETRY_BACKOFFS_S, start=1):
-        if backoff > 0:
-            time.sleep(backoff)
-            _tv_invalidate(pair)
+    td_attempt, td_reason = should_attempt("twelvedata", interval)
+    if td_attempt:
         try:
-            candles = _fetch_tradingview(pair, interval, lookback)
+            candles = _fetch_twelvedata(pair, interval, lookback)
             ok, detail = _payload_fresh(candles, interval)
             if ok:
-                if attempt > 1 or failures:
-                    log.info("[candle_ingestion] %s %s using TradingView fallback "
-                             "after TwelveData/unhealthy source", pair, interval)
-                return candles, "tradingview"
-            failures.append(f"TradingView attempt {attempt} rejected: {detail}")
-            log.warning("[candle_ingestion] %s %s TradingView attempt %d rejected: %s",
-                        pair, interval, attempt, detail)
+                note_success("twelvedata", interval)
+                return candles, "twelvedata"
+            failures.append(f"TwelveData rejected: {detail}")
+            note_failure("twelvedata", interval, detail, category="stale_payload")
+            log.warning("[candle_ingestion] %s %s TwelveData rejected: %s",
+                        pair, interval, detail)
         except Exception as exc:
-            failures.append(
-                f"TradingView attempt {attempt} {type(exc).__name__}: {exc}"
+            category = note_failure("twelvedata", interval, exc)
+            failures.append(f"TwelveData {type(exc).__name__}: {exc}")
+            log.warning(
+                "[candle_ingestion] %s %s TwelveData failed (%s): %s: %s",
+                pair, interval, category, type(exc).__name__, exc,
             )
-            log.warning("[candle_ingestion] %s %s TradingView attempt %d failed: %s: %s",
-                        pair, interval, attempt, type(exc).__name__, exc)
+    else:
+        failures.append(f"TwelveData skipped: {td_reason}")
+        log.info("[candle_ingestion] %s %s TwelveData skipped: %s",
+                 pair, interval, td_reason)
 
-    summary = " | ".join(failures[-6:])
+    tv_attempt, tv_reason = should_attempt("tradingview", interval)
+    if tv_attempt:
+        for attempt, backoff in enumerate([0.0] + _TV_RETRY_BACKOFFS_S, start=1):
+            if backoff > 0:
+                time.sleep(backoff)
+                _tv_invalidate(pair)
+            try:
+                candles = _fetch_tradingview(pair, interval, lookback)
+                ok, detail = _payload_fresh(candles, interval)
+                if ok:
+                    note_success("tradingview", interval)
+                    if attempt > 1 or failures:
+                        log.info(
+                            "[candle_ingestion] %s %s using TradingView fallback "
+                            "after primary/unhealthy source", pair, interval,
+                        )
+                    return candles, "tradingview"
+                failures.append(f"TradingView attempt {attempt} rejected: {detail}")
+                note_failure("tradingview", interval, detail, category="stale_payload")
+                log.warning(
+                    "[candle_ingestion] %s %s TradingView attempt %d rejected: %s",
+                    pair, interval, attempt, detail,
+                )
+            except Exception as exc:
+                category = note_failure("tradingview", interval, exc)
+                failures.append(
+                    f"TradingView attempt {attempt} {type(exc).__name__}: {exc}"
+                )
+                log.warning(
+                    "[candle_ingestion] %s %s TradingView attempt %d failed (%s): %s: %s",
+                    pair, interval, attempt, category, type(exc).__name__, exc,
+                )
+    else:
+        failures.append(f"TradingView skipped: {tv_reason}")
+        log.warning("[candle_ingestion] %s %s TradingView skipped: %s",
+                    pair, interval, tv_reason)
+
+    summary = " | ".join(failures[-8:])
     raise RuntimeError(
         f"No fresh XAU/USD spot provider for {pair} {interval}. {summary}"
     )

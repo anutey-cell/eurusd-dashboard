@@ -89,6 +89,8 @@ def market_data_health(db, instrument: str = "XAU/USD") -> dict[str, Any]:
     except Exception:
         tradingview_enabled = False
 
+    from services.provider_health import provider_health_snapshot
+
     return {
         "status": state,
         "data_quality_score": freshness.get("data_quality_score", 0),
@@ -98,6 +100,7 @@ def market_data_health(db, instrument: str = "XAU/USD") -> dict[str, Any]:
         "last_bar_time": last_bar_time,
         "provider_by_timeframe": provider_by_timeframe,
         "last_ingest_error": get_last_ingest_error(),
+        "provider_health": provider_health_snapshot(),
         "tradingview_enabled": tradingview_enabled,
         "weekend": bool(freshness.get("weekend")),
     }
