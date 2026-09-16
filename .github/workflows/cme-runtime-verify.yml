@@ -31,14 +31,14 @@ jobs:
             import json
             from sqlalchemy import text
             from database import SessionLocal
-            from services.market_data_health import get_market_data_health
+            from services.market_data_health import market_data_health
             from services.actionability_gate import evaluate_db_actionability
             from services.canonical_market_data import get_canonical
             with SessionLocal() as db:
-                health = get_market_data_health(db)
+                health = market_data_health(db)
                 gate = evaluate_db_actionability(db)
                 snap = get_canonical(cache_ttl_s=0).snapshot(db, force_refresh=True)
-                rows = db.execute(text("SELECT timeframe, candle_time, open, high, low, close, source FROM historical_candles WHERE instrument='XAU/USD' AND timeframe IN ('M5','M15','H1') ORDER BY candle_time DESC LIMIT 12")).fetchall()
+                rows = db.execute(text("SELECT timeframe, candle_time, open, high, low, close, source FROM historical_candles WHERE instrument='XAU/USD' AND timeframe IN ('M5','M15','H1') ORDER BY candle_time DESC LIMIT 18")).fetchall()
                 out = {
                     'health': health,
                     'gate': gate,
@@ -64,7 +64,8 @@ jobs:
                 'generated_at': a.get('generated_at'), 'directional_assessment': a.get('directional_assessment'),
                 'opportunity_status': a.get('opportunity_status'), 'entry_status': a.get('entry_status'),
                 'opportunity_state': a.get('opportunity_state'), 'confidence': a.get('confidence'),
-                'structure': a.get('structure'), 'htf': a.get('htf'), 'regime': a.get('regime'),
+                'structure': a.get('structure'), 'active_breakouts': a.get('active_breakouts'),
+                'htf': a.get('htf'), 'regime': a.get('regime'),
                 'evidence': a.get('evidence'), 'data': a.get('data'), 'macro': a.get('macro'),
                 'cme': a.get('cme'), 'policy': a.get('policy'),
             }
@@ -90,4 +91,4 @@ jobs:
             PY
 
             echo '=== RECENT SIGNAL / TELEGRAM LOGS ==='
-            docker logs --since 30m xauusd-backend 2>&1 | grep -Eai 'arbiter|market.intel|strategist|telegram|predator|momentum|vp.trap|kz.magnet|stand.aside|signal.only|BUY|SELL|breakout|liquidity|suppress|threshold|grade' | tail -n 260 || true
+            docker logs --since 45m xauusd-backend 2>&1 | grep -Eai 'arbiter|market.intel|strategist|telegram|predator|momentum|vp.trap|kz.magnet|stand.aside|signal.only|BUY|SELL|breakout|liquidity|suppress|threshold|grade|opportunity' | tail -n 320 || true
