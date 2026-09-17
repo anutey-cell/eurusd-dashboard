@@ -2,20 +2,22 @@
 XAU/USD candle data layer.
 
 In demo mode (DATA_MODE=demo), delegates to the seeded mock generator below.
-In live mode (DATA_MODE=live), delegates to candle_provider which routes to
-the configured FX_DATA_PROVIDER (twelvedata | alpha_vantage | oanda | polygon | fmp).
+In live mode (DATA_MODE=live), fresh MT5 bridge candles persisted in
+historical_candles are the PRIMARY source for the timeframes pushed by the VPS
+(M5, M15, H1, H4, D1). TradingView is fallback-only when the MT5 bridge data is
+missing or stale. M30/W1 still use external-provider fallback because the bridge
+does not push those timeframes.
 
 Only XAU/USD (xauusd) is supported. Requests for any other instrument raise ValueError.
 
 LIVE MODE PROVIDER FAILOVER
 ---------------------------
-When DATA_MODE=live we ALWAYS prefer a real provider price. If TradingView and
-MT5 both fail momentarily, we serve the last known live response from an
-in-memory cache (tagged source="tradingview-cached" or "mt5-cached") rather
-than silently falling back to synthetic ~$3285 prices, which would mislead
-the dashboard. Only when no live response has ever been cached do we fall
-through to synthetic, and that response is explicitly tagged source="synthetic"
-so the frontend can refuse to display it.
+When DATA_MODE=live we prefer fresh broker-native MT5 candles first. If MT5 is
+missing/stale we try TradingView, then serve the last known live response from
+an in-memory cache rather than silently falling back to synthetic ~$3285 prices.
+Only when no live response has ever been cached do we fall through to synthetic,
+and that response is explicitly tagged source="synthetic" so the frontend can
+refuse to display it.
 """
 import logging
 from config import settings   # P133: hoisted from get_candles() — was scoped-only, breaking briefing crash paths
@@ -28,7 +30,7 @@ from models.candle import Candle, CandleResponse
 logger = logging.getLogger(__name__)
 
 # In-memory cache of the last successful LIVE response, keyed by interval.
-# Survives transient TradingView outages so the dashboard never sees synthetic.
+# Survives transient provider outages so the dashboard never sees synthetic.
 _LIVE_CACHE: dict[str, tuple[float, CandleResponse]] = {}
 # Cap how stale a cached response can be before we admit defeat (12h).
 _LIVE_CACHE_MAX_AGE_SEC = 12 * 60 * 60
@@ -42,6 +44,20 @@ INTERVAL_MINUTES: dict[str, int] = {
     "H4":  240,
     "D1":  1440,
     "W1":  10080,
+}
+
+# VPS bridge currently pushes these five timeframes only.
+_MT5_BRIDGE_TIMEFRAMES = {"M5", "M15", "H1", "H4", "D1"}
+
+# Freshness guard for CLOSED candles persisted by the bridge. These limits are
+# deliberately wider than one bar because the EA sends only completed bars and
+# network/restart jitter must not cause unnecessary source flapping.
+_MT5_MAX_AGE_MIN = {
+    "M5":  15,
+    "M15": 30,
+    "H1":  120,
+    "H4":  480,
+    "D1":  2880,
 }
 
 # XAU/USD base price for mock data — realistic gold price range
@@ -146,6 +162,78 @@ def _generate_xauusd_candles(interval: str, limit: int) -> list[Candle]:
     return candles
 
 
+def _get_mt5_bridge_candles(interval: str, limit: int) -> CandleResponse:
+    """Return fresh broker-native candles persisted by /bridge/candles/receive.
+
+    Raises when the requested timeframe is not pushed by the bridge, there are
+    no MT5 rows, or the latest CLOSED bar is beyond the freshness allowance.
+    The caller then falls back to TradingView.
+    """
+    if interval not in _MT5_BRIDGE_TIMEFRAMES:
+        raise ValueError(f"MT5 bridge does not supply {interval}")
+
+    from database import SessionLocal
+    from db_models import HistoricalCandle
+
+    with SessionLocal() as db:
+        rows = (
+            db.query(HistoricalCandle)
+            .filter(
+                HistoricalCandle.instrument == "XAU/USD",
+                HistoricalCandle.timeframe == interval,
+                HistoricalCandle.source == "mt5",
+            )
+            .order_by(HistoricalCandle.candle_time.desc())
+            .limit(limit)
+            .all()
+        )
+
+    if not rows:
+        raise RuntimeError(f"No MT5 bridge candles available for {interval}")
+
+    latest_ts = rows[0].candle_time
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+    else:
+        latest_ts = latest_ts.astimezone(timezone.utc)
+
+    age_min = (datetime.now(timezone.utc) - latest_ts).total_seconds() / 60.0
+    max_age = _MT5_MAX_AGE_MIN[interval]
+    if age_min < -5:
+        raise RuntimeError(
+            f"MT5 {interval} latest candle is future-dated by {-age_min:.1f} min"
+        )
+    if age_min > max_age:
+        raise RuntimeError(
+            f"MT5 {interval} candles stale: age={age_min:.1f}m > {max_age}m"
+        )
+
+    rows = list(reversed(rows))
+    candles = [
+        Candle(
+            time=(
+                r.candle_time.replace(tzinfo=timezone.utc)
+                if r.candle_time.tzinfo is None
+                else r.candle_time.astimezone(timezone.utc)
+            ),
+            open=float(r.open),
+            high=float(r.high),
+            low=float(r.low),
+            close=float(r.close),
+            volume=int(r.volume or 0),
+        )
+        for r in rows
+    ]
+
+    return CandleResponse(
+        symbol="XAU/USD",
+        interval=interval,
+        count=len(candles),
+        candles=candles,
+        source="mt5",
+    )
+
+
 def get_candles(interval: str = "H4", limit: int = 200, pair: str = "xauusd") -> CandleResponse:
     """
     Fetch XAU/USD OHLCV candles.
@@ -182,9 +270,18 @@ def get_candles(interval: str = "H4", limit: int = 200, pair: str = "xauusd") ->
         getattr(settings, "allow_synthetic_candles_in_live", False)
     )
 
-    # Live mode: try TradingView → MT5 → cached live → only then synthetic
+    # Live mode: fresh MT5 bridge DB → TradingView → cached live → synthetic.
     if settings.data_mode == "live":
-        # Try TradingView first (real OHLCV)
+        # Primary source: the broker-native candles pushed from the VPS and
+        # persisted by /api/v1/bridge/candles/receive.
+        try:
+            resp = _get_mt5_bridge_candles(interval, limit)
+            _LIVE_CACHE[interval] = (time.time(), resp)
+            return resp
+        except Exception as exc:
+            logger.warning("MT5 bridge candles unavailable for %s: %s; falling back", interval, exc)
+
+        # Fallback source: TradingView real OHLCV.
         try:
             from services.tradingview_provider import get_tv_candles
             tv_bars = get_tv_candles("xauusd", timeframe=interval, limit=limit)
@@ -208,18 +305,6 @@ def get_candles(interval: str = "H4", limit: int = 200, pair: str = "xauusd") ->
         except Exception as exc:
             logger.debug("TradingView fetch failed for %s: %s", interval, exc)
 
-        # Try MT5 candle bridge
-        try:
-            from services.candle_provider import get_eurusd_candles
-            resp = get_eurusd_candles(timeframe=interval, lookback=limit, pair="XAU/USD")
-            # Tag source if the provider didn't (older shape)
-            if not getattr(resp, "source", None) or resp.source == "synthetic":
-                resp.source = "mt5"
-            _LIVE_CACHE[interval] = (time.time(), resp)
-            return resp
-        except Exception as exc:
-            logger.debug("MT5 fetch failed for %s: %s", interval, exc)
-
         # Live providers all failed — serve cached live response if fresh enough.
         # This prevents the dashboard from ever flashing $3285 synthetic gold.
         cached = _LIVE_CACHE.get(interval)
@@ -233,13 +318,9 @@ def get_candles(interval: str = "H4", limit: int = 200, pair: str = "xauusd") ->
                 )
                 # Compute the "-cached" suffix WITHOUT mutating the stored
                 # object — otherwise repeated cache-hits append "-cached" over
-                # and over: tradingview → tradingview-cached → -cached-cached
-                # (seen in prod 2026-05-22 — scanner refused the bizarre tags).
-                base = cached_resp.source.replace("-cached", "") or "tradingview"
+                # and over: tradingview → tradingview-cached → -cached-cached.
+                base = cached_resp.source.replace("-cached", "") or "mt5"
                 new_source = f"{base}-cached"
-                # Return a shallow copy with the corrected tag. The cached
-                # entry stays untouched, so the NEXT cache hit also says
-                # "tradingview-cached" (not "tradingview-cached-cached").
                 return CandleResponse(
                     symbol=cached_resp.symbol,
                     interval=cached_resp.interval,
