@@ -1498,7 +1498,7 @@ def _recommended_action(market_state, signal, engine_result, cfg, h4_liq) -> dic
             "targetPoints": engine_result.target_pips,
             "rr":           engine_result.rr,
             "qualityScore": engine_result.quality_score,
-            "session":      engine_result.model.get("session", ""),
+            "session":      (engine_result.model.get("session", "") if isinstance(engine_result.model, dict) else getattr(engine_result.model, "session", "") if engine_result.model is not None else ""),
             "validityMinutes": 30,
             "confirmEndpoint":  "POST /api/v1/signal/confirm",
         },
