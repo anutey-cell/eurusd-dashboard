@@ -491,7 +491,7 @@ def engine_state(
             "engine":         "swing_ict",
             "status":         scan.get("marketState"),
             "signal":         scan.get("signal"),
-            "qualityScore":   (scan.get("recommendedAction") or {}).get("tradePlan", {}).get("qualityScore", 0),
+            "qualityScore":   ((scan.get("recommendedAction") or {}).get("tradePlan") or {}).get("qualityScore", 0),
             "summary":        (scan.get("summary") or "")[:200],
             "blockers":       scan.get("blockers", [])[:5],
             "passing":        scan.get("marketState") == "SIGNAL_READY",
