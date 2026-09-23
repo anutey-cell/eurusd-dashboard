@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Diagnose CME snapshot cache
+      - name: Refresh and verify live CME context
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
@@ -24,15 +24,28 @@ jobs:
           script: |
             set -eu
             docker exec -i xauusd-backend python - <<'PY'
-            import json, os, time, requests
-            url = os.getenv('CME_CHATGPT_SNAPSHOT_URL','')
-            print('URL', url)
-            for label, u in [('plain', url), ('cachebust', url + ('&' if '?' in url else '?') + 't=' + str(int(time.time())) )]:
-                r = requests.get(u, timeout=10, headers={'User-Agent':'xauusd-cme-snapshot/diag','Accept':'application/json','Cache-Control':'no-cache'})
-                print(label, r.status_code, r.headers.get('age'), r.headers.get('cache-control'))
-                try:
-                    p = r.json()
-                    print(label, p.get('bulletin_date'), p.get('bulletin_status'), p.get('bulletin_number'), len(p.get('options') or []))
-                except Exception as e:
-                    print(label, 'json_error', type(e).__name__, str(e))
+            import json
+            from database import SessionLocal
+            from services.cme_options_context import refresh_chatgpt_snapshot, get_chatgpt_snapshot_status, get_cme_options_context
+            refresh_chatgpt_snapshot()
+            print('SNAPSHOT_STATUS')
+            print(json.dumps(get_chatgpt_snapshot_status(), indent=2, default=str, sort_keys=True))
+            with SessionLocal() as db:
+                ctx = get_cme_options_context(db)
+                keep = {
+                    'status': ctx.get('status'),
+                    'source': ctx.get('source'),
+                    'bulletin_date': ctx.get('bulletin_date'),
+                    'bulletin_status': ctx.get('bulletin_status'),
+                    'age_days': ctx.get('age_days'),
+                    'basis': ctx.get('basis'),
+                    'gc_price': ctx.get('gc_price'),
+                    'xau_price': ctx.get('xau_price'),
+                    'zones': ctx.get('zones'),
+                    'directional_bias': ctx.get('directional_bias'),
+                    'gamma_status': ctx.get('gamma_status'),
+                    'reason': ctx.get('reason'),
+                }
+                print('CME_CONTEXT')
+                print(json.dumps(keep, indent=2, default=str, sort_keys=True))
             PY
