@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect live XAUUSD engine state
+      - name: Verify live CME snapshot pickup
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
@@ -23,74 +23,28 @@ jobs:
           key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
           script: |
             set -eu
-            echo '=== CONTAINER ==='
-            docker inspect --format='image={{.Config.Image}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} started={{.State.StartedAt}}' xauusd-backend
-
-            echo '=== MARKET + PRICE ==='
             docker exec -i xauusd-backend python - <<'PY'
             import json
-            from sqlalchemy import text
             from database import SessionLocal
-            from services.market_data_health import market_data_health
-            from services.actionability_gate import evaluate_db_actionability
-            from services.canonical_market_data import get_canonical
+            from services.cme_options_context import refresh_chatgpt_snapshot, get_chatgpt_snapshot_status, get_cme_options_context
+            refresh_chatgpt_snapshot()
+            print('SNAPSHOT_STATUS')
+            print(json.dumps(get_chatgpt_snapshot_status(), indent=2, default=str, sort_keys=True))
             with SessionLocal() as db:
-                health = market_data_health(db)
-                gate = evaluate_db_actionability(db)
-                snap = get_canonical(cache_ttl_s=0).snapshot(db, force_refresh=True)
-                rows = db.execute(text("SELECT timeframe, candle_time, open, high, low, close, source FROM historical_candles WHERE instrument='XAU/USD' AND timeframe IN ('M5','M15','H1') ORDER BY candle_time DESC LIMIT 18")).fetchall()
-                out = {
-                    'health': health,
-                    'gate': gate,
-                    'canonical': {
-                        'ts': snap.ts, 'bid': snap.bid, 'ask': snap.ask,
-                        'spread': snap.spread, 'last_tick_at': snap.last_tick_at,
-                        'tick_source': snap.tick_source,
-                        'data_quality_score': snap.data_quality_score,
-                        'session': snap.session.to_dict(), 'levels': snap.levels.to_dict(),
-                        'tf_sources': {tf: sl.source for tf, sl in snap.timeframes.items()},
-                        'tf_status': {tf: sl.status for tf, sl in snap.timeframes.items()},
-                    },
-                    'recent_bars': [dict(r._mapping) for r in rows],
+                ctx = get_cme_options_context(db)
+                keep = {
+                    'status': ctx.get('status'),
+                    'source': ctx.get('source'),
+                    'bulletin_date': ctx.get('bulletin_date'),
+                    'bulletin_status': ctx.get('bulletin_status'),
+                    'age_days': ctx.get('age_days'),
+                    'basis': ctx.get('basis'),
+                    'gc_price': ctx.get('gc_price'),
+                    'xau_price': ctx.get('xau_price'),
+                    'zones': ctx.get('zones'),
+                    'directional_bias': ctx.get('directional_bias'),
+                    'gamma_status': ctx.get('gamma_status'),
                 }
-                print(json.dumps(out, indent=2, default=str, sort_keys=True))
+                print('CME_CONTEXT')
+                print(json.dumps(keep, indent=2, default=str, sort_keys=True))
             PY
-
-            echo '=== ARBITER ==='
-            docker exec -i xauusd-backend python - <<'PY'
-            import json
-            from services.opportunity_arbiter import get_latest_arbiter_context
-            a = get_latest_arbiter_context(max_age_s=600)
-            keep = {
-                'status': a.get('status'), 'stale': a.get('stale'), 'age_s': a.get('age_s'),
-                'generated_at': a.get('generated_at'), 'directional_assessment': a.get('directional_assessment'),
-                'opportunity_status': a.get('opportunity_status'), 'entry_status': a.get('entry_status'),
-                'opportunity_state': a.get('opportunity_state'), 'confidence': a.get('confidence'),
-                'structure': a.get('structure'), 'active_breakouts': a.get('active_breakouts'),
-                'htf': a.get('htf'), 'regime': a.get('regime'),
-                'evidence': a.get('evidence'), 'data': a.get('data'), 'macro': a.get('macro'),
-                'cme': a.get('cme'), 'policy': a.get('policy'),
-            }
-            print(json.dumps(keep, indent=2, default=str, sort_keys=True))
-            PY
-
-            echo '=== TELEGRAM + STRATEGY FLAGS ==='
-            docker exec -i xauusd-backend python - <<'PY'
-            import json
-            from config import settings
-            names = [
-                'telegram_alerts_enabled','telegram_enabled','telegram_signal_alerts','telegram_confirm_alerts',
-                'telegram_trade_alerts','telegram_standby_alerts','telegram_watchlist_alerts',
-                'telegram_market_intelligence_enabled','market_intelligence_telegram_enabled',
-                'notification_canonical_enabled','predator_notification_architecture','predator_notification_mode',
-                'vp_trap_enabled','vp_trap_telegram_alerts','kz_magnet_enabled','kz_magnet_telegram_alerts',
-                'monday_observation_mode','use_mandate_strategist',
-                'broker_execution_enabled','live_trading_authorized','auto_execution_enabled','mt5_execution_enabled',
-                'allow_demo_trading','demo_auto_enqueue','predator_execution_enabled','predator_expansion_enabled','vp_trap_auto_execute'
-            ]
-            out = {n:getattr(settings,n,None) for n in names}
-            print(json.dumps(out, indent=2, sort_keys=True))
-            PY
-
-            echo '=== RECENT SIGNAL / TELEGRAM LOGS ==='
-            docker logs --since 45m xauusd-backend 2>&1 | grep -Eai 'arbiter|market.intel|strategist|telegram|predator|momentum|vp.trap|kz.magnet|stand.aside|signal.only|BUY|SELL|breakout|liquidity|suppress|threshold|grade|opportunity' | tail -n 320 || true
