@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Refresh and verify live CME context
+      - name: Verify live CME zones
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DO_HOST }}
@@ -26,26 +26,14 @@ jobs:
             docker exec -i xauusd-backend python - <<'PY'
             import json
             from database import SessionLocal
-            from services.cme_options_context import refresh_chatgpt_snapshot, get_chatgpt_snapshot_status, get_cme_options_context
+            from services.cme_options_context import refresh_chatgpt_snapshot, get_cme_options_context
             refresh_chatgpt_snapshot()
-            print('SNAPSHOT_STATUS')
-            print(json.dumps(get_chatgpt_snapshot_status(), indent=2, default=str, sort_keys=True))
             with SessionLocal() as db:
                 ctx = get_cme_options_context(db)
-                keep = {
-                    'status': ctx.get('status'),
-                    'source': ctx.get('source'),
-                    'bulletin_date': ctx.get('bulletin_date'),
-                    'bulletin_status': ctx.get('bulletin_status'),
-                    'age_days': ctx.get('age_days'),
-                    'basis': ctx.get('basis'),
-                    'gc_price': ctx.get('gc_price'),
-                    'xau_price': ctx.get('xau_price'),
-                    'zones': ctx.get('zones'),
-                    'directional_bias': ctx.get('directional_bias'),
-                    'gamma_status': ctx.get('gamma_status'),
-                    'reason': ctx.get('reason'),
-                }
-                print('CME_CONTEXT')
+                keep = {k:ctx.get(k) for k in (
+                    'status','source','bulletin_date','bulletin_status','age_days',
+                    'gc_price','xau_price','gc_xau_basis','basis_status','directional_bias',
+                    'gamma_status','zone_count','strongest_zones','nearest_zones','largest_oi_changes'
+                )}
                 print(json.dumps(keep, indent=2, default=str, sort_keys=True))
             PY
