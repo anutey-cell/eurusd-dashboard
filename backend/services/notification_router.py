@@ -74,6 +74,18 @@ _DEFAULT_THRESHOLDS = {
     "end_of_session":   0,      # always send — recap is scheduled
 }
 
+# Signal-formation messages require fresh M5/M15/H1 market perception.
+# Post-entry lifecycle / risk messages are deliberately excluded: once a trade
+# exists, TP/stop/breakeven/trailing notifications remain safety-relevant even
+# if the candle feed is temporarily degraded.
+_DATA_FRESHNESS_GATED_TYPES = {
+    "monitoring",
+    "actionable",
+    "entry_triggered",
+    "invalidated",
+    "high_confluence",
+}
+
 # Quiet hours (EAT local — the operator's timezone) during which non-critical
 # alerts are suppressed. Stop-hits still fire.
 _QUIET_START_EAT = 0    # 00:00 EAT
@@ -121,6 +133,26 @@ def _resolve_muted(strategy_id: str, settings) -> Optional[str]:
     if not getattr(settings, "notification_canonical_enabled", True):
         return "canonical_layer_disabled"
     return None
+
+
+def _freshness_suppression(db: Session, msg_type: str) -> Optional[str]:
+    """Return a suppression reason when a setup message lacks fresh core data.
+
+    Fail closed if the gate itself cannot be evaluated. This is intentionally
+    scoped to signal-formation transitions; lifecycle/risk notifications are
+    not blocked by market-data freshness.
+    """
+    if msg_type not in _DATA_FRESHNESS_GATED_TYPES:
+        return None
+    try:
+        from services.actionability_gate import evaluate_db_actionability
+        gate = evaluate_db_actionability(db)
+    except Exception as exc:
+        log.warning("[router] market-data freshness gate failed closed: %s", exc)
+        return f"data_freshness_gate_error:{type(exc).__name__}"
+    if gate.get("actionable") is True:
+        return None
+    return "data_stale:" + str(gate.get("reason") or "core_data_not_actionable")
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -172,9 +204,13 @@ def route(
     elif msg_type not in _ALWAYS_ON_TYPES and _in_quiet_hours(now):
         suppression = "quiet_hours_eat"
     else:
-        threshold = _resolve_threshold(msg_type, settings)
-        if signal.confidence < threshold:
-            suppression = f"below_threshold:{msg_type}<{threshold}"
+        freshness = _freshness_suppression(db, msg_type)
+        if freshness:
+            suppression = freshness
+        else:
+            threshold = _resolve_threshold(msg_type, settings)
+            if signal.confidence < threshold:
+                suppression = f"below_threshold:{msg_type}<{threshold}"
 
     # Shadow mode is an overlay on top of everything else — an explicit
     # "audit-only" pass. The client persists the row with suppressed reason.
