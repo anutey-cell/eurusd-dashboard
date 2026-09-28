@@ -74,15 +74,12 @@ _DEFAULT_THRESHOLDS = {
     "end_of_session":   0,      # always send — recap is scheduled
 }
 
-# Signal-formation messages require fresh M5/M15/H1 market perception.
-# Post-entry lifecycle / risk messages are deliberately excluded: once a trade
-# exists, TP/stop/breakeven/trailing notifications remain safety-relevant even
-# if the candle feed is temporarily degraded.
+# Only actionable/new-entry signal notifications fail closed on stale core data.
+# Informational monitoring/watchlist, invalidation, and post-entry lifecycle
+# messages are not suppressed by this gate.
 _DATA_FRESHNESS_GATED_TYPES = {
-    "monitoring",
     "actionable",
     "entry_triggered",
-    "invalidated",
     "high_confluence",
 }
 
@@ -136,12 +133,7 @@ def _resolve_muted(strategy_id: str, settings) -> Optional[str]:
 
 
 def _freshness_suppression(db: Session, msg_type: str) -> Optional[str]:
-    """Return a suppression reason when a setup message lacks fresh core data.
-
-    Fail closed if the gate itself cannot be evaluated. This is intentionally
-    scoped to signal-formation transitions; lifecycle/risk notifications are
-    not blocked by market-data freshness.
-    """
+    """Return a suppression reason when an actionable setup lacks fresh core data."""
     if msg_type not in _DATA_FRESHNESS_GATED_TYPES:
         return None
     try:
