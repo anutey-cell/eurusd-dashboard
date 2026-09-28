@@ -88,3 +88,55 @@ def test_stale_m5_blocks_actionable_signal(monkeypatch):
         assert gate["status"] == "DATA_STALE"
     finally:
         db.close()
+
+
+def test_attach_actionability_fail_closes_stale_watchlist(monkeypatch):
+    """A stale STAND-ASIDE/watchlist verdict must not remain Telegram-eligible."""
+    import services.actionability_gate as ag
+
+    gate = {
+        "actionable": False,
+        "status": "DATA_STALE",
+        "reason": "critical_stale=M5",
+        "optional_context_is_gate": False,
+    }
+    monkeypatch.setattr(ag, "evaluate_db_actionability", lambda db: gate)
+
+    verdict = {
+        "decision": "STAND ASIDE",
+        "execution_status": "Watchlist",
+        "execution_permission": {"allow_alert": True, "allow_execute": False},
+    }
+    returned = ag.attach_actionability(verdict, object())
+
+    assert returned is gate
+    assert verdict["pre_data_gate_execution_status"] == "Watchlist"
+    assert verdict["execution_status"] == "DATA_STALE"
+    assert verdict["execution_permission"]["allow_alert"] is False
+    assert verdict["execution_permission"]["allow_execute"] is False
+    assert verdict["execution_permission"]["data_gate"] == "BLOCKED"
+    assert verdict["execution_permission"]["data_gate_reason"] == "critical_stale=M5"
+
+
+def test_attach_actionability_preserves_fresh_watchlist(monkeypatch):
+    """Fresh watchlist status remains intact; only stale market perception is blocked."""
+    import services.actionability_gate as ag
+
+    gate = {
+        "actionable": True,
+        "status": "ACTIONABLE",
+        "reason": "ok",
+        "optional_context_is_gate": False,
+    }
+    monkeypatch.setattr(ag, "evaluate_db_actionability", lambda db: gate)
+
+    verdict = {
+        "decision": "STAND ASIDE",
+        "execution_status": "Watchlist",
+        "execution_permission": {"allow_alert": True, "allow_execute": False},
+    }
+    ag.attach_actionability(verdict, object())
+
+    assert verdict["execution_status"] == "Watchlist"
+    assert verdict["execution_permission"]["allow_alert"] is True
+    assert verdict["execution_permission"]["data_gate"] == "OPEN"
