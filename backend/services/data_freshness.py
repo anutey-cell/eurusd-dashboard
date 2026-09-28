@@ -7,9 +7,8 @@ The scanner runs on live TwelveData ticks so a stale historical
 table doesn't fail loud — it fails silent (lookback features drift
 to stale values, HTF alignment misreads, ICT structure lags).
 
-Rule: if MAX(candle_time) for XAU/USD H1 is more than `staleness_h`
-hours behind now DURING market hours, fire a Telegram alert (one
-per staleness episode, deduped by day).
+Freshness remains an internal control used by the actionability gate and
+health diagnostics. It does NOT emit Telegram health notifications.
 
 Skipped over the weekend (Sat + Sun before Sunday reopen) — market
 closed, no fresh candles expected.
@@ -17,7 +16,7 @@ closed, no fresh candles expected.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import text
@@ -67,17 +66,6 @@ STALENESS_MIN_BY_TF: dict[str, int] = {
 # Result:
 #   M1  =  4 min       M5  = 15 min       M15 = 35 min
 #   H1  = 135 min      H4  = 510 min      D1  = 3000 min (~50h)
-_ALERT_STATE = {"date": None, "fired_for_tf": set()}
-
-# Reminder cadence: after the first stale-alert, re-alert every N seconds
-# while the stale condition persists so the operator gets nudged to fix.
-# Reset when data goes fresh again.
-_LAST_ALERT_STATE: dict = {
-    "stale_key":       "",       # fingerprint of the current stale set
-    "first_sent_at":   0.0,      # unix ts of the first alert in this outage
-    "last_sent_at":    0.0,      # unix ts of the most recent alert
-}
-_REMINDER_INTERVAL_S = 2 * 60 * 60   # 2 hours
 
 
 def data_quality_score(details_by_tf: dict) -> int:
@@ -128,7 +116,8 @@ def _last_candle_at(db, instrument: str, tf: str) -> Optional[datetime]:
         except ValueError:
             for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
                 try:
-                    ts = datetime.strptime(raw.split("+")[0], fmt); break
+                    ts = datetime.strptime(raw.split("+")[0], fmt)
+                    break
                 except ValueError:
                     continue
     if isinstance(ts, datetime):
@@ -156,7 +145,7 @@ def check_freshness(db, *, instrument: str = "XAU/USD",
     Returns {"stale": [...], "fresh": [...], "details": {tf: {age_min,threshold_min,latest,status}},
              "data_quality_score": int, "weekend": bool}.
 
-    Per-TF thresholds from STALENESS_MIN_BY_TF (M15=20 min, H1=70, H4=300 …).
+    Per-TF thresholds come from STALENESS_MIN_BY_TF.
     Passing `staleness_h` overrides the per-TF thresholds (legacy back-compat).
     """
     now = now or datetime.now(timezone.utc)
@@ -188,183 +177,23 @@ def check_freshness(db, *, instrument: str = "XAU/USD",
             "data_quality_score": data_quality_score(details)}
 
 
-def _send_operator_alert(text: str) -> bool:
-    """
-    Direct httpx POST to Telegram, bypassing the canonical client's dry-run.
-    Freshness alerts are operational infrastructure — they must fire regardless
-    of shadow / dry-run flags. Returns True on success.
-    """
-    try:
-        import httpx
-        from config import settings
-        token = getattr(settings, "telegram_bot_token", None)
-        chat_id = getattr(settings, "telegram_chat_id", None)
-        if not (token and chat_id):
-            log.warning("[freshness] cannot alert — missing bot_token or chat_id")
-            return False
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        r = httpx.post(url, json={
-            "chat_id":                  chat_id,
-            "text":                     text,
-            "disable_web_page_preview": True,
-        }, timeout=10.0)
-        if not r.is_success:
-            log.warning("[freshness] Telegram send failed status=%s body=%s",
-                        r.status_code, r.text[:200])
-            return False
-        return True
-    except Exception as exc:
-        log.warning("[freshness] Telegram send error: %s", exc)
-        return False
-
-
-def _stale_fingerprint(stale: list, details: dict) -> str:
-    """Compact key so re-alerts don't fire while the same set stays stale."""
-    parts = []
-    for tf in sorted(stale):
-        info = details.get(tf) or {}
-        parts.append(f"{tf}:{info.get('status', '?')}")
-    return "|".join(parts)
-
-
 def maybe_alert(db, client=None) -> Optional[dict]:
+    """Run the periodic freshness check without sending Telegram health alerts.
+
+    The scheduler still calls this function, so provider continuity and stale
+    timeframes remain visible in logs/health endpoints. Telegram is intentionally
+    reserved for trading/setup/lifecycle notifications; `🚨 DATA STALE` and
+    `⚠️ DATA STILL STALE` messages are suppressed by policy.
+
+    Actionable BUY/SELL signals continue to fail closed separately through
+    `services.actionability_gate` when core M5/M15/H1 data is stale.
     """
-    Called by scheduler on a periodic tick (default every 10 min).
-
-    First alert fires immediately on stale detection. While the same stale
-    set persists, a reminder fires every _REMINDER_INTERVAL_S (2h) so the
-    operator gets nudged to fix. When data goes fresh again, the state
-    resets so the next outage produces an immediate alert.
-
-    Uses direct httpx (bypassing canonical dry-run) — freshness is
-    operational infrastructure, not a signal notification.
-    """
-    import time as _time
-    now = datetime.now(timezone.utc)
-    result = check_freshness(db, now=now)
-
-    # Reset alert state when data goes fresh (or over weekend when closure
-    # expected). This way the next stale episode always gets its first alert.
-    if result.get("weekend") or not result["stale"]:
-        if _LAST_ALERT_STATE.get("stale_key"):
-            log.info("[freshness] data recovered — clearing alert state")
-            _LAST_ALERT_STATE["stale_key"]     = ""
-            _LAST_ALERT_STATE["first_sent_at"] = 0.0
-            _LAST_ALERT_STATE["last_sent_at"]  = 0.0
-        return result
-
-    stale_key = _stale_fingerprint(result["stale"], result.get("details", {}))
-    now_ts = _time.time()
-    prior_key    = _LAST_ALERT_STATE.get("stale_key", "")
-    last_sent    = float(_LAST_ALERT_STATE.get("last_sent_at", 0.0))
-    first_sent   = float(_LAST_ALERT_STATE.get("first_sent_at", 0.0))
-
-    # Decide: send if new stale set, OR reminder interval elapsed
-    should_send = False
-    reason      = ""
-    if stale_key != prior_key:
-        should_send = True
-        reason      = "new_stale_set"
-    elif now_ts - last_sent > _REMINDER_INTERVAL_S:
-        should_send = True
-        reason      = "reminder"
-
-    if not should_send:
-        return result
-
-    # Build the alert
-    try:
-        from services.candle_ingestion import get_last_ingest_error
-        err = get_last_ingest_error() or {}
-    except Exception:
-        err = {}
-
-    now_str    = now.strftime("%Y-%m-%d %H:%M:%S UTC")
-    first_seen = ""
-    if reason == "reminder" and first_sent:
-        first_dt = datetime.fromtimestamp(first_sent, tz=timezone.utc)
-        first_seen = first_dt.strftime("%Y-%m-%d %H:%M UTC")
-
-    lines = []
-    if reason == "reminder":
-        lines.append(f"⚠️ DATA STILL STALE · XAU/USD  (reminder)")
-        lines.append(f"First detected: {first_seen}")
-    else:
-        lines.append(f"🚨 DATA STALE · XAU/USD")
-    lines.append(f"Now: {now_str}")
-    lines.append("")
-    lines.append("Stale timeframes:")
-    for tf in sorted(result["stale"]):
-        info = result["details"].get(tf, {})
-        if isinstance(info, dict):
-            latest = info.get("latest", "—")
-            age    = info.get("age_min")
-            thr    = info.get("threshold_min")
-            status = info.get("status", "?")
-            lines.append(f"  • {tf}: {status} · latest {latest} · "
-                          f"age {age} min · threshold {thr} min")
-        else:
-            lines.append(f"  • {tf}: {info}")
-
-    lines.append("")
-    lines.append(f"Data-quality score: {result.get('data_quality_score', 0)}/100")
-
-    if err.get("message"):
-        lines.append("")
-        lines.append("Last ingestion error:")
-        lines.append(f"  [{err.get('tf','?')}] {err.get('message','')}")
-        if err.get("at"):
-            lines.append(f"  at: {err.get('at')}")
-
-    # Actual per-TF provider state — replaces the old hardcoded TV wording
-    try:
-        from sqlalchemy import text as _sqltext
-        from database import SessionLocal as _SL
-        with _SL() as _db:
-            provider_rows = _db.execute(_sqltext(
-                "SELECT timeframe, source FROM historical_candles "
-                "WHERE instrument='XAU/USD' AND timeframe IN ('M5','M15','H1','H4','D1') "
-                "AND candle_time = (SELECT MAX(candle_time) FROM historical_candles h2 "
-                "                    WHERE h2.instrument=historical_candles.instrument "
-                "                    AND h2.timeframe=historical_candles.timeframe)"
-            )).fetchall()
-        provider_by_tf = {r[0]: r[1] for r in provider_rows}
-    except Exception:
-        provider_by_tf = {}
-
-    lines.append("")
-    lines.append("Providers serving latest bars:")
-    for tf in sorted(BAR_DURATION_MIN.keys()):
-        if tf in ("M1",):
-            continue
-        src = provider_by_tf.get(tf, "(none)")
-        lines.append(f"  {tf}: {src}")
-
-    lines.append("")
-    lines.append("Action:")
-    lines.append("  - Cloud XAU/USD continuity is primary: check provider_health and last_ingest_error.")
-    lines.append("  - TradingView OANDA:XAUUSD is the independent spot fallback when Twelve Data is unavailable.")
-    if "mt5" in provider_by_tf.values():
-        lines.append("  - HOME MT5 is online and adds broker bars/ticks; it is not required for signal continuity.")
-    else:
-        lines.append("  - HOME MT5 is offline/absent; cloud signal generation should continue if spot data is fresh.")
-    lines.append("  - Yahoo GC=F is futures context only and never satisfies XAU/USD spot freshness.")
-    lines.append("  - Transient provider drops normally recover through the fallback chain.")
-    lines.append("Actionable signals fail closed only when core XAU/USD M5/M15/H1 data is stale.")
-    text = "\n".join(lines)
-
-    sent = _send_operator_alert(text)
-    if sent:
-        _LAST_ALERT_STATE["stale_key"]    = stale_key
-        _LAST_ALERT_STATE["last_sent_at"] = now_ts
-        if reason == "new_stale_set" or not first_sent:
-            _LAST_ALERT_STATE["first_sent_at"] = now_ts
-        log.warning("[freshness] Telegram alert sent (%s): stale=%s",
-                    reason, result["stale"])
-    else:
-        log.warning("[freshness] Telegram alert BUILD OK but send FAILED — "
-                    "stale=%s", result["stale"])
-
+    result = check_freshness(db)
+    if result.get("stale") and not result.get("weekend"):
+        log.warning(
+            "[freshness] STALE timeframes (Telegram health alert disabled): %s",
+            result.get("stale"),
+        )
     return result
 
 
