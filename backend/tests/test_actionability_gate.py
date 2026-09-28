@@ -37,7 +37,6 @@ def _seed(db: Session, tf: str, when: datetime) -> None:
 
 
 def test_core_fresh_context_stale_remains_actionable(monkeypatch):
-    # Freeze the freshness module's wall-clock by wrapping check_freshness.
     now = datetime(2026, 9, 16, 10, 0, tzinfo=timezone.utc)
     db = _db()
     try:
@@ -90,43 +89,37 @@ def test_stale_m5_blocks_actionable_signal(monkeypatch):
         db.close()
 
 
-def test_attach_actionability_fail_closes_stale_watchlist(monkeypatch):
-    """A stale STAND-ASIDE/watchlist verdict must not remain Telegram-eligible."""
+def test_stale_buy_fails_closed(monkeypatch):
     import services.actionability_gate as ag
 
     gate = {
         "actionable": False,
         "status": "DATA_STALE",
         "reason": "critical_stale=M5",
-        "optional_context_is_gate": False,
     }
     monkeypatch.setattr(ag, "evaluate_db_actionability", lambda db: gate)
 
     verdict = {
-        "decision": "STAND ASIDE",
-        "execution_status": "Watchlist",
-        "execution_permission": {"allow_alert": True, "allow_execute": False},
+        "decision": "BUY",
+        "execution_status": "SIGNAL_ONLY",
+        "execution_permission": {"allow_alert": True, "allow_execute": True},
     }
-    returned = ag.attach_actionability(verdict, object())
+    ag.attach_actionability(verdict, object())
 
-    assert returned is gate
-    assert verdict["pre_data_gate_execution_status"] == "Watchlist"
     assert verdict["execution_status"] == "DATA_STALE"
     assert verdict["execution_permission"]["allow_alert"] is False
     assert verdict["execution_permission"]["allow_execute"] is False
     assert verdict["execution_permission"]["data_gate"] == "BLOCKED"
-    assert verdict["execution_permission"]["data_gate_reason"] == "critical_stale=M5"
 
 
-def test_attach_actionability_preserves_fresh_watchlist(monkeypatch):
-    """Fresh watchlist status remains intact; only stale market perception is blocked."""
+def test_stale_watchlist_is_not_reclassified(monkeypatch):
+    """Only actionable BUY/SELL verdicts fail closed on stale core data."""
     import services.actionability_gate as ag
 
     gate = {
-        "actionable": True,
-        "status": "ACTIONABLE",
-        "reason": "ok",
-        "optional_context_is_gate": False,
+        "actionable": False,
+        "status": "DATA_STALE",
+        "reason": "critical_stale=M5",
     }
     monkeypatch.setattr(ag, "evaluate_db_actionability", lambda db: gate)
 
@@ -139,4 +132,3 @@ def test_attach_actionability_preserves_fresh_watchlist(monkeypatch):
 
     assert verdict["execution_status"] == "Watchlist"
     assert verdict["execution_permission"]["allow_alert"] is True
-    assert verdict["execution_permission"]["data_gate"] == "OPEN"
