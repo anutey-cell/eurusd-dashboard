@@ -70,25 +70,14 @@ def evaluate_db_actionability(db, *, instrument: str = "XAU/USD") -> dict[str, A
 
 
 def attach_actionability(verdict: dict, db) -> dict[str, Any]:
-    """Attach the gate and fail closed for every signal-style alert/order path.
-
-    This intentionally applies DATA_STALE to STAND-ASIDE / watchlist verdicts too,
-    not only BUY/SELL. Several legacy Telegram side paths key off
-    ``execution_status``; normalising stale verdicts here prevents those paths
-    from treating old market perception as a fresh watchlist or momentum setup.
-    """
+    """Attach the gate to a verdict and fail closed for BUY/SELL alerts/orders."""
     gate = evaluate_db_actionability(db)
     verdict["data_actionability"] = gate
-
-    if not gate["actionable"]:
-        # Preserve the pre-gate status for diagnostics/audit before replacing it
-        # with the universal stale-data status consumed by legacy side paths.
-        verdict.setdefault("pre_data_gate_execution_status", verdict.get("execution_status"))
+    if verdict.get("decision") in ("BUY", "SELL") and not gate["actionable"]:
         verdict["execution_status"] = "DATA_STALE"
         verdict["execution_status_reason"] = (
             "Core XAU/USD market data not actionable: " + gate["reason"]
         )
-
         permission = verdict.get("execution_permission")
         if not isinstance(permission, dict):
             permission = {}
@@ -96,12 +85,6 @@ def attach_actionability(verdict: dict, db) -> dict[str, Any]:
         permission["allow_alert"] = False
         permission["allow_execute"] = False
         permission["data_gate"] = "BLOCKED"
-        permission["data_gate_reason"] = gate["reason"]
-    else:
-        permission = verdict.get("execution_permission")
-        if isinstance(permission, dict):
-            permission["data_gate"] = "OPEN"
-
     return gate
 
 
