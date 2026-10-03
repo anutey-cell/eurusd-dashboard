@@ -1,4 +1,6 @@
+import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from services import predator_engine as pe
 
@@ -154,6 +156,63 @@ def test_fire_freshness_guard_rejects_stale_market_feed():
     assert reason == "stale_m5_feed"
 
 
+def test_weekend_market_guard_closes_friday_at_2100_utc():
+    assert pe.is_xauusd_market_open(
+        datetime(2026, 10, 2, 20, 59, tzinfo=timezone.utc)
+    ) is True
+    assert pe.is_xauusd_market_open(
+        datetime(2026, 10, 2, 21, 0, tzinfo=timezone.utc)
+    ) is False
+
+
+def test_weekend_market_guard_blocks_saturday():
+    assert pe.is_xauusd_market_open(
+        datetime(2026, 10, 3, 4, 7, tzinfo=timezone.utc)
+    ) is False
+
+
+def test_weekend_market_guard_reopens_sunday_at_2200_utc():
+    assert pe.is_xauusd_market_open(
+        datetime(2026, 10, 4, 21, 59, tzinfo=timezone.utc)
+    ) is False
+    assert pe.is_xauusd_market_open(
+        datetime(2026, 10, 4, 22, 0, tzinfo=timezone.utc)
+    ) is True
+
+
+def test_closed_market_freezes_scheduler_armed_clock(monkeypatch):
+    tracking = {
+        "APPROACHING_LEVEL:SELL": {
+            "armed_at": 1.0,
+            "last_seen": 2.0,
+        }
+    }
+    fake_scheduler = SimpleNamespace(_PREDATOR_ARMED_TRACKING=tracking)
+    monkeypatch.setitem(sys.modules, "services.background_scheduler", fake_scheduler)
+    now = datetime(2026, 10, 3, 4, 7, tzinfo=timezone.utc)
+
+    frozen = pe._freeze_scheduler_armed_clock(now)
+
+    assert frozen == 1
+    assert tracking["APPROACHING_LEVEL:SELL"]["last_seen"] == now.timestamp()
+    assert tracking["APPROACHING_LEVEL:SELL"]["armed_at"] == 1.0
+
+
+def test_evaluate_suppresses_weekend_before_legacy_detection(monkeypatch):
+    monkeypatch.setattr(
+        pe,
+        "_legacy_evaluate",
+        lambda db: (_ for _ in ()).throw(AssertionError("legacy detector must not run")),
+    )
+
+    result = pe.evaluate(
+        object(),
+        now_utc=datetime(2026, 10, 3, 4, 7, tzinfo=timezone.utc),
+    )
+
+    assert result == []
+
+
 def test_evaluate_boundary_drops_stale_fire_before_scheduler(monkeypatch):
     stale = _fire("2026-09-14T13:25:00")
     latest = datetime(2026, 9, 14, 13, 35)
@@ -163,10 +222,13 @@ def test_evaluate_boundary_drops_stale_fire_before_scheduler(monkeypatch):
     monkeypatch.setattr(pe, "_legacy_load_recent", lambda db, tf, n: bars)
     monkeypatch.setattr(
         pe, "validate_fire_freshness",
-        lambda signal, m5: (False, "stale_signal_bar"),
+        lambda signal, m5, **kwargs: (False, "stale_signal_bar"),
     )
 
-    assert pe.evaluate(None) == []
+    assert pe.evaluate(
+        None,
+        now_utc=datetime(2026, 9, 14, 13, 41, tzinfo=timezone.utc),
+    ) == []
 
 
 def test_quarantined_pdl_fire_is_shadow_recorded_then_withheld(monkeypatch):
@@ -177,10 +239,13 @@ def test_quarantined_pdl_fire_is_shadow_recorded_then_withheld(monkeypatch):
 
     monkeypatch.setattr(pe, "_legacy_evaluate", lambda db: [sig])
     monkeypatch.setattr(pe, "_legacy_load_recent", lambda db, tf, n: bars)
-    monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5: (True, "ok"))
+    monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5, **kwargs: (True, "ok"))
     monkeypatch.setattr(pe, "_record_quarantined_shadow", lambda db, signal: recorded.append(signal.archetype))
 
-    assert pe.evaluate(object()) == []
+    assert pe.evaluate(
+        object(),
+        now_utc=datetime(2026, 9, 14, 13, 41, tzinfo=timezone.utc),
+    ) == []
     assert recorded == ["PDL_BREAK"]
 
 
@@ -192,10 +257,13 @@ def test_quarantined_asian_fire_is_shadow_recorded_then_withheld(monkeypatch):
 
     monkeypatch.setattr(pe, "_legacy_evaluate", lambda db: [sig])
     monkeypatch.setattr(pe, "_legacy_load_recent", lambda db, tf, n: bars)
-    monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5: (True, "ok"))
+    monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5, **kwargs: (True, "ok"))
     monkeypatch.setattr(pe, "_record_quarantined_shadow", lambda db, signal: recorded.append(signal.archetype))
 
-    assert pe.evaluate(object()) == []
+    assert pe.evaluate(
+        object(),
+        now_utc=datetime(2026, 9, 14, 13, 41, tzinfo=timezone.utc),
+    ) == []
     assert recorded == ["ASIAN_BREAKDOWN"]
 
 
@@ -207,8 +275,11 @@ def test_vol_continuation_cannot_bypass_quarantined_primary(monkeypatch):
 
     monkeypatch.setattr(pe, "_legacy_evaluate", lambda db: [sig])
     monkeypatch.setattr(pe, "_legacy_load_recent", lambda db, tf, n: bars)
-    monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5: (True, "ok"))
+    monkeypatch.setattr(pe, "validate_fire_freshness", lambda signal, m5, **kwargs: (True, "ok"))
     monkeypatch.setattr(pe, "_record_quarantined_shadow", lambda db, signal: recorded.append(signal.archetype))
 
-    assert pe.evaluate(object()) == []
+    assert pe.evaluate(
+        object(),
+        now_utc=datetime(2026, 9, 14, 13, 41, tzinfo=timezone.utc),
+    ) == []
     assert recorded == ["VOL_CONTINUATION"]
