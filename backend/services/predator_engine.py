@@ -11,13 +11,16 @@ This module patches operational defects and production governance controls:
 7) ASIAN_BREAKDOWN and PDL_BREAK FIREs are quarantined to shadow research after
    full-history post-fix validation showed no robust production edge,
 8) VOL_CONTINUATION is quarantined too because the frozen engine creates it only
-   as a derivative of one of those primary FIREs and copies its trade plan.
+   as a derivative of one of those primary FIREs and copies its trade plan,
+9) live Predator evaluation is suppressed while the XAUUSD weekend market is
+   closed, and ARMED wall-clock ageing is frozen until trading resumes.
 
 Sizing, SL/TP geometry and SELL mandate are unchanged.
 """
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -128,6 +131,64 @@ def _as_utc(value):
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def is_xauusd_market_open(now_utc=None) -> bool:
+    """Return whether the normal XAUUSD weekend trading session is open.
+
+    Production uses the repository's existing XAU session convention:
+      * Friday closes at 21:00 UTC,
+      * Saturday is closed,
+      * Sunday reopens at 22:00 UTC.
+
+    This is deliberately a narrow weekend safety gate. It does not attempt to
+    model exchange holidays or provider-specific maintenance windows; the
+    existing data-freshness controls continue to own those failure modes.
+    """
+    now_t = _as_utc(now_utc or datetime.now(timezone.utc))
+    weekday = now_t.weekday()  # Mon=0 ... Sun=6
+    minute_of_day = now_t.hour * 60 + now_t.minute
+
+    if weekday == 4 and minute_of_day >= 21 * 60:  # Friday after close
+        return False
+    if weekday == 5:  # Saturday
+        return False
+    if weekday == 6 and minute_of_day < 22 * 60:  # Sunday before reopen
+        return False
+    return True
+
+
+def _freeze_scheduler_armed_clock(now_utc=None) -> int:
+    """Freeze scheduler ARMED ageing while the market clock is stopped.
+
+    The scheduler's legacy invalidation TTL is wall-clock based. During the
+    weekend that would otherwise turn a valid Friday ARMED setup into a false
+    "trigger window elapsed" invalidation despite zero new M5 closes. Refreshing
+    only ``last_seen`` makes the TTL resume from market reopen while preserving
+    the original ``armed_at`` audit timestamp.
+
+    Returns the number of tracked setups frozen. The scheduler module is looked
+    up via ``sys.modules`` to avoid an import cycle; outside the scheduler this
+    is a harmless no-op.
+    """
+    now_t = _as_utc(now_utc or datetime.now(timezone.utc))
+    frozen = 0
+    for module_name in (
+        "services.background_scheduler",
+        "backend.services.background_scheduler",
+    ):
+        scheduler = sys.modules.get(module_name)
+        if scheduler is None:
+            continue
+        tracking = getattr(scheduler, "_PREDATOR_ARMED_TRACKING", None)
+        if not isinstance(tracking, dict):
+            return frozen
+        for info in tracking.values():
+            if isinstance(info, dict):
+                info["last_seen"] = now_t.timestamp()
+                frozen += 1
+        return frozen
+    return frozen
 
 
 def validate_fire_freshness(signal, m5_bars: list[tuple], *,
@@ -292,8 +353,21 @@ _legacy._first_m5_close_below = _fresh_m5_cross_below  # Asian detector: latest 
 _legacy.detect_pdl_break = detect_pdl_break
 
 
-def evaluate(db):
-    """Frozen evaluation plus safety boundary and evidence-based quarantine."""
+def evaluate(db, *, now_utc=None):
+    """Frozen evaluation plus live-session safety and governance controls."""
+    now_t = _as_utc(now_utc or datetime.now(timezone.utc))
+
+    # Weekend fail-closed boundary: no detector evaluation, no ARMED/FIRE output,
+    # and no wall-clock invalidation ageing while the market cannot print a new
+    # M5 close. This prevents stale Friday state from becoming Saturday alerts.
+    if not is_xauusd_market_open(now_t):
+        frozen = _freeze_scheduler_armed_clock(now_t)
+        log.debug(
+            "[predator] market-closed guard: evaluation suppressed; frozen_armed=%d",
+            frozen,
+        )
+        return []
+
     signals = _legacy_evaluate(db)
     if not signals:
         return signals
@@ -309,7 +383,7 @@ def evaluate(db):
     out = []
     for sig in signals:
         if getattr(sig, "state", None) == "FIRE":
-            ok, reason = validate_fire_freshness(sig, latest_m5)
+            ok, reason = validate_fire_freshness(sig, latest_m5, now_utc=now_t)
             if not ok:
                 log.warning(
                     "[predator] FIRE blocked by engine freshness guard: %s %s reason=%s bar=%s",
@@ -340,6 +414,7 @@ __all__ = [
     "PredatorSignal", "evaluate", "format_telegram_alert",
     "format_telegram_invalidated", "format_predator_execution_summary",
     "detect_asian_breakdown", "detect_pdl_break", "detect_vol_continuation",
-    "validate_fire_freshness", "_QUARANTINED_FIRE_ARCHETYPES",
-    "_ARCHETYPE_STATS", "_EXPECTED_TOTAL_MOVE_PTS", "_EXTENSION_LIMIT",
+    "validate_fire_freshness", "is_xauusd_market_open",
+    "_QUARANTINED_FIRE_ARCHETYPES", "_ARCHETYPE_STATS",
+    "_EXPECTED_TOTAL_MOVE_PTS", "_EXTENSION_LIMIT",
 ]
