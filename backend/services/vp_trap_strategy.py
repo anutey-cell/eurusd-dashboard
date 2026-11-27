@@ -601,12 +601,13 @@ def scan_and_persist_zones(db, expiry_hours: int = 48,
 
     # Score-related config
     from config import settings
-    live_threshold      = getattr(settings, "vp_trap_live_threshold", 80)
     countertrend_bonus  = getattr(settings, "vp_trap_countertrend_bonus", 10)
     tick_volume_penalty = getattr(settings, "vp_trap_penalize_tick_volume", 15)
     min_rr              = getattr(settings, "vp_trap_min_rr", 1.8)
 
+    processed_plans = set()
     for z in zones:
+        strategy_enabled, live_threshold = settings.vp_trap_policy(z.level_side)
         scan_zone(
             z, bars_window,
             min_displacement_pts=min_displacement_pts,
@@ -642,7 +643,8 @@ def scan_and_persist_zones(db, expiry_hours: int = 48,
                 )
                 # Phase 4: dispatch alert if would_fire (module respects its own
                 # gates: cooldown, dedupe, weekend, config toggle)
-                if breakdown.would_fire:
+                plan_key = (z.level_side, plan["entry"], plan["sl"], plan["tp1"], plan["tp2"], plan["tp3"])
+                if strategy_enabled and breakdown.would_fire and plan_key not in processed_plans:
                     try:
                         from services.vp_trap_alerts import maybe_dispatch_alert
                         signal_id = maybe_dispatch_alert(
@@ -653,6 +655,7 @@ def scan_and_persist_zones(db, expiry_hours: int = 48,
                             profile=profile.to_dict(),
                         )
                         zone_dict["signal_id"] = signal_id
+                        processed_plans.add(plan_key)
                     except Exception as exc:
                         log.warning("[vp_trap] alert dispatch failed for %s: %s",
                                     z.zone_id, exc)

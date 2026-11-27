@@ -82,11 +82,14 @@ def record_signal(
     """
     try:
         from db_models import VpTrapMeasurementEvent as M
+        if not (0 < stop_loss < entry_price if direction == "BUY" else
+                0 < entry_price < stop_loss if direction == "SELL" else False):
+            return None
         # De-dupe on active zone (any non-terminal row within last 6h)
         cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
         existing = (db.query(M)
                        .filter(M.zone_id == zone_id)
-                       .filter(M.status.in_(["PENDING", "TRIGGERED"]))
+                       .filter(M.status.in_(["PENDING", "TRIGGERED", "TP1_HIT"]), M.closed_at.is_(None))
                        .filter(M.fired_at >= cutoff)
                        .order_by(M.id.desc())
                        .first())
@@ -224,12 +227,14 @@ def advance_outcomes(db: Session) -> dict:
                 "expired": 0, "invalidated": 0}
 
     rows = (db.query(M)
-              .filter(M.status.in_(["PENDING", "TRIGGERED"]))
+              .filter(M.status.in_(["PENDING", "TRIGGERED", "TP1_HIT"]),
+                      M.closed_at.is_(None), M.stop_loss > 0)
               .all())
 
     for r in rows:
         try:
-            _update_mfe_mae(r, price)
+            if r.status != "PENDING":
+                _update_mfe_mae(r, price)
 
             # PENDING → TRIGGERED / INVALIDATED / EXPIRED
             if r.status == "PENDING":
@@ -270,7 +275,14 @@ def advance_outcomes(db: Session) -> dict:
                 continue
 
             # TRIGGERED → TP1_HIT / TP2_HIT / STOPPED / EXPIRED
-            if r.status == "TRIGGERED":
+            if r.status in ("TRIGGERED", "TP1_HIT"):
+                # After a partial, close the runner at breakeven.
+                if r.status == "TP1_HIT" and _crossed(_opposite(r.direction), price, r.entry_price):
+                    r.closed_at = now
+                    r.closed_price = r.entry_price
+                    r.duration_min = _duration_min(r.triggered_at, now)
+                    r.r_realized = _compute_realized_r(r, r.entry_price)
+                    continue
                 # SL hit
                 if _crossed(_opposite(r.direction), price, r.stop_loss):
                     r.status = "STOPPED"
@@ -345,32 +357,34 @@ def _opposite(direction: str) -> str:
 
 # ── Aggregation ────────────────────────────────────────────────────────────
 
-def compute_stats(db: Session, days: int = 30) -> dict:
+def compute_stats(db: Session, days: int = 30, direction: Optional[str] = None) -> dict:
     """
     Compute the four protocol metrics + drill-downs. Never raises.
     """
     from db_models import VpTrapMeasurementEvent as M
     since = datetime.now(timezone.utc) - timedelta(days=days)
     try:
-        rows = (db.query(M)
-                   .filter(M.fired_at >= since)
-                   .order_by(M.fired_at.asc())
-                   .all())
+        query = db.query(M).filter(M.fired_at >= since)
+        if direction:
+            query = query.filter(M.direction == direction)
+        rows = query.order_by(M.fired_at.asc(), M.id.asc()).all()
     except Exception as exc:
         log.warning("[vp_measurement] compute_stats query failed: %s", exc)
         return {"error": str(exc)}
 
+    excluded = sum(not row.stop_loss or row.stop_loss <= 0 for row in rows)
+    rows = [row for row in rows if row.stop_loss and row.stop_loss > 0]
     if not rows:
-        return _empty_stats(days)
+        return {**_empty_stats(days), "excluded_invalid_stop": excluded}
 
     n_fired      = len(rows)
     days_actual  = max(1.0, (datetime.now(timezone.utc) -
                               _naive(rows[0].fired_at)).total_seconds() / 86400)
     per_day      = round(n_fired / days_actual, 2)
 
-    closed = [r for r in rows if r.status in ("TP1_HIT", "TP2_HIT", "STOPPED", "EXPIRED")]
+    closed = [r for r in rows if r.closed_at and r.status in ("TP1_HIT", "TP2_HIT", "STOPPED", "EXPIRED")]
     invalid = [r for r in rows if r.status == "INVALIDATED"]
-    open_   = [r for r in rows if r.status in ("PENDING", "TRIGGERED")]
+    open_   = [r for r in rows if not r.closed_at and r.status in ("PENDING", "TRIGGERED", "TP1_HIT")]
 
     wins   = [r for r in closed if (r.r_realized or 0) > 0]
     losses = [r for r in closed if (r.r_realized or 0) < 0]
@@ -407,6 +421,7 @@ def compute_stats(db: Session, days: int = 30) -> dict:
 
     return {
         "window_days":         days,
+        "excluded_invalid_stop": excluded,
         "window_days_actual":  round(days_actual, 2),
         "n_fired":             n_fired,
         "n_closed":            len(closed),

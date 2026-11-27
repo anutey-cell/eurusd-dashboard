@@ -445,6 +445,19 @@ def compute_trade_plan(zone, profile, ctx: MarketContext) -> dict:
 
 # ── Public entry point ──────────────────────────────────────────────────────
 
+def valid_trade_plan(direction: str, plan: dict) -> bool:
+    from math import isfinite
+
+    if direction not in ("BUY", "SELL"):
+        return False
+    levels = [plan.get(key) for key in ("sl", "entry", "tp1", "tp2", "tp3")]
+    if any(not isinstance(price, (float, int)) or not isfinite(price) or price <= 0 for price in levels):
+        return False
+    if direction == "SELL":
+        levels.reverse()
+    return all(lower < higher for lower, higher in zip(levels, levels[1:]))
+
+
 def score_zone(
     zone,
     profile,
@@ -514,6 +527,10 @@ def score_zone(
     if rr_pts == 0:
         hard_gate_failed = True
         hard_gate_reason = f"RR below {min_rr:.1f} floor"
+
+    if not valid_trade_plan(zone.level_side, plan):
+        hard_gate_failed = True
+        hard_gate_reason = "stop and targets must be ordered in the signal direction"
 
     effective_threshold = live_threshold + (countertrend_bonus if is_ct else 0)
     would_fire = (total >= effective_threshold) and not hard_gate_failed
