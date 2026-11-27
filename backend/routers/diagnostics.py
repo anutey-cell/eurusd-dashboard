@@ -19,6 +19,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from typing import Literal
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
 
@@ -1341,6 +1342,7 @@ def external_confluence(request: Request,
 )
 @limiter.limit("30/minute")
 def vp_trap_measurement(request: Request,
+                          direction: Literal["BUY", "SELL"] | None = Query(default=None),
                           days: int = Query(default=30, ge=1, le=90),
                           db: Session = Depends(get_db)) -> APIResponse[dict]:
     """
@@ -1349,7 +1351,7 @@ def vp_trap_measurement(request: Request,
     INSUFFICIENT SAMPLE | NO DATA).
     """
     from services.vp_trap_measurement import compute_stats
-    return APIResponse(data=compute_stats(db, days=days), source="diagnostics")
+    return APIResponse(data=compute_stats(db, days=days, direction=direction), source="diagnostics")
 
 
 @router.get(

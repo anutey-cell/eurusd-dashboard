@@ -16,7 +16,7 @@ import {
   TrendingUp, TrendingDown, RefreshCw, AlertTriangle, Activity,
   Target, Zap, Eye, Clock,
 } from 'lucide-react';
-import { getVpTrapDiagnostics, getVpTrapSignals, getVpTrapStatus } from '../services/api';
+import { getVpTrapDiagnostics, getVpTrapSignals, getVpTrapStatus, getVpTrapOutcomes } from '../services/api';
 import { usePollInterval } from '../hooks/usePollInterval';
 
 const POLL_MS = 30_000;
@@ -58,7 +58,7 @@ function Pill({ children, cls }) {
   );
 }
 
-function ZoneRow({ zone, score, plan, isTop }) {
+function ZoneRow({ zone, score, plan, isTop, enabled }) {
   const bandCls = BAND_CLS[score?.band] || BAND_CLS.NO_SIGNAL;
   const stateCls = STATE_CLS[zone.state] || STATE_CLS.LEVEL_DETECTED;
   const dirIcon = zone.level_side === 'SELL'
@@ -91,7 +91,7 @@ function ZoneRow({ zone, score, plan, isTop }) {
               CT
             </Pill>
           )}
-          {score?.would_fire && (
+          {enabled && zone.state === 'TRIGGERED' && score?.would_fire && (
             <Pill cls="bg-emerald-500/25 border-emerald-500/70 text-emerald-200">
               🪤 FIRE
             </Pill>
@@ -209,8 +209,30 @@ const MODE_CLS = {
 };
 
 export default function VpTrapPanel() {
+  const [direction, setDirection] = useState('BUY');
+  return (
+    <section aria-label="Volume profile trap strategies">
+      <div className="mb-2 flex flex-wrap gap-2" role="group" aria-label="Select strategy">
+        {Object.entries(TRAP_NAMES).map(([side, name]) => (
+          <button key={side} type="button" aria-pressed={direction === side}
+            onClick={() => setDirection(side)}
+            className={`rounded border px-3 py-2 text-sm ${direction === side
+              ? 'border-blue-400 text-white' : 'border-gray-700 text-gray-400'}`}>
+            {name}
+          </button>
+        ))}
+      </div>
+      <TrapStrategyPanel key={direction} direction={direction} />
+    </section>
+  );
+}
+
+const TRAP_NAMES = { BUY: 'Trapped sellers · BUY', SELL: 'Trapped buyers · SELL' };
+
+function TrapStrategyPanel({ direction }) {
   const [data, setData] = useState(null);
   const [signals, setSignals] = useState([]);
+  const [stats, setStats] = useState(null);
   const [status, setStatus] = useState(null);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -220,26 +242,28 @@ export default function VpTrapPanel() {
     setLoading(true);
     setErr(null);
     try {
-      const [diag, sig, st] = await Promise.all([
+      const [diag, sig, st, outcomes] = await Promise.all([
         getVpTrapDiagnostics(),
-        getVpTrapSignals({ limit: 8 }),
+        getVpTrapSignals({ limit: 8, direction }),
         getVpTrapStatus(),
+        getVpTrapOutcomes(direction),
       ]);
       setData(diag);
       setSignals(sig.signals || []);
       setStatus(st);
+      setStats(outcomes);
       setLastFetch(new Date());
     } catch (e) {
       setErr(e.message || 'Failed to load VP Trap data');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [direction]);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
   usePollInterval(fetchAll, POLL_MS);
 
-  const zoneScores = data?.zone_scores || [];
+  const zoneScores = (data?.zone_scores || []).filter(row => row.zone.level_side === direction);
   const topZone = zoneScores.reduce((best, cur) => {
     const s = cur.score?.total ?? 0;
     return (!best || s > (best.score?.total ?? 0)) ? cur : best;
@@ -250,7 +274,7 @@ export default function VpTrapPanel() {
       <div className="card-header">
         <div className="flex items-center gap-2">
           <span className="text-lg">🪤</span>
-          <span className="card-title">Volume Profile Trap Strategy</span>
+          <span className="card-title">{TRAP_NAMES[direction]}</span>
           {status?.mode && (
             <Pill cls={MODE_CLS[status.mode] || MODE_CLS.independent}
                   title={status.mode_description || ''}>
@@ -301,7 +325,8 @@ export default function VpTrapPanel() {
               ATR H1: <span className="text-white ml-1">{fmtNum(data.atr_h1)}</span> ·
               D1: <span className="text-white ml-1">{data.d1_bias || '—'}</span> ·
               H4: <span className="text-white ml-1">{data.h4_bias || '—'}</span> ·
-              Live threshold: <span className="text-white ml-1">{data.live_threshold}</span>
+              Base threshold: <span className="text-white ml-1">{topZone?.base_threshold ?? data.live_threshold}</span>
+              {topZone?.strategy_enabled === false && <span className="ml-2 text-amber-400">Alerts disabled</span>}
             </div>
           </div>
 
@@ -314,7 +339,7 @@ export default function VpTrapPanel() {
             {[...zoneScores]
               .sort((a, b) => (b.score?.total ?? 0) - (a.score?.total ?? 0))
               .map((zs, i) => (
-              <ZoneRow key={zs.zone.zone_id} zone={zs.zone} score={zs.score}
+              <ZoneRow key={zs.zone.zone_id} zone={zs.zone} score={zs.score} enabled={zs.strategy_enabled}
                        plan={zs.trade_plan} isTop={zs === topZone} />
             ))}
           </div>
@@ -338,6 +363,14 @@ export default function VpTrapPanel() {
             </div>
           )}
 
+          {stats && (
+            <div className="text-xs text-gray-300">
+              Paper outcomes · 90 days · {stats.n_closed} closed · {stats.n_open ?? 0} open
+              {stats.n_closed > 0 && <> · {stats.win_rate_pct}% wins · {fmtNum(stats.avg_r_per_trade)}R average</>}
+              {stats.excluded_invalid_stop > 0 && <> · {stats.excluded_invalid_stop} historical records excluded for invalid stops</>}
+            </div>
+          )}
+
           {/* Recent signals */}
           <div className="space-y-1">
             <div className="text-xs font-medium text-gray-300 flex items-center gap-1">
@@ -346,8 +379,7 @@ export default function VpTrapPanel() {
             </div>
             {signals.length === 0 ? (
               <div className="text-[10px] text-gray-500 italic px-2 py-1">
-                No fired signals yet. When a zone reaches score ≥ {data.live_threshold},
-                a Telegram alert + persisted signal will appear here.
+                No alerts recorded for this strategy.
               </div>
             ) : (
               <div className="space-y-1">

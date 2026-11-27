@@ -764,8 +764,15 @@ export async function getVpTrapZones({ includeTerminal = false } = {}) {
   return res.data;
 }
 
-export async function getVpTrapSignals({ limit = 20 } = {}) {
+export async function getVpTrapSignals({ limit = 20, direction } = {}) {
   const params = new URLSearchParams({ limit: String(limit) });
+  if (direction) params.set("direction", direction);
   const res = await apiFetch(`/vp-trap/signals?${params}`);
+  return res.data;
+}
+
+export async function getVpTrapOutcomes(direction) {
+  const params = new URLSearchParams({ days: '90', direction });
+  const res = await apiFetch(`/diagnostics/vp-trap-measurement?${params}`);
   return res.data;
 }

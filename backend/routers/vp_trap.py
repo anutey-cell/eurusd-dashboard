@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -227,6 +227,7 @@ def get_diagnostics(db: Session = Depends(get_db)) -> APIResponse:
     zones = zones_from_profile(profile, expiry_hours=48)
     diagnostics = []
     for z in zones:
+        strategy_enabled, threshold = settings.vp_trap_policy(z.level_side)
         scan_zone(z, bars_window,
                   min_displacement_pts=5.0, retest_tolerance_pts=3.0, max_retests=3)
         breakdown, plan = score_zone(
@@ -234,9 +235,11 @@ def get_diagnostics(db: Session = Depends(get_db)) -> APIResponse:
             countertrend_bonus=countertrend_bonus,
             tick_volume_penalty=tick_volume_penalty,
             min_rr=min_rr,
-            live_threshold=live_threshold,
+            live_threshold=threshold,
         )
         diagnostics.append({
+            "strategy_enabled": strategy_enabled,
+            "base_threshold": threshold,
             "zone":         z.to_dict(),
             "score":        breakdown.to_dict(),
             "trade_plan":   plan,
@@ -262,6 +265,7 @@ def get_diagnostics(db: Session = Depends(get_db)) -> APIResponse:
 def get_signals(
     limit: int = Query(20, ge=1, le=200,
                        description="Max signals to return, newest first"),
+    direction: Literal["BUY", "SELL"] | None = Query(default=None),
     include_terminal: bool = Query(True,
         description="Include signals with terminal state (STOPPED/EXPIRED/etc)"),
     db: Session = Depends(get_db),
@@ -274,12 +278,14 @@ def get_signals(
     from db_models import VpTrapSignal as SM
     import json as _json
 
-    q = db.query(SM).order_by(SM.created_at.desc()).limit(limit)
-    rows = q.all()
+    q = db.query(SM)
+    if direction:
+        q = q.filter(SM.signal == direction)
+    if not include_terminal:
+        q = q.filter(~SM.state.in_(("STOPPED", "EXPIRED", "INVALIDATED")))
+    rows = q.order_by(SM.created_at.desc(), SM.id.desc()).limit(limit).all()
     out = []
     for r in rows:
-        if not include_terminal and r.state in ("STOPPED", "EXPIRED", "INVALIDATED"):
-            continue
         try:
             breakdown = _json.loads(r.score_breakdown_json) if r.score_breakdown_json else None
         except Exception:

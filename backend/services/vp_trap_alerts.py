@@ -367,7 +367,7 @@ def get_vp_trap_context_for_mandate(direction: str, db: Session) -> Optional[dic
 
     Never raises. Fast DB read (one row).
     """
-    if direction not in ("BUY", "SELL"):
+    if direction not in ("BUY", "SELL") or not settings.vp_trap_policy(direction)[0]:
         return None
     mode = getattr(settings, "vp_trap_mode", "independent")
     if mode not in ("confirmation", "confluence"):
@@ -447,7 +447,11 @@ def maybe_dispatch_alert(
     zone_id = zone.get("zone_id", "")
     direction = zone.get("level_side", "")
     level_type = zone.get("level_type", "")
-    if not zone_id or not direction:
+    if not zone_id or direction not in ("BUY", "SELL") or not settings.vp_trap_policy(direction)[0]:
+        return None
+
+    from services.vp_trap_scoring import valid_trade_plan
+    if not valid_trade_plan(direction, plan):
         return None
 
     # Weekend + Monday-observation respect (share the strategist_runner gates)
@@ -481,31 +485,15 @@ def maybe_dispatch_alert(
                  "for %s %s (no own alert)", signal_id or -1, direction, level_type)
         return signal_id
 
-    # ── Confluence mode: check for mandate agreement, consolidate if match ─
-    if mode == "confluence":
-        mandate_dir = _recent_mandate_alert_direction(within_seconds=300)
-        if mandate_dir == direction:
-            text = _format_consolidated_alert(
-                zone=zone, breakdown=breakdown, plan=plan,
-                profile=profile, mandate_direction=mandate_dir,
-            )
-            if not _send_plain(text):
-                return None
-            signal_id = _persist_signal(db, zone=zone, breakdown=breakdown, plan=plan,
-                                         profile=profile, confluence=confluence,
-                                         fingerprint=fingerprint)
-            _last_alerts[zone_id] = {
-                "fingerprint": fingerprint, "sent_at": time.time(),
-            }
-            log.info("[vp_trap_alerts] CONFLUENCE consolidated alert fired "
-                     "%s (mandate agrees) score=%d id=%s",
-                     direction, breakdown.get("total", 0), signal_id)
-            return signal_id
-        # Confluence mode but no mandate agreement — fall through to independent
-
-    # ── Independent mode (default) OR confluence with no mandate match ──
-    text = _format_alert(zone=zone, breakdown=breakdown, plan=plan,
-                         profile=profile, confluence=confluence)
+    mandate_dir = _recent_mandate_alert_direction(within_seconds=300) if mode == "confluence" else None
+    if mandate_dir == direction:
+        text = _format_consolidated_alert(
+            zone=zone, breakdown=breakdown, plan=plan,
+            profile=profile, mandate_direction=mandate_dir,
+        )
+    else:
+        text = _format_alert(zone=zone, breakdown=breakdown, plan=plan,
+                             profile=profile, confluence=confluence)
     if not _send_plain(text):
         log.warning("[vp_trap_alerts] send failed for zone %s", zone_id[:8])
         return None
@@ -530,7 +518,7 @@ def maybe_dispatch_alert(
             score=int(breakdown.get("total", 0) or 0),
             session=(zone.get("session") or plan.get("session") or "unknown"),
             entry_price=float(plan.get("entry") or 0.0),
-            stop_loss=float(plan.get("stop_loss") or 0.0),
+            stop_loss=float(plan["sl"]),
             tp1_price=(float(plan["tp1"]) if plan.get("tp1") is not None else None),
             tp2_price=(float(plan["tp2"]) if plan.get("tp2") is not None else None),
             invalidation_price=(float(plan["invalidation"])

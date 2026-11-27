@@ -1,4 +1,5 @@
 from typing import Literal
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -162,6 +163,21 @@ class Settings(BaseSettings):
     vp_trap_enabled:                 bool  = True    # master toggle (Phase 4 ships enabled)
     vp_trap_mode:                    str   = "independent"  # independent | confirmation | confluence
     vp_trap_live_threshold:          int   = 70      # P132: aggressive — was 80
+    vp_trap_trapped_sellers_enabled: bool = True
+    vp_trap_trapped_buyers_enabled: bool = True
+    # None inherits the existing global threshold, including deployment overrides.
+    vp_trap_trapped_sellers_threshold: int | None = Field(default=None, ge=0, le=100)
+    vp_trap_trapped_buyers_threshold: int | None = Field(default=None, ge=0, le=100)
+
+    def vp_trap_policy(self, direction: str) -> tuple[bool, int]:
+        if direction == "BUY":
+            enabled, threshold = self.vp_trap_trapped_sellers_enabled, self.vp_trap_trapped_sellers_threshold
+        elif direction == "SELL":
+            enabled, threshold = self.vp_trap_trapped_buyers_enabled, self.vp_trap_trapped_buyers_threshold
+        else:
+            raise ValueError(f"Invalid VP Trap direction: {direction}")
+        return self.vp_trap_enabled and enabled, self.vp_trap_live_threshold if threshold is None else threshold
+
     vp_trap_watch_threshold:         int   = 55      # P132: aggressive — was 60
     vp_trap_countertrend_bonus:      int   = 10      # extra threshold for countertrend setups
     vp_trap_value_area_pct:          float = 0.70    # standard TPO 70%
